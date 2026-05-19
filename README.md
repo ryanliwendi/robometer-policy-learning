@@ -175,15 +175,12 @@ You should see evaluation curves similar to the example below:
 
 ---
 
-## DSRL + Pi0 on LIBERO
-
-Coming soon...
-
----
-
 # Real-World Online RL with DSRL + Remote Reward Labeling
 
 Coming soon...
+Files are in this repo but need to be cleaned up, should be done by mid June. 
+
+Also coming soon: DSRL+Pi0 sanity check command before running real world online RL. 
 
 ---
 
