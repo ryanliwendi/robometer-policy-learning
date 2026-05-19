@@ -1,0 +1,37 @@
+# Python-generated files
+**/__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# logs and datasets
+unsloth_compiled_cache/
+logs/
+data/
+wandb/
+ckpts/
+evaluation_videos/
+*.png
+*.mp4
+unsloth_compiled_cache/
+*.out
+*.h5
+
+outputs/*
+
+*uv.lock
+*cache*
+
+commands.sh
+*_pb2.py
+*.proto
+
+checkpoints/*
+extracted_episodes*
+replay_buffer/*
+replay_buffers/*

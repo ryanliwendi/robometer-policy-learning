@@ -1,0 +1,60 @@
+# Pi0 Evaluation Configuration
+# Usage: python scripts/eval_pi0.py [overrides]
+# Examples:
+#   python scripts/eval_pi0.py                                    # Use defaults (random noise)
+#   python scripts/eval_pi0.py policy_checkpoint=./checkpoint.pt  # Use trained policy
+#   python scripts/eval_pi0.py eval.num_episodes=20               # Run more episodes
+#   python scripts/eval_pi0.py use_random_noise=false policy_checkpoint=./ckpt.pt
+
+# Environment configuration (defaults to DROID remote robot)
+env:
+  env_type: "remote_robot"  # "simpler" or "remote_robot"
+  obs_format: "droid"  # "droid" or "widowx"
+  image_keys: ["observation/wrist_image_left", "observation/exterior_image_1_left"] # keys for dino conversion in DSRL observation
+  extra_keys_to_drop: ["observation/joint_position", "observation/gripper_position"]
+
+# Remote robot/server connection
+server:
+  host: "jessezhang2.a.pinggy.link"
+  port: 25363
+
+# Pi0 configuration
+pi0:
+  checkpoint: "gs://openpi-assets/checkpoints/pi0_droid"
+  action_exec_len: 8 # Number of actions to execute from each chunk
+  noise_dim: 32  # Dimension of noise vector
+  noise_action_bound: 1.0  # Action bound for noise (used in DummyDSRLEnv)
+
+# Noise configuration (for random noise evaluation)
+use_random_noise: true  # If true, use random Gaussian noise instead of trained policy
+noise_scale: 1.0  # Scale factor for random noise
+
+# Policy configuration (used when use_random_noise=false)
+policy_checkpoint: null  # Path to trained policy checkpoint
+
+# Evaluation settings
+eval:
+  num_episodes: 20 # Number of evaluation episodes
+  record_video: true  # Record evaluation videos
+  gamma: 0.99  # Discount factor
+
+# Logging configuration
+logging:
+  wandb_enable: true
+  wandb_project: rfm_rl
+  wandb_entity: clvr
+  wandb_offline: false
+  wandb_name: eval_pi0
+  wandb_log_dir_base: logs/wandb
+  wandb_group: null
+  wandb_job_type: eval
+  wandb_tags: ["eval"]
+
+# Model configuration (optional feature extractors)
+model:
+  dinov2_model: "facebook/dinov2-small"  # DINOv2 model for image embedding (null to disable)
+  sentence_model: null  # Sentence transformer for language (null to disable)
+
+# Device and seed
+device: "cuda"
+seed: 42
