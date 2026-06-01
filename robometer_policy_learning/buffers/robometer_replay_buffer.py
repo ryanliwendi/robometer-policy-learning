@@ -16,14 +16,24 @@ from robometer_policy_learning.utils.robometer_utils import (
     extract_rewards_from_server_output,
 )
 from robometer_policy_learning.utils.gpu_utils import convert_to_numpy
-from robometer.evals.eval_utils import raw_dict_to_sample, build_payload, post_batch_npy
-from robometer.evals.eval_server import process_batch_helper
-from robometer.utils.embedding_utils import compute_text_embeddings, compute_video_embeddings
 from transformers import AutoModel, AutoImageProcessor
 from sentence_transformers import SentenceTransformer
-from robometer.utils.setup_utils import setup_batch_collator
 from tqdm import tqdm
+from robometer.utils.embedding_utils import compute_video_embeddings
 
+# Returns NameError: name 'auto_docstring' is not defined otherwise
+try:
+    from robometer.evals.eval_utils import raw_dict_to_sample, build_payload, post_batch_npy
+    from robometer.evals.eval_server import process_batch_helper
+    from robometer.utils.embedding_utils import compute_text_embeddings
+    from robometer.utils.setup_utils import setup_batch_collator
+except Exception:
+    raw_dict_to_sample = None
+    build_payload = None
+    post_batch_npy = None
+    process_batch_helper = None
+    compute_text_embeddings = None
+    setup_batch_collator = None
 
 class RobometerReplayBuffer(ReplayBuffer):
     """
