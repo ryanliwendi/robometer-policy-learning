@@ -153,15 +153,16 @@ def main(cfg: DictConfig):
             logger.info(f"Saving checkpoint to {save_dir}/latest")
             save_checkpoint(offline_algo, save_dir, "latest")
 
+        offline_evaluation_worker = EvaluationWorker(
+            eval_env=eval_env,
+            device=device,
+            num_episodes=cfg.eval.eval_num_episodes,
+            record_video=True,
+            logger=wandb_logger,
+        )
+
         # If we loaded a checkpoint, we skip offline training step
         if cfg.training.load_dir is None or cfg.training.continue_training:
-            offline_evaluation_worker = EvaluationWorker(
-                eval_env=eval_env,
-                device=device,
-                num_episodes=cfg.eval.eval_num_episodes,
-                record_video=True,
-                logger=wandb_logger,
-            )
             # Training loop
             logger.info(f"Training offline algorithm for {cfg.training.num_offline_steps} steps")
             with tqdm(total=cfg.training.num_offline_steps, desc="Offline Training", unit="step") as pbar:
