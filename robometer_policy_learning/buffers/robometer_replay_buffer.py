@@ -866,6 +866,16 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
                     video_embeddings = self.precomputed_video_embeddings[demo_key]  # [T, D]
                     obs_dict["dino_embedding"] = video_embeddings
 
+                # Build observation/state to match LiberoPI0Wrapper's format:
+                # ee_states (6D = ee_pos+ee_ori) + gripper_states (2D) = 8D.
+                if "observation/state" not in obs_dict:
+                    ee_states = obs_dict.get("ee_states")
+                    gripper_states = obs_dict.get("gripper_states")
+                    if ee_states is not None and gripper_states is not None:
+                        obs_dict["observation/state"] = np.concatenate(
+                            [ee_states, gripper_states], axis=-1
+                        ).astype(np.float32)
+
                 cached_demo["obs"] = obs_dict
 
         # Register newly added keys so the buffer samples them correctly.
@@ -875,11 +885,15 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
                 self.low_dim_keys.append("language")
             if self.use_dino_embeddings and "dino_embedding" not in self.low_dim_keys:
                 self.low_dim_keys.append("dino_embedding")
+            if "observation/state" not in self.low_dim_keys:
+                self.low_dim_keys.append("observation/state")
         if getattr(self, "obs_keys", None) is not None:
             if has_any_language and "language" not in self.obs_keys:
                 self.obs_keys.append("language")
             if self.use_dino_embeddings and "dino_embedding" not in self.obs_keys:
                 self.obs_keys.append("dino_embedding")
+            if "observation/state" not in self.obs_keys:
+                self.obs_keys.append("observation/state")
 
     def _compute_rewards_batch(self, batch_raw: List[Dict[str, Any]]) -> Tuple[List[float], List[float]]:
         """
