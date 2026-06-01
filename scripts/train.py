@@ -111,15 +111,15 @@ def main(cfg: DictConfig):
             dinov2_model=components.dinov2_model,
             dinov2_processor=components.dinov2_processor,
             reward_relabeling_keys=reward_relabeling_keys,
-            use_success_detection=cfg.reward_model.use_success_detection if cfg.reward_model is not None else False,
-            success_detection_duration=cfg.reward_model.success_detection_duration
-            if cfg.reward_model is not None
+            use_success_detection=reward_model_cfg.use_success_detection if reward_model_cfg is not None else False,
+            success_detection_duration=reward_model_cfg.success_detection_duration
+            if reward_model_cfg is not None
             else 2,
-            success_detection_threshold=cfg.reward_model.success_detection_threshold
-            if cfg.reward_model is not None
+            success_detection_threshold=reward_model_cfg.success_detection_threshold
+            if reward_model_cfg is not None
             else 0.65,
-            add_estimated_reward=cfg.reward_model.add_estimated_reward
-            if cfg.reward_model is not None
+            add_estimated_reward=reward_model_cfg.add_estimated_reward
+            if reward_model_cfg is not None
             else False,
         )
 
