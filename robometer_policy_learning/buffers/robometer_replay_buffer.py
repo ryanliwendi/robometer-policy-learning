@@ -610,7 +610,7 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
             else []
         )
         hash_input = (
-            f"{cache_type}_{h5_paths_list}_{reward_keys}_{self.sentence_model.get_sentence_embedding_dimension()}"
+            f"{cache_type}_{h5_paths_list}_{reward_keys}_{self.sentence_model.get_sentence_embedding_dimension() if self.sentence_model is not None else 'no_sentence_model'}"
         )
         if self.use_dino_embeddings and self.dinov2_model is not None:
             hash_input += f"_dinov2_{self.dinov2_model.config.name_or_path}"
@@ -785,8 +785,13 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
         Compute language embeddings for all unique instructions in the cache.
 
         Returns:
-            Dictionary mapping text instruction to language embedding array [D]
+            Dictionary mapping text instruction to language embedding array [D],
+            or empty dict if no sentence model is available.
         """
+        if self.sentence_model is None or compute_text_embeddings is None:
+            logger.info("No sentence model available; skipping language embedding computation.")
+            return {}
+
         logger.info("Computing language embeddings for all trajectories...")
         all_trajectory_frames, all_language_instructions, all_episode_lengths = self._load_all_frames_for_demos()
 
@@ -844,15 +849,17 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
                 language_str = self._load_language_instruction_from_file(h5_path, original_demo_name)
                 cached_demo["language_instruction"] = language_str
 
-            language_encoding = self.text_embeddings_dict[language_str]
+            has_language = language_str in self.text_embeddings_dict
 
             if "obs" in cached_demo and cached_demo["obs"] is not None:
                 obs_dict = cached_demo["obs"]
                 episode_len = len(cached_demo["actions"])
 
-                # Add language encoding (same for all timesteps)
-                lang_array = np.repeat(np.expand_dims(language_encoding, axis=0), episode_len, axis=0)
-                obs_dict["language"] = lang_array
+                # Add language encoding (same for all timesteps) if available
+                if has_language:
+                    language_encoding = self.text_embeddings_dict[language_str]
+                    lang_array = np.repeat(np.expand_dims(language_encoding, axis=0), episode_len, axis=0)
+                    obs_dict["language"] = lang_array
 
                 # Add DINO embeddings (one per timestep) if available
                 if self.use_dino_embeddings and demo_key in self.precomputed_video_embeddings:
@@ -861,14 +868,15 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
 
                 cached_demo["obs"] = obs_dict
 
-        # Try to register 'language' and 'dino_embedding' as low_dim keys if needed
+        # Register newly added keys so the buffer samples them correctly.
+        has_any_language = bool(self.text_embeddings_dict)
         if hasattr(self, "low_dim_keys"):
-            if "language" not in self.low_dim_keys:
+            if has_any_language and "language" not in self.low_dim_keys:
                 self.low_dim_keys.append("language")
             if self.use_dino_embeddings and "dino_embedding" not in self.low_dim_keys:
                 self.low_dim_keys.append("dino_embedding")
         if getattr(self, "obs_keys", None) is not None:
-            if "language" not in self.obs_keys:
+            if has_any_language and "language" not in self.obs_keys:
                 self.obs_keys.append("language")
             if self.use_dino_embeddings and "dino_embedding" not in self.obs_keys:
                 self.obs_keys.append("dino_embedding")
