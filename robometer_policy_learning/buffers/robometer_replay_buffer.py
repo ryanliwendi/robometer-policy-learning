@@ -575,7 +575,12 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
             # Load subsequent frames in a single read: shape [episode_len, H, W, C]
             with self._get_hdf5_file(h5_path) as file:
                 demo_group = self._get_demo_group(file, original_demo_name)
-                all_next_frames = np.array(demo_group["next_obs"][img_key][:episode_len])
+                try:
+                    all_next_frames = np.array(demo_group["next_obs"][img_key][:episode_len])
+                except Exception: 
+                    obs_frames = np.array(demo_group["obs"][img_key][:episode_len])
+                    all_next_frames = np.concatenate([obs_frames[1:], obs_frames[-1:]], axis=0)
+
 
             # Concatenate to [episode_len+1, H, W, C]
             video_frames = np.concatenate([initial_frame[np.newaxis, ...], all_next_frames], axis=0)
