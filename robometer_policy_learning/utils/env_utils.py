@@ -171,8 +171,9 @@ def _make_env(
                                 dinov2_processor=dinov2_processor,
                                 sentence_model=sentence_model,
                                 device=device,
-                                max_episode_steps=max_episode_steps, 
-                                seed=seed, 
+                                max_episode_steps=max_episode_steps,
+                                seed=seed,
+                                image_keys=dino_image_keys if dino_image_keys is not None else ["observation/image"],
                                 )
     else:
         # Regular gym environment
