@@ -19,7 +19,11 @@ from robometer_policy_learning.runners.serial_runner import SerialRunner
 
 from robometer_policy_learning.buffers.mixed_replay_buffer import MixedReplayBuffer
 from robometer_policy_learning.buffers.samplers import ChunkedSequentialSampler, RandomSampler
-from robometer_policy_learning.buffers.remote_reward_relabel_buffer import AsyncRewardRelabelBuffer
+# Circumvented an exception here because this is not needed for BC training
+try:
+    from robometer_policy_learning.buffers.remote_reward_relabel_buffer import AsyncRewardRelabelBuffer
+except Exception:
+    AsyncRewardRelabelBuffer = None
 from robometer_policy_learning.algorithms.bc import BC, BCConfig
 from robometer_policy_learning.algorithms.iql import IQL, IQLConfig
 from robometer_policy_learning.algorithms.sac import SAC, SACConfig
