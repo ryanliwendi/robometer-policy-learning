@@ -2,8 +2,8 @@ defaults:
   - algorithm@offline_algorithm: bc # Options: iql, bc
   - algorithm@online_algorithm: null
   - reward_model: null # Options: null, robometer
-  - policy@policy: mlp # Options: mlp, rnn, transformer
-  - value_function@value_function: mlp # Options: mlp, rnn, transformer
+  - policy@policy: transformer # Options: mlp, rnn, transformer
+  - value_function@value_function: transformer # Options: mlp, rnn, transformer
 
 # Debug mode
 debug: false
@@ -24,7 +24,7 @@ env:
 training:
   num_envs: 1 # Number of parallel environments
   num_rollouts: 0  # Number of rollouts to train, this is more like env steps
-  chunk_size: null # Action chunking size
+  chunk_size: 10 # Action chunking size
   use_rnn: false  # Use RNN actor and critic
   num_offline_steps: 100_000  # Number of offline training steps
   load_dir: null  # Directory to load RL models from (null for no loading)
