@@ -23,6 +23,7 @@ class BCConfig(BaseAlgorithmConfig):
     # Set up BC parameters
     learning_starts: int = 100
     batch_size: int = 256
+    gamma: float = 0.99  # unused by BC loss; required by ChunkedSequentialSampler
 
     # Training configuration
     num_updates_per_train_step: int = 1
