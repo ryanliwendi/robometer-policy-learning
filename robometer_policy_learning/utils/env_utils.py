@@ -175,6 +175,8 @@ def _make_env(
                                 seed=seed,
                                 image_keys=dino_image_keys if dino_image_keys is not None else ["observation/image"],
                                 )
+        if chunk_size is not None:
+            env = VectorActionChunkingWrapper(env, chunk_size=chunk_size, n_action_steps=1)
     else:
         # Regular gym environment
         if vectorized:
