@@ -24,7 +24,7 @@ dependencies = [
     "gym",
     "metaworld",
     # Model libraries (for reward models and transformers)
-    "transformers>=4.57.0",
+    "transformers==4.57.6",
     "sentence-transformers>=2.0.0",
     "huggingface-hub>=0.35.0",
     # Data handling
@@ -116,7 +116,7 @@ allow-direct-references = true
 [tool.uv]
 extra-build-dependencies = { egl-probe = ["cmake<4.0"] }
 override-dependencies = [
-    "transformers>=4.57.0",
+    "transformers==4.57.6",
     "jax[cuda12]>=0.5.3,<0.7.0",  # 0.6.x has better bf16 support but keeps DeviceLocalLayout API
     "gymnasium>=1.2.2", # override lerobot dependency (stemming from openpi repo)
     "protobuf>3.21",

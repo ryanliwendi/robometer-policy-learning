@@ -19,12 +19,8 @@ from robometer_policy_learning.buffers.replay_buffer import ReplayBuffer
 from robometer_policy_learning.buffers.h5_replay_buffer import H5ReplayBuffer
 from robometer_policy_learning.buffers.robometer_replay_buffer import RobometerReplayBuffer, RobometerH5ReplayBuffer
 from robometer_policy_learning.buffers.success_failure_replay_buffer import SuccessFailureReplayBuffer
-try:
-    from robometer_policy_learning.buffers.remote_reward_relabel_buffer import AsyncRewardRelabelBuffer
-    from robometer_policy_learning.distributed.clients.reward_relabel_client import RewardRelabelClient
-except Exception: 
-    AsyncRewardRelabelBuffer = None
-    RewardRelabelClient = None
+from robometer_policy_learning.buffers.remote_reward_relabel_buffer import AsyncRewardRelabelBuffer
+from robometer_policy_learning.distributed.clients.reward_relabel_client import RewardRelabelClient
 
 # Setup imports
 from transformers import AutoModel, AutoImageProcessor
