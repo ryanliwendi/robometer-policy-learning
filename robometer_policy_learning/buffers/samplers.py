@@ -131,17 +131,25 @@ class ChunkedSequentialSampler(BaseSampler):
 
         sequence_transitions = []
         for chunk in chunks:
-            if len(chunk) >= self.chunk_size:
+            if len(chunk) >= self.chunk_size:  # Only a defensive guard, chunk is always chunk_size of length
                 seq_transition = self._chunk_to_sequence(chunk[: self.chunk_size])
                 sequence_transitions.append(seq_transition)
 
-        return sequence_transitions[:batch_size]
+        return sequence_transitions[:batch_size]  # Defensive guard
 
     def sample_indices(self, buffer: "BaseReplayBuffer", batch_size: int):
         return None
 
     def _chunk_to_sequence(self, chunk: List["Transition"]) -> "Transition":
-        """Convert chunk to sequence format for RNN training."""
+        """Collapse a list of chunk_size raw Transition objects into one synthetic Transition.
+
+        obs_as_sequence=False (transformer chunking):
+            obs      = chunk[0].obs            (single obs, start of chunk)
+            action   = stack of all actions    (shape [chunk_size, action_dim])
+            reward   = discounted sum over chunk (γ⁰r0 + γ¹r1 + ... + γ^(n-1)r_{n-1})
+            next_obs = chunk[-1].next_obs      (single obs, end of chunk)
+            done     = any step in chunk was terminal
+        """
         first = chunk[0]
 
         # --- Observations ---
