@@ -1,6 +1,6 @@
 learning_starts: 4000
 ent_coef: "auto"
-target_entropy: "auto"
+target_entropy: -70
 target_update_interval: 1
 gamma: 0.99
 tau: 0.005
