@@ -76,9 +76,17 @@ class ReplayBuffer(BaseReplayBuffer):
                         del self._episode_steps[old.episode_id]
 
         self.buffer[self._write_pos] = transition
-        if episode_id is not None and step_in_episode is not None:
-            self._transition_index[(episode_id, step_in_episode)] = self._write_pos
-            self._episode_steps.setdefault(episode_id, {})[step_in_episode] = self._write_pos
+        if episode_id is not None:
+            # Use step_in_episode when provided (e.g. async reward relabeling); otherwise
+            # auto-assign a sequential key so _episode_steps is always populated and
+            # get_contiguous_chunks() can sample chunks from online rollouts that don't
+            # supply step_in_episode in info.
+            if step_in_episode is not None:
+                step_key = step_in_episode
+            else:
+                step_key = len(self._episode_steps.get(episode_id, {}))
+            self._transition_index[(episode_id, step_key)] = self._write_pos
+            self._episode_steps.setdefault(episode_id, {})[step_key] = self._write_pos
 
         self._write_pos = (self._write_pos + 1) % self.capacity
         self._size = min(self._size + 1, self.capacity)
