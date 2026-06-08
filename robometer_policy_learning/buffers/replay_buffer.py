@@ -20,6 +20,8 @@ class ReplayBuffer(BaseReplayBuffer):
         pre_transforms: List[Callable] = None,
         post_transforms: List[Callable] = None,
         sampler=None,
+        min_action=None,
+        max_action=None,
     ):
         super().__init__(
             obs_keys=obs_keys,
@@ -28,6 +30,8 @@ class ReplayBuffer(BaseReplayBuffer):
             pre_transforms=pre_transforms,
             post_transforms=post_transforms,
             sampler=sampler,
+            min_action=min_action,
+            max_action=max_action,
         )
         self.capacity = capacity
         self.buffer = [None] * capacity

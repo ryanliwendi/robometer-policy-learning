@@ -9,6 +9,7 @@ import os
 if "MUJOCO_GL" not in os.environ:
     os.environ["MUJOCO_GL"] = "egl"
 
+import numpy as np
 import torch
 from hydra import main as hydra_main
 from omegaconf import DictConfig, OmegaConf
@@ -23,6 +24,7 @@ from robometer_policy_learning.buffers.remote_reward_relabel_buffer import Async
 from robometer_policy_learning.algorithms.bc import BC, BCConfig
 from robometer_policy_learning.algorithms.iql import IQL, IQLConfig
 from robometer_policy_learning.algorithms.sac import SAC, SACConfig
+from robometer_policy_learning.algorithms.dp import DP, DPConfig
 from robometer_policy_learning.rollouts.robometer_rollout_worker import RobometerRolloutWorker
 from robometer_policy_learning.rollouts.rollout_worker import RolloutWorker
 from robometer_policy_learning.rollouts.evaluation_worker import EvaluationWorker
@@ -32,6 +34,7 @@ ALG_TO_CONFIG = {
     "iql": IQLConfig,
     "bc": BCConfig,
     "sac": SACConfig,
+    "dp": DPConfig,
 }
 
 
@@ -62,7 +65,24 @@ def main(cfg: DictConfig):
     logger = components.logger
     wandb_logger = components.wandb_logger
     reward_model_cfg = OmegaConf.select(cfg, "reward_model", default=None)
-    reward_relabeling_keys = components.dino_image_keys
+    image_keys_to_be_used = components.dino_image_keys
+
+    # Action bounds for buffer-side normalization: stored (env-space) actions are mapped to
+    # the policy's [-1, 1] space for offline/online training, matching the actor's output.
+    # Only set when the action space is finite (else the actor doesn't normalize either, so
+    # the buffer shouldn't). The env still receives unnormalized actions (act() unnormalizes).
+    _action_space = env.single_action_space if hasattr(env, "single_action_space") else env.action_space
+    if (
+        _action_space is not None
+        and hasattr(_action_space, "low")
+        and np.all(np.isfinite(_action_space.low))
+        and np.all(np.isfinite(_action_space.high))
+    ):
+        action_min = np.asarray(_action_space.low, dtype=np.float32)
+        action_max = np.asarray(_action_space.high, dtype=np.float32)
+    else:
+        action_min = action_max = None
+    logger.info(f"Action normalization bounds: min={action_min}, max={action_max}")
 
     # Override num_offline_steps in debug mode
     if cfg.debug:
@@ -85,8 +105,9 @@ def main(cfg: DictConfig):
         if cfg.training.chunk_size is None:
             sampler = RandomSampler()
         else:
+            gamma = offline_algorithm_cfg.gamma if hasattr(offline_algorithm_cfg, "gamma") else 0.99
             sampler = ChunkedSequentialSampler(
-                chunk_size=cfg.training.chunk_size, obs_as_sequence=False, gamma=offline_algorithm_cfg.gamma
+                chunk_size=cfg.training.chunk_size, obs_as_sequence=False, gamma=gamma
             )
         logger.info(f"Offline Sampler: {sampler.__class__.__name__}")
         offline_buffer = create_buffer(
@@ -106,16 +127,18 @@ def main(cfg: DictConfig):
             sentence_model=components.sentence_model,
             dinov2_model=components.dinov2_model,
             dinov2_processor=components.dinov2_processor,
-            reward_relabeling_keys=reward_relabeling_keys,
-            use_success_detection=cfg.reward_model.use_success_detection if cfg.reward_model is not None else False,
+            image_keys_to_be_used=image_keys_to_be_used,
+            min_action=action_min,
+            max_action=action_max,
+            use_success_detection=cfg.reward_model.use_success_detection if reward_model is not None else False,
             success_detection_duration=cfg.reward_model.success_detection_duration
-            if cfg.reward_model is not None
+            if reward_model is not None
             else 2,
             success_detection_threshold=cfg.reward_model.success_detection_threshold
-            if cfg.reward_model is not None
+            if reward_model is not None
             else 0.65,
             add_estimated_reward=cfg.reward_model.add_estimated_reward
-            if cfg.reward_model is not None
+            if reward_model is not None
             else False,
         )
 
@@ -158,6 +181,8 @@ def main(cfg: DictConfig):
                 record_video=True,
                 logger=wandb_logger,
             )
+            offline_eval_metrics = offline_evaluation_worker.run(offline_algo.actor)
+            wandb_logger.log(offline_eval_metrics, step=0, prefix="offline/eval")            
             # Training loop
             logger.info(f"Training offline algorithm for {cfg.training.num_offline_steps} steps")
             with tqdm(total=cfg.training.num_offline_steps, desc="Offline Training", unit="step") as pbar:
@@ -227,7 +252,9 @@ def main(cfg: DictConfig):
             eval_server_timeout=components.eval_server_timeout if not use_async_reward_relabel else 120.0,
             use_async_reward_relabel=use_async_reward_relabel and reward_model is not None,
             reward_model=reward_model,
-            reward_relabeling_keys=reward_relabeling_keys,
+            image_keys_to_be_used=image_keys_to_be_used,
+            min_action=action_min,
+            max_action=action_max,
             reward_relabel_address=reward_relabel_address
             if use_async_reward_relabel and reward_model is not None
             else None,
@@ -298,7 +325,7 @@ def main(cfg: DictConfig):
             device=device,
             count_by="step",
             num_envs=cfg.training.num_envs,
-            reward_relabeling_keys=reward_relabeling_keys if reward_model_cfg is not None else None,
+            reward_relabeling_keys=image_keys_to_be_used if reward_model_cfg is not None else None,
         )
         logger.info(f"Rollout worker: {rollout_worker.num_envs} environments")
 

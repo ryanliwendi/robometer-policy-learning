@@ -1,9 +1,5 @@
 import numpy as np
 from typing import List, Dict, Optional, Any, Tuple
-import os
-import hashlib
-import pickle
-import torch
 
 from loguru import logger
 from collections import deque
@@ -18,7 +14,6 @@ from robometer_policy_learning.utils.robometer_utils import (
 from robometer_policy_learning.utils.gpu_utils import convert_to_numpy
 from robometer.evals.eval_utils import raw_dict_to_sample, build_payload, post_batch_npy
 from robometer.evals.eval_server import process_batch_helper
-from robometer.utils.embedding_utils import compute_text_embeddings, compute_video_embeddings
 from transformers import AutoModel, AutoImageProcessor
 from sentence_transformers import SentenceTransformer
 from robometer.utils.setup_utils import setup_batch_collator
@@ -269,6 +264,14 @@ class RobometerReplayBuffer(ReplayBuffer):
 
 
 class RobometerH5ReplayBuffer(H5ReplayBuffer):
+    """Offline HDF5 buffer that relabels rewards with a Robometer reward model / eval server.
+
+    DINO image embeddings and sentence (language) embeddings are handled by the base
+    :class:`H5ReplayBuffer`; this subclass only adds reward relabeling on top. Use it only
+    when reward relabeling is required (``reward_model`` or ``use_eval_server``); for plain
+    embedding-augmented offline data, use :class:`H5ReplayBuffer` directly.
+    """
+
     def __init__(
         self,
         reward_model=None,
@@ -287,15 +290,26 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
         add_estimated_reward: bool = False,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        # Reward relabeling embeds the same image keys it scores, so the base buffer
+        # computes DINO embeddings over `reward_relabeling_keys` (set before super()).
+        self.reward_relabeling_keys = reward_relabeling_keys
+        super().__init__(
+            dinov2_model=dinov2_model,
+            dinov2_processor=dinov2_processor,
+            sentence_model=sentence_model,
+            dino_embedding_keys=reward_relabeling_keys,
+            **kwargs,
+        )
+        # Base has now computed DINO/language embeddings and added them to obs.
+
         self.use_eval_server = use_eval_server
         self.eval_server_url = eval_server_url
         self.eval_server_timeout = eval_server_timeout
-        self.reward_relabeling_keys = reward_relabeling_keys
         self.use_success_detection = use_success_detection
         self.success_detection_duration = success_detection_duration
         self.success_detection_threshold = success_detection_threshold
         self.add_estimated_reward = add_estimated_reward
+        self.use_relative_rewards = use_relative_rewards
 
         # Set max_frames once from config
         if reward_model_config is not None:
@@ -326,27 +340,9 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
                 raise ValueError("eval_server_url must be provided when use_eval_server=True")
             logger.info(f"Using eval_server at {self.eval_server_url} for reward computation")
 
-        # Set up cache directory for embeddings
-        h5_paths = kwargs.get("h5_paths")
-        h5_paths_list = h5_paths if isinstance(h5_paths, list) else [h5_paths]
-        self.embeddings_cache_dir = os.path.join(os.path.dirname(h5_paths_list[0]), ".embeddings_cache")
-        os.makedirs(self.embeddings_cache_dir, exist_ok=True)
-
-        # Since we need to add embeddings to observations for policy learning, we need to initialize the models.
-        self.use_dino_embeddings = True
-        self.dinov2_model = dinov2_model
-        self.dinov2_processor = dinov2_processor
-        self.sentence_model = sentence_model
-        self.use_relative_rewards = use_relative_rewards
-
-        # Always compute language and video embeddings
-        self.precomputed_video_embeddings = self._load_or_compute_video_embeddings()
-        self.text_embeddings_dict = self._load_or_compute_language_embeddings()
-
-        # Relabel rewards if using Robometer rewards, otherwise only add embeddings to obs
+        # Relabel rewards using the reward model (embeddings already attached by the base).
         if self.reward_model is not None:
             self.relabel_rewards(verbose=True, batch_size=8)
-        self.add_embeddings_to_obs()
 
     def relabel_rewards(self, verbose: bool = True, batch_size: Optional[int] = None):
         """
@@ -499,364 +495,6 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
             assert len(cached_demo["rewards"]) == len(cached_demo["actions"]) == len(cached_demo["dones"])
 
         logger.info(f"Reward relabeling complete!")
-
-    # --------------------------
-    # Loading and caching
-    # --------------------------
-    def _load_with_optimizations(self):
-        if self.obs_keys is None:
-            self.obs_keys = self._get_all_obs_keys(self.h5_paths[0])
-
-        # Determine modalities by heuristic
-        low_dim_keys: List[str] = []
-        rgb_keys: List[str] = []
-        # Combine reward_relabeling_keys with common image keywords
-        reward_image_keys = set(
-            self.reward_relabeling_keys
-            if hasattr(self, "reward_relabeling_keys") and self.reward_relabeling_keys is not None
-            else []
-        )
-        for key in self.obs_keys:
-            is_image_key = any(img_kw in key.lower() for img_kw in ["image", "rgb", "camera", "cam"])
-            is_reward_key = key in reward_image_keys
-            if is_image_key or is_reward_key:
-                if key not in rgb_keys:
-                    rgb_keys.append(key)
-            else:
-                low_dim_keys.append(key)
-        self.image_keys = rgb_keys
-        self.low_dim_keys = low_dim_keys
-
-        if self.hdf5_cache_mode in ["all", "low_dim"]:
-            self._load_with_memory_cache()
-        else:
-            self._convert_to_transitions()
-
-        self._print_dataset_statistics()
-        self.image_loading_executor = None
-
-    def _load_all_frames_for_demos(self, key: Optional[str] = None):
-        """
-        Helper method to load all frames for all demos.
-        If key is provided, only load frames for that key.
-        Returns tuple of (all_trajectory_frames, all_language_instructions, all_episode_lengths).
-        """
-        all_trajectory_frames = []
-        all_language_instructions = {}
-        all_episode_lengths = {}
-
-        for demo_key, cached_demo in self.hdf5_cache.items():
-            h5_path, unique_episode_id = demo_key.split("::")
-            original_demo_name = cached_demo.get("original_demo_name", unique_episode_id.split("_", 1)[-1])
-
-            # Episode length
-            episode_len = len(cached_demo["actions"])
-            all_episode_lengths[demo_key] = episode_len
-
-            # Language instruction
-            language_instruction = self._load_language_instruction_from_file(h5_path, original_demo_name)
-            all_language_instructions[demo_key] = language_instruction
-
-            img_key = key if key is not None else self.image_keys[0]
-
-            # Load initial frame (t=0)
-            initial_frame = self._load_obs_from_file(h5_path, original_demo_name, img_key, 0)
-
-            # Load subsequent frames in a single read: shape [episode_len, H, W, C]
-            with self._get_hdf5_file(h5_path) as file:
-                demo_group = self._get_demo_group(file, original_demo_name)
-                all_next_frames = np.array(demo_group["next_obs"][img_key][:episode_len])
-
-            # Concatenate to [episode_len+1, H, W, C]
-            video_frames = np.concatenate([initial_frame[np.newaxis, ...], all_next_frames], axis=0)
-
-            all_trajectory_frames.append((demo_key, cached_demo, video_frames))
-
-        return all_trajectory_frames, all_language_instructions, all_episode_lengths
-
-    def _get_cache_key(self, cache_type: str) -> str:
-        """
-        Generate a cache key based on h5_paths, model names, and other relevant info.
-
-        Args:
-            cache_type: Type of cache ('video' or 'language')
-
-        Returns:
-            Cache key string
-        """
-        # Get h5_paths as a sorted list for consistent hashing
-        h5_paths_list = sorted(self.h5_paths if isinstance(self.h5_paths, list) else [self.h5_paths])
-
-        # Create a hash from h5_paths and cache type.
-        # Include reward_relabeling_keys because video embeddings depend on which image keys we embed (and their order).
-        reward_keys = (
-            self.reward_relabeling_keys
-            if hasattr(self, "reward_relabeling_keys") and self.reward_relabeling_keys is not None
-            else []
-        )
-        hash_input = (
-            f"{cache_type}_{h5_paths_list}_{reward_keys}_{self.sentence_model.get_sentence_embedding_dimension()}"
-        )
-        if self.use_dino_embeddings and self.dinov2_model is not None:
-            hash_input += f"_dinov2_{self.dinov2_model.config.name_or_path}"
-
-        # Use file modification times to detect dataset changes
-        for h5_path in h5_paths_list:
-            if os.path.exists(h5_path):
-                mtime = os.path.getmtime(h5_path)
-                hash_input += f"_{mtime}"
-
-        cache_key = hashlib.md5(hash_input.encode()).hexdigest()
-        return cache_key
-
-    def _get_cache_path(self, cache_type: str) -> str:
-        """Get the full path to the cache file."""
-        cache_key = self._get_cache_key(cache_type)
-        return os.path.join(self.embeddings_cache_dir, f"{cache_type}_embeddings_{cache_key}.pkl")
-
-    def _load_video_embeddings_from_cache(self) -> Optional[Dict[str, np.ndarray]]:
-        """Load video embeddings from cache if available."""
-        cache_path = self._get_cache_path("video")
-        if os.path.exists(cache_path):
-            logger.info(f"Loading video embeddings from cache: {cache_path}")
-            with open(cache_path, "rb") as f:
-                cached_data = pickle.load(f)
-                logger.info(f"Successfully loaded {len(cached_data)} video embeddings from cache")
-                return cached_data
-        return None
-
-    def _save_video_embeddings_to_cache(self, embeddings: Dict[str, np.ndarray]):
-        """Save video embeddings to cache."""
-        cache_path = self._get_cache_path("video")
-        logger.info(f"Saving video embeddings to cache: {cache_path}")
-        with open(cache_path, "wb") as f:
-            pickle.dump(embeddings, f)
-        logger.info(f"Successfully saved {len(embeddings)} video embeddings to cache")
-
-    def _load_language_embeddings_from_cache(self) -> Optional[Dict[str, np.ndarray]]:
-        """Load language embeddings from cache if available."""
-        cache_path = self._get_cache_path("language")
-        if os.path.exists(cache_path):
-            logger.info(f"Loading language embeddings from cache: {cache_path}")
-            with open(cache_path, "rb") as f:
-                cached_data = pickle.load(f)
-                logger.info(f"Successfully loaded {len(cached_data)} language embeddings from cache")
-                return cached_data
-        return None
-
-    def _save_language_embeddings_to_cache(self, embeddings: Dict[str, np.ndarray]):
-        """Save language embeddings to cache."""
-        cache_path = self._get_cache_path("language")
-        logger.info(f"Saving language embeddings to cache: {cache_path}")
-        with open(cache_path, "wb") as f:
-            pickle.dump(embeddings, f)
-        logger.info(f"Successfully saved {len(embeddings)} language embeddings to cache")
-
-    def _load_or_compute_video_embeddings(self) -> Dict[str, np.ndarray]:
-        """Load video embeddings from cache or compute them if not available."""
-        cached_embeddings = self._load_video_embeddings_from_cache()
-        if cached_embeddings is not None:
-            return cached_embeddings
-
-        # Compute embeddings if not in cache
-        embeddings = self.compute_video_embeddings_for_trajectory()
-        self._save_video_embeddings_to_cache(embeddings)
-        return embeddings
-
-    def _load_or_compute_language_embeddings(self) -> Dict[str, np.ndarray]:
-        """Load language embeddings from cache or compute them if not available."""
-        cached_embeddings = self._load_language_embeddings_from_cache()
-        if cached_embeddings is not None:
-            return cached_embeddings
-
-        # Compute embeddings if not in cache
-        embeddings = self.compute_language_embeddings_for_trajectory()
-        self._save_language_embeddings_to_cache(embeddings)
-        return embeddings
-
-    def compute_video_embeddings_for_trajectory(self) -> Dict[str, np.ndarray]:
-        """
-        Compute DINO embeddings for all image keys in `self.reward_relabeling_keys`.
-
-        Returns:
-            Dictionary mapping demo_key to concatenated video embeddings array [T, D_total],
-            where D_total = D_per_key * len(self.reward_relabeling_keys) and the concatenation order
-            matches `self.reward_relabeling_keys`.
-        """
-        reward_keys: List[str] = (
-            self.reward_relabeling_keys
-            if hasattr(self, "reward_relabeling_keys") and self.reward_relabeling_keys is not None
-            else []
-        )
-        if len(reward_keys) == 0:
-            # Fallback to first image key if reward relabeling keys are not configured
-            reward_keys = [self.image_keys[0]]
-
-        logger.info(f"Computing video embeddings for all trajectories across keys: {reward_keys}")
-
-        # Compute per-key embeddings, then concatenate per demo_key.
-        per_key_embeddings: Dict[str, Dict[str, np.ndarray]] = {}
-
-        for key in reward_keys:
-            all_trajectory_frames, _, all_episode_lengths = self._load_all_frames_for_demos(key=key)
-
-            # Collect all frames from all trajectories (for this key)
-            all_frames_list = []
-            trajectory_frame_indices = []
-            current_frame_idx = 0
-
-            for demo_idx, (demo_key, cached_demo, video_frames) in enumerate(all_trajectory_frames):
-                num_frames = len(video_frames)
-                trajectory_frame_indices.append((current_frame_idx, current_frame_idx + num_frames))
-                all_frames_list.append(video_frames)
-                current_frame_idx += num_frames
-
-            if len(all_frames_list) == 0:
-                logger.warning(f"No frames found for key={key}; skipping embeddings for this key")
-                per_key_embeddings[key] = {}
-                continue
-
-            # Batch compute video embeddings for all frames for this key
-            all_frames_array = np.concatenate(all_frames_list, axis=0)
-            all_frame_embeddings = compute_video_embeddings(
-                all_frames_array,
-                self.dinov2_model,
-                self.dinov2_processor,
-                use_autocast=True,
-                use_tqdm=True,
-            )
-
-            logger.info(
-                f"[{key}] Computed {all_frame_embeddings.shape[0]} frame embeddings for {len(all_frames_list)} trajectories"
-            )
-
-            # Store per-timestep embeddings per trajectory
-            key_embeddings: Dict[str, np.ndarray] = {}
-            for demo_idx, (demo_key, cached_demo, video_frames) in enumerate(all_trajectory_frames):
-                episode_len = all_episode_lengths[demo_key]
-                start_idx, end_idx = trajectory_frame_indices[demo_idx]
-                trajectory_embeddings = all_frame_embeddings[start_idx:end_idx]
-
-                # One embedding per timestep (truncate or pad last as needed)
-                embedding_per_timestep = []
-                for t in range(episode_len):
-                    if t < len(trajectory_embeddings):
-                        embedding_per_timestep.append(trajectory_embeddings[t])
-                    else:
-                        embedding_per_timestep.append(trajectory_embeddings[-1])
-
-                key_embeddings[demo_key] = np.stack(embedding_per_timestep[:episode_len], axis=0)
-
-            per_key_embeddings[key] = key_embeddings
-
-        # Concatenate per-key embeddings per demo_key in the configured order.
-        precomputed_video_embeddings: Dict[str, np.ndarray] = {}
-        demo_keys = list(self.hdf5_cache.keys()) if self.hdf5_cache is not None else []
-        for demo_key in demo_keys:
-            chunks = []
-            for key in reward_keys:
-                if demo_key not in per_key_embeddings.get(key, {}):
-                    raise RuntimeError(
-                        f"Missing video embeddings for demo_key={demo_key} key={key}. "
-                        "Check that the image key exists in the dataset and frames were loaded correctly."
-                    )
-                chunks.append(per_key_embeddings[key][demo_key])
-            precomputed_video_embeddings[demo_key] = np.concatenate(chunks, axis=-1)
-
-        return precomputed_video_embeddings
-
-    def compute_language_embeddings_for_trajectory(self) -> Dict[str, np.ndarray]:
-        """
-        Compute language embeddings for all unique instructions in the cache.
-
-        Returns:
-            Dictionary mapping text instruction to language embedding array [D]
-        """
-        logger.info("Computing language embeddings for all trajectories...")
-        all_trajectory_frames, all_language_instructions, all_episode_lengths = self._load_all_frames_for_demos()
-
-        # Compute language embeddings for all unique instructions
-        unique_texts = list(set(all_language_instructions.values()))
-        logger.info(f"Computing language embeddings for {len(unique_texts)} unique instructions...")
-
-        text_embeddings_dict = {}
-        for text in unique_texts:
-            text_emb = compute_text_embeddings(text, self.sentence_model, use_autocast=True, show_progress_bar=False)
-            text_embeddings_dict[text] = text_emb
-
-        logger.info(f"Computed {len(text_embeddings_dict)} language embeddings")
-        return text_embeddings_dict
-
-    def _load_language_instruction_from_file(self, h5_path: str, demo: str):
-        cache_key = f"{h5_path}::{demo}::language_instruction"
-        # Lightweight cache on the instance
-        if not hasattr(self, "_lang_instr_cache"):
-            self._lang_instr_cache = {}
-        if cache_key in self._lang_instr_cache:
-            return self._lang_instr_cache[cache_key]
-        with self._get_hdf5_file(h5_path) as f:
-            grp = self._get_demo_group(f, demo)
-            if "language_instruction" in grp:
-                val = grp["language_instruction"][()]
-                if isinstance(val, bytes):
-                    val = val.decode("utf-8", errors="ignore")
-                elif hasattr(val, "dtype") and getattr(val, "dtype", None).kind in {"S", "O"}:
-                    val = val.astype(str)
-                self._lang_instr_cache[cache_key] = val
-                return val
-
-    def add_embeddings_to_obs(self):
-        """
-        Add language encodings and DINO embeddings to the observation dicts of all demos in the HDF5 cache.
-        This will add 'language' and 'dino_embedding' keys to each time step in 'obs' for each demo,
-        reusing precomputed embeddings from self.text_embeddings_dict and self.precomputed_video_embeddings.
-        """
-        if self.hdf5_cache is None or len(self.hdf5_cache) == 0:
-            logger.warning("HDF5 cache is empty or not available, cannot add embeddings")
-            return
-
-        # Ensure text embeddings dict exists
-        if not hasattr(self, "text_embeddings_dict") or self.text_embeddings_dict is None:
-            raise RuntimeError("text_embeddings_dict must be precomputed before calling add_embeddings_to_obs")
-
-        for demo_key, cached_demo in self.hdf5_cache.items():
-            # Get the language string for this demo (from the cache or directly if available)
-            h5_path, unique_episode_id = demo_key.split("::")
-            original_demo_name = cached_demo.get("original_demo_name", unique_episode_id.split("_", 1)[-1])
-            if "language_instruction" in cached_demo:
-                language_str = cached_demo["language_instruction"]
-            else:
-                language_str = self._load_language_instruction_from_file(h5_path, original_demo_name)
-                cached_demo["language_instruction"] = language_str
-
-            language_encoding = self.text_embeddings_dict[language_str]
-
-            if "obs" in cached_demo and cached_demo["obs"] is not None:
-                obs_dict = cached_demo["obs"]
-                episode_len = len(cached_demo["actions"])
-
-                # Add language encoding (same for all timesteps)
-                lang_array = np.repeat(np.expand_dims(language_encoding, axis=0), episode_len, axis=0)
-                obs_dict["language"] = lang_array
-
-                # Add DINO embeddings (one per timestep) if available
-                if self.use_dino_embeddings and demo_key in self.precomputed_video_embeddings:
-                    video_embeddings = self.precomputed_video_embeddings[demo_key]  # [T, D]
-                    obs_dict["dino_embedding"] = video_embeddings
-
-                cached_demo["obs"] = obs_dict
-
-        # Try to register 'language' and 'dino_embedding' as low_dim keys if needed
-        if hasattr(self, "low_dim_keys"):
-            if "language" not in self.low_dim_keys:
-                self.low_dim_keys.append("language")
-            if self.use_dino_embeddings and "dino_embedding" not in self.low_dim_keys:
-                self.low_dim_keys.append("dino_embedding")
-        if getattr(self, "obs_keys", None) is not None:
-            if "language" not in self.obs_keys:
-                self.obs_keys.append("language")
-            if self.use_dino_embeddings and "dino_embedding" not in self.obs_keys:
-                self.obs_keys.append("dino_embedding")
 
     def _compute_rewards_batch(self, batch_raw: List[Dict[str, Any]]) -> Tuple[List[float], List[float]]:
         """

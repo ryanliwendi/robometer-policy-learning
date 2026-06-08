@@ -58,30 +58,38 @@ class RNNCritic(BaseCritic):
         self.featurizers = nn.ModuleDict() if self.featurizer_cfg else None
         self.use_action = config.use_action
 
-        # Build featurizers for dict observations
-        # If image_encoder_type is "impala", build IMPALA featurizers for image keys
-        if config.image_encoder_type == "impala":
-            from robometer_policy_learning.utils.featurizers import build_mlp_impala_featurizers, identify_image_keys
+        # Build featurizers for dict observations.
+        # If an image_encoder_type is set, build featurizer-level encoders (impala|resnet|dinov2).
+        if config.image_encoder_type in ("impala", "resnet", "dinov2"):
+            from robometer_policy_learning.modules.encoders import build_image_featurizers
+            from robometer_policy_learning.modules.transformer.transformer_utils import identify_image_keys
 
             if not isinstance(config.observation_space, gym.spaces.Dict):
-                raise ValueError("IMPALA encoder requires Dict observation space")
+                raise ValueError("Image encoders require a Dict observation space")
 
-            # Build IMPALA featurizers for image keys
-            impala_featurizers = build_mlp_impala_featurizers(
+            image_featurizers = build_image_featurizers(
                 observation_space=config.observation_space,
-                keys=None,  # Auto-detect image keys
-                nn_scale=config.impala_nn_scale,
-                num_blocks_per_stack=config.impala_num_blocks_per_stack,
-                use_smaller=config.impala_use_smaller,
-                requires_grad=True,
-                impala_output_dim=config.impala_output_dim,
+                image_keys=None,  # auto-detect image keys
+                image_encoder_type=config.image_encoder_type,
+                finetune=getattr(config, "finetune_image_encoder", False),
+                output_dim=config.impala_output_dim,
+                image_feature_dim=getattr(config, "image_feature_dim", 128),
+                resnet_backbone=getattr(config, "resnet_backbone", "ResNet18"),
+                resnet_pretrained=getattr(config, "resnet_pretrained", True),
+                resnet_pool=getattr(config, "resnet_pool", "spatial_softmax"),
+                spatial_softmax_num_kp=getattr(config, "spatial_softmax_num_kp", 32),
+                impala_nn_scale=config.impala_nn_scale,
+                impala_num_blocks_per_stack=config.impala_num_blocks_per_stack,
+                impala_use_smaller=config.impala_use_smaller,
+                dinov2_model=getattr(config, "dinov2_model", None),
+                dinov2_processor=getattr(config, "dinov2_processor", None),
             )
 
             # Merge with existing featurizer_cfg (featurizer_cfg takes precedence)
             image_keys = identify_image_keys(list(config.observation_space.spaces.keys()))
             for key in image_keys:
                 if key not in self.featurizer_cfg:
-                    self.featurizer_cfg[key] = impala_featurizers[key]
+                    self.featurizer_cfg[key] = image_featurizers[key]
             # For non-image keys, use default MLP if not specified
             for key in config.observation_space.spaces:
                 if key not in self.featurizer_cfg:
@@ -107,8 +115,11 @@ class RNNCritic(BaseCritic):
 
         # Determine input dimension to RNN
         if self.featurizer_cfg:
-            # sum over featurizer cfg values
-            obs_dim = sum(sum(value) for value in self.featurizer_cfg.values())
+            # MLP featurizers contribute their last hidden dim; image encoders their .output_dim
+            obs_dim = sum(
+                value.output_dim if hasattr(value, "output_dim") else int(value[-1])
+                for value in self.featurizer_cfg.values()
+            )
             self._flatten_keys = None
         elif isinstance(config.observation_space, gym.spaces.Dict):
             self._flatten_keys = [

@@ -33,8 +33,17 @@ class RNNCriticConfig(BaseCriticConfig):
     featurizer: Optional[dict] = None
     preprocess_obs_transform: Optional[List[Any]] = None
 
-    # IMPALA encoder parameters (optional)
-    image_encoder_type: str = None  # "impala" to enable IMPALA for image keys
+    # Image encoder parameters (optional).
+    # image_encoder_type in {impala, resnet, dinov2} enables featurizer-level image encoding.
+    image_encoder_type: str = None
+    finetune_image_encoder: bool = False
+    image_feature_dim: int = 128
+    resnet_backbone: str = "ResNet18"
+    resnet_pretrained: bool = True
+    resnet_pool: str = "spatial_softmax"
+    spatial_softmax_num_kp: int = 32
+    dinov2_model: object = None
+    dinov2_processor: object = None
     impala_nn_scale: int = 1
     impala_num_blocks_per_stack: int = 2
     impala_use_smaller: bool = False

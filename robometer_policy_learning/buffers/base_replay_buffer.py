@@ -276,12 +276,22 @@ class BaseReplayBuffer(abc.ABC):
         post_transforms: List[Callable] = None,  # Can handle both batch and transition transforms
         sampler: "BaseSampler" = None,
         reward_model=None,
+        min_action=None,
+        max_action=None,
     ):
         self.obs_keys = obs_keys
         self.remove_obs_keys = remove_obs_keys or []
         self.rename_obs_keys = rename_obs_keys or {}
         self.pre_transforms = pre_transforms or []
         self.post_transforms = post_transforms or []
+
+        # Optional action normalization to the policy's [-1, 1] space. When set, sampled
+        # actions are mapped from [min_action, max_action] -> [-1, 1] so that offline/online
+        # training operates on normalized actions (matching the actor's output space). The
+        # env still receives unnormalized actions because rollouts store env-space actions
+        # and BaseActor.act() unnormalizes at inference time.
+        self.min_action = None if min_action is None else np.asarray(min_action, dtype=np.float32)
+        self.max_action = None if max_action is None else np.asarray(max_action, dtype=np.float32)
         # Import here to avoid circular imports
         from robometer_policy_learning.buffers.samplers import RandomSampler
 
@@ -859,11 +869,31 @@ class BaseReplayBuffer(abc.ABC):
 
         transition = self._batch_transitions(sampled)
 
+        # Normalize stored (env-space) actions to the policy's [-1, 1] space, if configured.
+        if transition:
+            transition = self._normalize_action_batch(transition)
+
         # Convert to tensors if requested
         if transition:
             transition = self._convert_batch_to_tensors(transition, device, dtype)
 
         return transition
+
+    def _normalize_action_batch(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Map ``batch['action']`` from [min_action, max_action] to [-1, 1] (no-op if unset).
+
+        Broadcasts over the trailing action-dim, so it works for both single-step
+        ``(B, action_dim)`` and chunked ``(B, chunk, action_dim)`` action batches.
+        """
+        if self.min_action is None or self.max_action is None:
+            return batch
+        action = batch.get("action")
+        if not isinstance(action, np.ndarray) or action.dtype == object:
+            return batch
+        span = self.max_action - self.min_action
+        span = np.where(span == 0, 1.0, span)  # avoid div-by-zero on degenerate dims
+        batch["action"] = (2.0 * (action - self.min_action) / span - 1.0).astype(np.float32)
+        return batch
 
     def _convert_batch_to_tensors(self, batch: Dict[str, Any], device: str = None, dtype=None) -> Dict[str, Any]:
         """Convert batch from buffer to tensors on the specified device."""

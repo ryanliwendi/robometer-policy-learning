@@ -21,7 +21,7 @@ class TransformerCriticConfig(BaseCriticConfig):
     chunk_size: int = 10  # Expected action chunk size for Q-functions
 
     # MLP parameters for feature extraction and output
-    feature_hidden_dims: List[int] = (128,)  # MLP before transformer, None means direct input->transformer
+    feature_hidden_dims: List[int] = (128,)  # DEPRECATED/unused: the pre-transformer fusion MLP was removed; obs_projection maps concatenated features to d_model
     output_hidden_dims: List[int] = None  # MLP after transformer, None means direct transformer->value
 
     # Standard MLP parameters
@@ -48,8 +48,10 @@ class TransformerCriticConfig(BaseCriticConfig):
 
     # Image encoder parameters
     image_encoder_type: str = None  # "resnet", "dinov2", "impala", or "flatten"
+    finetune_image_encoder: bool = False  # whether image-encoder params are trainable
     resnet_backbone: str = "ResNet18"  # "ResNet18", "ResNet34", "ResNet50"
     resnet_pretrained: bool = True  # Whether to use pretrained ResNet weights
+    resnet_pool: str = "spatial_softmax"  # "spatial_softmax", "adaptive_avg", "flatten"
     image_feature_dim: int = 128  # Output dimension for image features
     spatial_softmax_num_kp: int = 32  # Number of keypoints for spatial softmax pooling
 
