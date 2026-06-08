@@ -353,17 +353,17 @@ class MixedReplayBuffer(BaseReplayBuffer):
         return self._fix_dtypes(combined)
 
     def _combine_dicts(self, dict_1: Dict[str, Any], dict_2: Dict[str, Any]) -> Dict[str, Any]:
-        """Combine observation dictionaries."""
-        combined = {}
-        for key in set(dict_1.keys()) | set(dict_2.keys()):
-            val_1, val_2 = dict_1.get(key), dict_2.get(key)
+        """Combine observation dictionaries.
 
-            if val_1 is None:
-                combined[key] = val_2
-            elif val_2 is None:
-                combined[key] = val_1
-            else:
-                combined[key] = self._concat(val_1, val_2)
+        Uses key intersection: keys present in only one buffer have half the
+        batch size and would cause index-out-of-bounds when the combined batch
+        is sliced with full-batch indices.  Keys unique to one buffer (e.g.
+        pre-computed video embeddings in the offline H5 buffer that the online
+        env never produces) are simply dropped.
+        """
+        combined = {}
+        for key in set(dict_1.keys()) & set(dict_2.keys()):
+            combined[key] = self._concat(dict_1[key], dict_2[key])
         return combined
 
     def _concat(self, arr_1: Any, arr_2: Any) -> Any:
