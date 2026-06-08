@@ -272,8 +272,8 @@ class BaseReplayBuffer(abc.ABC):
         obs_keys: List[str] = None,
         remove_obs_keys: List[str] = None,
         rename_obs_keys: Dict[str, str] = None,
-        pre_transforms: List[Callable] = None,
-        post_transforms: List[Callable] = None,  # Can handle both batch and transition transforms
+        pre_transforms: List[Callable] = None,  # Run when transition added to the buffer
+        post_transforms: List[Callable] = None,  # Run when transitions are sampled; can handle both batch and transition transforms
         sampler: "BaseSampler" = None,
         reward_model=None,
     ):
@@ -332,7 +332,7 @@ class BaseReplayBuffer(abc.ABC):
     def get_episode_boundaries(self) -> Dict[Any, Tuple[int, int]]:
         """Return episode_id -> (start_idx, end_idx) mapping"""
         all_transitions = self.get_all_transitions()
-        boundaries = {}
+        boundaries = {}  # Maps each episode_id to the start and end indices of that episode within the flat transition list.
         current_episode = None
         start_idx = 0
 
@@ -681,7 +681,7 @@ class BaseReplayBuffer(abc.ABC):
             for _episode_id, (start, end) in self._cached_boundaries.items():
                 episode_length = end - start + 1
                 if episode_length >= chunk_size:
-                    self._valid_chunk_starts.extend(range(start, end - chunk_size + 2))
+                    self._valid_chunk_starts.extend(range(start, end - chunk_size + 2))  # Ex. [0, 1, 2, 12, 13, 14, 15, 16] with values being global buffer indices
 
         valid_starts = getattr(self, "_valid_chunk_starts", [])
         if not valid_starts:
