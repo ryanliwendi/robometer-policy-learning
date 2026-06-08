@@ -11,11 +11,11 @@ debug: false
 # Environment configuration
 env:
   env_name: "libero_10"
-  task_id: 2 # task id for libero environment
+  task_id: 3 # task id for libero environment
   max_episode_steps: 1000 # max episode steps for libero environment
   use_full_state: false  # Use the full state (default: False). If False, only proprioceptive information will be used. If True, no reward relabeling will be performed.
   use_gt_rewards: true # Use ground truth rewards (default: False). If True, no reward relabeling will be performed. If no reward model is provided, this will be set to True.
-  h5_dataset_path: "/scr/liryan/LIBERO/libero/datasets/libero_10_only_successful/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it_demo.hdf5"
+  h5_dataset_path: "/scr/liryan/LIBERO/libero/datasets/libero_10_only_successful/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo.hdf5"
   dino_image_keys: ["agentview_rgb"] # keys for dino conversion in observation
   extra_keys_to_drop: ["eye_in_hand_rgb", "prompt", "language", "observation/image", "observation/wrist_image"] # keys to drop from observation beyond image_keys (default: [])
   success_bonus_amount: 0.0
