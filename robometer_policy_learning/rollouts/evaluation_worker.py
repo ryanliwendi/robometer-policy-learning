@@ -58,11 +58,13 @@ class EvaluationWorker:
 
     def _run_evaluations(self, actor: BaseActor, num_episodes: int = 10):
         """Run multiple evaluation episodes without video recording for statistics."""
+        from tqdm import tqdm
+
         all_rewards = []
         all_steps = []
         all_success = []
 
-        for episode_idx in range(num_episodes):
+        for episode_idx in tqdm(range(num_episodes), desc="Eval episodes", unit="ep"):
             sum_reward = 0
             is_done = False
             obs, info = self.eval_env.reset()
