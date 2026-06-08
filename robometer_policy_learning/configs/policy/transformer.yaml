@@ -15,4 +15,5 @@ transformer:
   use_layer_norm: false
   activation: relu
   dropout_rate: 0.0
+  log_std_init: -2.0
 
