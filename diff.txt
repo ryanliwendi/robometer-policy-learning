@@ -1,0 +1,662 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 17a9350..d53e027 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -24,7 +24,7 @@ dependencies = [
+     "gym",
+     "metaworld",
+     # Model libraries (for reward models and transformers)
+-    "transformers>=4.57.0",
++    "transformers==4.57.6",
+     "sentence-transformers>=2.0.0",
+     "huggingface-hub>=0.35.0",
+     # Data handling
+@@ -116,7 +116,7 @@ allow-direct-references = true
+ [tool.uv]
+ extra-build-dependencies = { egl-probe = ["cmake<4.0"] }
+ override-dependencies = [
+-    "transformers>=4.57.0",
++    "transformers==4.57.6",
+     "jax[cuda12]>=0.5.3,<0.7.0",  # 0.6.x has better bf16 support but keeps DeviceLocalLayout API
+     "gymnasium>=1.2.2", # override lerobot dependency (stemming from openpi repo)
+     "protobuf>3.21",
+diff --git a/robometer_policy_learning/algorithms/bc/configuration_bc.py b/robometer_policy_learning/algorithms/bc/configuration_bc.py
+index 7d06926..e78b21c 100644
+--- a/robometer_policy_learning/algorithms/bc/configuration_bc.py
++++ b/robometer_policy_learning/algorithms/bc/configuration_bc.py
+@@ -23,6 +23,7 @@ class BCConfig(BaseAlgorithmConfig):
+     # Set up BC parameters
+     learning_starts: int = 100
+     batch_size: int = 256
++    gamma: float = 0.99  # unused by BC loss; required by ChunkedSequentialSampler
+ 
+     # Training configuration
+     num_updates_per_train_step: int = 1
+diff --git a/robometer_policy_learning/buffers/base_replay_buffer.py b/robometer_policy_learning/buffers/base_replay_buffer.py
+index 28ed478..341082c 100644
+--- a/robometer_policy_learning/buffers/base_replay_buffer.py
++++ b/robometer_policy_learning/buffers/base_replay_buffer.py
+@@ -272,8 +272,8 @@ class BaseReplayBuffer(abc.ABC):
+         obs_keys: List[str] = None,
+         remove_obs_keys: List[str] = None,
+         rename_obs_keys: Dict[str, str] = None,
+-        pre_transforms: List[Callable] = None,
+-        post_transforms: List[Callable] = None,  # Can handle both batch and transition transforms
++        pre_transforms: List[Callable] = None,  # Run when transition added to the buffer
++        post_transforms: List[Callable] = None,  # Run when transitions are sampled; can handle both batch and transition transforms
+         sampler: "BaseSampler" = None,
+         reward_model=None,
+     ):
+@@ -332,7 +332,7 @@ class BaseReplayBuffer(abc.ABC):
+     def get_episode_boundaries(self) -> Dict[Any, Tuple[int, int]]:
+         """Return episode_id -> (start_idx, end_idx) mapping"""
+         all_transitions = self.get_all_transitions()
+-        boundaries = {}
++        boundaries = {}  # Maps each episode_id to the start and end indices of that episode within the flat transition list.
+         current_episode = None
+         start_idx = 0
+ 
+@@ -681,7 +681,7 @@ class BaseReplayBuffer(abc.ABC):
+             for _episode_id, (start, end) in self._cached_boundaries.items():
+                 episode_length = end - start + 1
+                 if episode_length >= chunk_size:
+-                    self._valid_chunk_starts.extend(range(start, end - chunk_size + 2))
++                    self._valid_chunk_starts.extend(range(start, end - chunk_size + 2))  # Ex. [0, 1, 2, 12, 13, 14, 15, 16] with values being global buffer indices
+ 
+         valid_starts = getattr(self, "_valid_chunk_starts", [])
+         if not valid_starts:
+diff --git a/robometer_policy_learning/buffers/mixed_replay_buffer.py b/robometer_policy_learning/buffers/mixed_replay_buffer.py
+index 0e267d0..8c772eb 100644
+--- a/robometer_policy_learning/buffers/mixed_replay_buffer.py
++++ b/robometer_policy_learning/buffers/mixed_replay_buffer.py
+@@ -353,17 +353,17 @@ class MixedReplayBuffer(BaseReplayBuffer):
+         return self._fix_dtypes(combined)
+ 
+     def _combine_dicts(self, dict_1: Dict[str, Any], dict_2: Dict[str, Any]) -> Dict[str, Any]:
+-        """Combine observation dictionaries."""
+-        combined = {}
+-        for key in set(dict_1.keys()) | set(dict_2.keys()):
+-            val_1, val_2 = dict_1.get(key), dict_2.get(key)
++        """Combine observation dictionaries.
+ 
+-            if val_1 is None:
+-                combined[key] = val_2
+-            elif val_2 is None:
+-                combined[key] = val_1
+-            else:
+-                combined[key] = self._concat(val_1, val_2)
++        Uses key intersection: keys present in only one buffer have half the
++        batch size and would cause index-out-of-bounds when the combined batch
++        is sliced with full-batch indices.  Keys unique to one buffer (e.g.
++        pre-computed video embeddings in the offline H5 buffer that the online
++        env never produces) are simply dropped.
++        """
++        combined = {}
++        for key in set(dict_1.keys()) & set(dict_2.keys()):
++            combined[key] = self._concat(dict_1[key], dict_2[key])
+         return combined
+ 
+     def _concat(self, arr_1: Any, arr_2: Any) -> Any:
+diff --git a/robometer_policy_learning/buffers/replay_buffer.py b/robometer_policy_learning/buffers/replay_buffer.py
+index 1564266..b9a3647 100644
+--- a/robometer_policy_learning/buffers/replay_buffer.py
++++ b/robometer_policy_learning/buffers/replay_buffer.py
+@@ -76,9 +76,17 @@ class ReplayBuffer(BaseReplayBuffer):
+                         del self._episode_steps[old.episode_id]
+ 
+         self.buffer[self._write_pos] = transition
+-        if episode_id is not None and step_in_episode is not None:
+-            self._transition_index[(episode_id, step_in_episode)] = self._write_pos
+-            self._episode_steps.setdefault(episode_id, {})[step_in_episode] = self._write_pos
++        if episode_id is not None:
++            # Use step_in_episode when provided (e.g. async reward relabeling); otherwise
++            # auto-assign a sequential key so _episode_steps is always populated and
++            # get_contiguous_chunks() can sample chunks from online rollouts that don't
++            # supply step_in_episode in info.
++            if step_in_episode is not None:
++                step_key = step_in_episode
++            else:
++                step_key = len(self._episode_steps.get(episode_id, {}))
++            self._transition_index[(episode_id, step_key)] = self._write_pos
++            self._episode_steps.setdefault(episode_id, {})[step_key] = self._write_pos
+ 
+         self._write_pos = (self._write_pos + 1) % self.capacity
+         self._size = min(self._size + 1, self.capacity)
+diff --git a/robometer_policy_learning/buffers/robometer_replay_buffer.py b/robometer_policy_learning/buffers/robometer_replay_buffer.py
+index 4dccf40..b1fd9af 100644
+--- a/robometer_policy_learning/buffers/robometer_replay_buffer.py
++++ b/robometer_policy_learning/buffers/robometer_replay_buffer.py
+@@ -16,14 +16,24 @@ from robometer_policy_learning.utils.robometer_utils import (
+     extract_rewards_from_server_output,
+ )
+ from robometer_policy_learning.utils.gpu_utils import convert_to_numpy
+-from robometer.evals.eval_utils import raw_dict_to_sample, build_payload, post_batch_npy
+-from robometer.evals.eval_server import process_batch_helper
+-from robometer.utils.embedding_utils import compute_text_embeddings, compute_video_embeddings
+ from transformers import AutoModel, AutoImageProcessor
+ from sentence_transformers import SentenceTransformer
+-from robometer.utils.setup_utils import setup_batch_collator
+ from tqdm import tqdm
+-
++from robometer.utils.embedding_utils import compute_video_embeddings
++
++# Returns NameError: name 'auto_docstring' is not defined otherwise
++try:
++    from robometer.evals.eval_utils import raw_dict_to_sample, build_payload, post_batch_npy
++    from robometer.evals.eval_server import process_batch_helper
++    from robometer.utils.embedding_utils import compute_text_embeddings
++    from robometer.utils.setup_utils import setup_batch_collator
++except Exception:
++    raw_dict_to_sample = None
++    build_payload = None
++    post_batch_npy = None
++    process_batch_helper = None
++    compute_text_embeddings = None
++    setup_batch_collator = None
+ 
+ class RobometerReplayBuffer(ReplayBuffer):
+     """
+@@ -565,7 +575,12 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
+             # Load subsequent frames in a single read: shape [episode_len, H, W, C]
+             with self._get_hdf5_file(h5_path) as file:
+                 demo_group = self._get_demo_group(file, original_demo_name)
+-                all_next_frames = np.array(demo_group["next_obs"][img_key][:episode_len])
++                try:
++                    all_next_frames = np.array(demo_group["next_obs"][img_key][:episode_len])
++                except Exception: 
++                    obs_frames = np.array(demo_group["obs"][img_key][:episode_len])
++                    all_next_frames = np.concatenate([obs_frames[1:], obs_frames[-1:]], axis=0)
++
+ 
+             # Concatenate to [episode_len+1, H, W, C]
+             video_frames = np.concatenate([initial_frame[np.newaxis, ...], all_next_frames], axis=0)
+@@ -595,7 +610,7 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
+             else []
+         )
+         hash_input = (
+-            f"{cache_type}_{h5_paths_list}_{reward_keys}_{self.sentence_model.get_sentence_embedding_dimension()}"
++            f"{cache_type}_{h5_paths_list}_{reward_keys}_{self.sentence_model.get_sentence_embedding_dimension() if self.sentence_model is not None else 'no_sentence_model'}"
+         )
+         if self.use_dino_embeddings and self.dinov2_model is not None:
+             hash_input += f"_dinov2_{self.dinov2_model.config.name_or_path}"
+@@ -770,8 +785,13 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
+         Compute language embeddings for all unique instructions in the cache.
+ 
+         Returns:
+-            Dictionary mapping text instruction to language embedding array [D]
++            Dictionary mapping text instruction to language embedding array [D],
++            or empty dict if no sentence model is available.
+         """
++        if self.sentence_model is None or compute_text_embeddings is None:
++            logger.info("No sentence model available; skipping language embedding computation.")
++            return {}
++
+         logger.info("Computing language embeddings for all trajectories...")
+         all_trajectory_frames, all_language_instructions, all_episode_lengths = self._load_all_frames_for_demos()
+ 
+@@ -829,34 +849,51 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
+                 language_str = self._load_language_instruction_from_file(h5_path, original_demo_name)
+                 cached_demo["language_instruction"] = language_str
+ 
+-            language_encoding = self.text_embeddings_dict[language_str]
++            has_language = language_str in self.text_embeddings_dict
+ 
+             if "obs" in cached_demo and cached_demo["obs"] is not None:
+                 obs_dict = cached_demo["obs"]
+                 episode_len = len(cached_demo["actions"])
+ 
+-                # Add language encoding (same for all timesteps)
+-                lang_array = np.repeat(np.expand_dims(language_encoding, axis=0), episode_len, axis=0)
+-                obs_dict["language"] = lang_array
++                # Add language encoding (same for all timesteps) if available
++                if has_language:
++                    language_encoding = self.text_embeddings_dict[language_str]
++                    lang_array = np.repeat(np.expand_dims(language_encoding, axis=0), episode_len, axis=0)
++                    obs_dict["language"] = lang_array
+ 
+                 # Add DINO embeddings (one per timestep) if available
+                 if self.use_dino_embeddings and demo_key in self.precomputed_video_embeddings:
+                     video_embeddings = self.precomputed_video_embeddings[demo_key]  # [T, D]
+                     obs_dict["dino_embedding"] = video_embeddings
+ 
++                # Build observation/state to match LiberoPI0Wrapper's format:
++                # ee_states (6D = ee_pos+ee_ori) + gripper_states (2D) = 8D.
++                if "observation/state" not in obs_dict:
++                    ee_states = obs_dict.get("ee_states")
++                    gripper_states = obs_dict.get("gripper_states")
++                    if ee_states is not None and gripper_states is not None:
++                        obs_dict["observation/state"] = np.concatenate(
++                            [ee_states, gripper_states], axis=-1
++                        ).astype(np.float32)
++
+                 cached_demo["obs"] = obs_dict
+ 
+-        # Try to register 'language' and 'dino_embedding' as low_dim keys if needed
++        # Register newly added keys so the buffer samples them correctly.
++        has_any_language = bool(self.text_embeddings_dict)
+         if hasattr(self, "low_dim_keys"):
+-            if "language" not in self.low_dim_keys:
++            if has_any_language and "language" not in self.low_dim_keys:
+                 self.low_dim_keys.append("language")
+             if self.use_dino_embeddings and "dino_embedding" not in self.low_dim_keys:
+                 self.low_dim_keys.append("dino_embedding")
++            if "observation/state" not in self.low_dim_keys:
++                self.low_dim_keys.append("observation/state")
+         if getattr(self, "obs_keys", None) is not None:
+-            if "language" not in self.obs_keys:
++            if has_any_language and "language" not in self.obs_keys:
+                 self.obs_keys.append("language")
+             if self.use_dino_embeddings and "dino_embedding" not in self.obs_keys:
+                 self.obs_keys.append("dino_embedding")
++            if "observation/state" not in self.obs_keys:
++                self.obs_keys.append("observation/state")
+ 
+     def _compute_rewards_batch(self, batch_raw: List[Dict[str, Any]]) -> Tuple[List[float], List[float]]:
+         """
+diff --git a/robometer_policy_learning/buffers/samplers.py b/robometer_policy_learning/buffers/samplers.py
+index 1336267..f2261cf 100644
+--- a/robometer_policy_learning/buffers/samplers.py
++++ b/robometer_policy_learning/buffers/samplers.py
+@@ -131,17 +131,25 @@ class ChunkedSequentialSampler(BaseSampler):
+ 
+         sequence_transitions = []
+         for chunk in chunks:
+-            if len(chunk) >= self.chunk_size:
++            if len(chunk) >= self.chunk_size:  # Only a defensive guard, chunk is always chunk_size of length
+                 seq_transition = self._chunk_to_sequence(chunk[: self.chunk_size])
+                 sequence_transitions.append(seq_transition)
+ 
+-        return sequence_transitions[:batch_size]
++        return sequence_transitions[:batch_size]  # Defensive guard
+ 
+     def sample_indices(self, buffer: "BaseReplayBuffer", batch_size: int):
+         return None
+ 
+     def _chunk_to_sequence(self, chunk: List["Transition"]) -> "Transition":
+-        """Convert chunk to sequence format for RNN training."""
++        """Collapse a list of chunk_size raw Transition objects into one synthetic Transition.
++
++        obs_as_sequence=False (transformer chunking):
++            obs      = chunk[0].obs            (single obs, start of chunk)
++            action   = stack of all actions    (shape [chunk_size, action_dim])
++            reward   = discounted sum over chunk (γ⁰r0 + γ¹r1 + ... + γ^(n-1)r_{n-1})
++            next_obs = chunk[-1].next_obs      (single obs, end of chunk)
++            done     = any step in chunk was terminal
++        """
+         first = chunk[0]
+ 
+         # --- Observations ---
+diff --git a/robometer_policy_learning/configs/algorithm/bc.yaml b/robometer_policy_learning/configs/algorithm/bc.yaml
+index b343336..4faf4b5 100644
+--- a/robometer_policy_learning/configs/algorithm/bc.yaml
++++ b/robometer_policy_learning/configs/algorithm/bc.yaml
+@@ -1,6 +1,7 @@
+ # Basic BC parameters
+ learning_starts: 100
+ batch_size: 256
++gamma: 0.99  # unused by BC loss; required by ChunkedSequentialSampler when chunk_size is set
+ 
+ # Training configuration
+ num_updates_per_train_step: 1
+@@ -11,7 +12,8 @@ actor_optimizer_eps: 1.0e-8
+ actor_optimizer_weight_decay: 0.0
+ 
+ # BC-specific parameters
+-loss_type: "nll"  # ["mse", "nll", "huber", "smooth_l1"] - MSE for deterministic, NLL for stochastic
++# Changed to MSE because NLL causes MSE loss to explode
++loss_type: "mse"  # ["mse", "nll", "huber", "smooth_l1"] - MSE for deterministic, NLL for stochastic
+ l2_regularization: 0.0  # L2 regularization weight
+ 
+ # Anti-overfitting regularization parameters
+diff --git a/robometer_policy_learning/configs/algorithm/sac.yaml b/robometer_policy_learning/configs/algorithm/sac.yaml
+index a631e04..1196915 100644
+--- a/robometer_policy_learning/configs/algorithm/sac.yaml
++++ b/robometer_policy_learning/configs/algorithm/sac.yaml
+@@ -1,6 +1,6 @@
+ learning_starts: 4000
+ ent_coef: "auto"
+-target_entropy: "auto"
++target_entropy: -70
+ target_update_interval: 1
+ gamma: 0.99
+ tau: 0.005
+diff --git a/robometer_policy_learning/configs/libero_bc_config.yaml b/robometer_policy_learning/configs/libero_bc_config.yaml
+new file mode 100644
+index 0000000..db78ac4
+--- /dev/null
++++ b/robometer_policy_learning/configs/libero_bc_config.yaml
+@@ -0,0 +1,75 @@
++defaults:
++  - algorithm@offline_algorithm: bc # Options: iql, bc
++  - algorithm@online_algorithm: null
++  - reward_model: null # Options: null, robometer
++  - policy@policy: transformer # Options: mlp, rnn, transformer
++  - value_function@value_function: transformer # Options: mlp, rnn, transformer
++
++# Debug mode
++debug: false
++
++# Environment configuration
++env:
++  env_name: "libero_10"
++  task_id: 3 # task id for libero environment
++  max_episode_steps: 1000 # max episode steps for libero environment
++  use_full_state: false  # Use the full state (default: False). If False, only proprioceptive information will be used. If True, no reward relabeling will be performed.
++  use_gt_rewards: true # Use ground truth rewards (default: False). If True, no reward relabeling will be performed. If no reward model is provided, this will be set to True.
++  h5_dataset_path: "/scr/liryan/LIBERO/libero/datasets/libero_10_only_successful/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo.hdf5"
++  dino_image_keys: ["agentview_rgb"] # keys for dino conversion in observation
++  extra_keys_to_drop: ["eye_in_hand_rgb", "prompt", "language", "observation/image", "observation/wrist_image"] # keys to drop from observation beyond image_keys (default: [])
++  success_bonus_amount: 0.0
++
++# Training configuration
++training:
++  num_envs: 1 # Number of parallel environments
++  num_rollouts: 0  # Number of rollouts to train, this is more like env steps
++  # chunk_size: null # Action chunking size
++  chunk_size: 10 # Action chunking size for transformer policy
++  use_rnn: false  # Use RNN actor and critic
++  num_offline_steps: 100_000  # Number of offline training steps
++  load_dir: null  # Directory to load RL models from (null for no loading)
++  save_interval: 10000  # Save interval in steps
++  continue_training: false  # Continue training from the last checkpoint
++  seed: 0  # Random seed for training
++
++# Replay buffer configuration - for online RL
++buffer:
++  capacity: 500_000  # Replay buffer capacity
++  sample_ratio: 0.5  # Sample ratio of offline buffer in mixed replay buffer (used only when we do offline-to-online RL)
++  use_success_fail_buffer: false  # If True, create SuccessFailureReplayBuffer
++  success_fail_sample_ratio: 0.5  # Ratio for sampling from success vs failure buffer
++  success_detection_duration: 2  # Number of consecutive time steps to detect success (only used with reward relabeling)
++  success_detection_threshold: 0.65  # Threshold for success detection (only used with reward relabeling)
++  distributed_reward_relabel:
++    enabled: false  # Whether to use distributed reward relabeling
++    server_address: "localhost:50052"  # Address for remote reward relabeling server
++    max_queue_size: 100  # Max queue size for reward relabeling client
++    timeout: 60.0  # Timeout for reward relabeling client
++    flush_interval: 0.1  # Flush interval for reward relabeling client
++
++# Logging configuration
++logging:
++  wandb_project: libero_bc
++  wandb_entity: liryan-usc
++  wandb_offline: false
++  wandb_log_dir_base: logs/wandb
++  wandb_name: "train_bc"
++  log_level: "INFO"
++
++# Algorithm configuration
++alg:
++  offline_alg_name: bc  # Offline algorithm name (iql, bc, sac)
++  online_alg_name: null  # Online algorithm name (sac, iql, bc)
++
++# Evaluation configuration
++eval:
++  eval_freq: 10000   # Evaluation frequency in rollouts
++  eval_num_episodes: 25  # Number of episodes for evaluation
++  eval_record_video: true  # Whether to record videos during evaluation
++  eval_on_first_step: false  # If true, evaluate on the first step before any training
++
++# Model configuration
++model:
++  dinov2_model: "facebook/dinov2-base"
++  sentence_model: null
+diff --git a/robometer_policy_learning/configs/libero_bc_sac_config.yaml b/robometer_policy_learning/configs/libero_bc_sac_config.yaml
+new file mode 100644
+index 0000000..196cb20
+--- /dev/null
++++ b/robometer_policy_learning/configs/libero_bc_sac_config.yaml
+@@ -0,0 +1,74 @@
++defaults:
++  - algorithm@offline_algorithm: bc # Options: iql, bc
++  - algorithm@online_algorithm: sac
++  - reward_model: null # Options: null, robometer
++  - policy@policy: transformer # Options: mlp, rnn, transformer
++  - value_function@value_function: transformer # Options: mlp, rnn, transformer
++
++# Debug mode
++debug: false
++
++# Environment configuration
++env:
++  env_name: "libero_10"
++  task_id: 2 # task id for libero environment
++  max_episode_steps: 1000 # max episode steps for libero environment
++  use_full_state: false  # Use the full state (default: False). If False, only proprioceptive information will be used. If True, no reward relabeling will be performed.
++  use_gt_rewards: true # Use ground truth rewards (default: False). If True, no reward relabeling will be performed. If no reward model is provided, this will be set to True.
++  h5_dataset_path: "/scr/liryan/LIBERO/libero/datasets/libero_10_only_successful/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it_demo.hdf5"
++  dino_image_keys: ["agentview_rgb"] # keys for dino conversion in observation
++  extra_keys_to_drop: ["eye_in_hand_rgb", "prompt", "language", "observation/image", "observation/wrist_image"] # keys to drop from observation beyond image_keys (default: [])
++  success_bonus_amount: 0.0
++
++# Training configuration
++training:
++  num_envs: 1 # Number of parallel environments
++  num_rollouts: 100_000  # Online SAC fine-tuning env steps
++  chunk_size: 10 # Action chunking size for transformer policy
++  use_rnn: false  # Use RNN actor and critic
++  num_offline_steps: 100_000  # Number of BC offline pretraining steps
++  load_dir: outputs/2026-06-04/09-33-17/checkpoints/100000  # BC checkpoint at 100k steps
++  save_interval: 10000  # Save interval in steps
++  continue_training: false  # load_dir is set, so offline training is skipped; BC weights copied into SAC
++  seed: 0  # Random seed for training
++
++# Replay buffer configuration
++buffer:
++  capacity: 500_000  # Online replay buffer capacity
++  sample_ratio: 0.5  # 50% offline demo data, 50% online rollouts in mixed replay buffer
++  use_success_fail_buffer: false  # If True, create SuccessFailureReplayBuffer
++  success_fail_sample_ratio: 0.5  # Ratio for sampling from success vs failure buffer
++  success_detection_duration: 2  # Number of consecutive time steps to detect success (only used with reward relabeling)
++  success_detection_threshold: 0.65  # Threshold for success detection (only used with reward relabeling)
++  distributed_reward_relabel:
++    enabled: false  # Whether to use distributed reward relabeling
++    server_address: "localhost:50052"  # Address for remote reward relabeling server
++    max_queue_size: 100  # Max queue size for reward relabeling client
++    timeout: 60.0  # Timeout for reward relabeling client
++    flush_interval: 0.1  # Flush interval for reward relabeling client
++
++# Logging configuration
++logging:
++  wandb_project: libero_bc_sac
++  wandb_entity: liryan-usc
++  wandb_offline: false
++  wandb_log_dir_base: logs/wandb
++  wandb_name: "train_bc_sac"
++  log_level: "INFO"
++
++# Algorithm configuration
++alg:
++  offline_alg_name: bc  # Offline algorithm name (iql, bc, sac)
++  online_alg_name: sac  # Online algorithm name (sac, iql, bc)
++
++# Evaluation configuration
++eval:
++  eval_freq: 10000   # Evaluation frequency in steps
++  eval_num_episodes: 5  # Number of episodes for evaluation
++  eval_record_video: false  # Whether to record videos during evaluation
++  eval_on_first_step: true  # Evaluate BC checkpoint before any SAC updates to confirm ~40% baseline
++
++# Model configuration
++model:
++  dinov2_model: "facebook/dinov2-base"
++  sentence_model: null
+diff --git a/robometer_policy_learning/configs/policy/transformer.yaml b/robometer_policy_learning/configs/policy/transformer.yaml
+index be499a8..cd9a41e 100644
+--- a/robometer_policy_learning/configs/policy/transformer.yaml
++++ b/robometer_policy_learning/configs/policy/transformer.yaml
+@@ -15,4 +15,5 @@ transformer:
+   use_layer_norm: false
+   activation: relu
+   dropout_rate: 0.0
++  log_std_init: -2.0
+ 
+diff --git a/robometer_policy_learning/envs/libero_pi0_wrapper.py b/robometer_policy_learning/envs/libero_pi0_wrapper.py
+index bfa4bc1..cc88a3a 100644
+--- a/robometer_policy_learning/envs/libero_pi0_wrapper.py
++++ b/robometer_policy_learning/envs/libero_pi0_wrapper.py
+@@ -47,6 +47,8 @@ class LiberoPI0Wrapper(gym.Wrapper):
+                 "observation/state": gym.spaces.Box(low=-1, high=1, shape=(8,), dtype=np.float32),
+                 "observation/image": gym.spaces.Box(low=0, high=255, shape=(224, 224, 3), dtype=np.uint8),
+                 "observation/wrist_image": gym.spaces.Box(low=0, high=255, shape=(224, 224, 3), dtype=np.uint8),
++                # Raw (unflipped) agentview — same orientation as H5 dataset; used by DinoEmbeddingWrapper
++                "agentview_rgb": gym.spaces.Box(low=0, high=255, shape=(224, 224, 3), dtype=np.uint8),
+             }
+         )
+ 
+diff --git a/robometer_policy_learning/rollouts/evaluation_worker.py b/robometer_policy_learning/rollouts/evaluation_worker.py
+index 83581b4..b91016b 100644
+--- a/robometer_policy_learning/rollouts/evaluation_worker.py
++++ b/robometer_policy_learning/rollouts/evaluation_worker.py
+@@ -58,11 +58,13 @@ class EvaluationWorker:
+ 
+     def _run_evaluations(self, actor: BaseActor, num_episodes: int = 10):
+         """Run multiple evaluation episodes without video recording for statistics."""
++        from tqdm import tqdm
++
+         all_rewards = []
+         all_steps = []
+         all_success = []
+ 
+-        for episode_idx in range(num_episodes):
++        for episode_idx in tqdm(range(num_episodes), desc="Eval episodes", unit="ep"):
+             sum_reward = 0
+             is_done = False
+             obs, info = self.eval_env.reset()
+diff --git a/robometer_policy_learning/rollouts/rollout_worker.py b/robometer_policy_learning/rollouts/rollout_worker.py
+index ff257dc..7fb666e 100644
+--- a/robometer_policy_learning/rollouts/rollout_worker.py
++++ b/robometer_policy_learning/rollouts/rollout_worker.py
+@@ -61,7 +61,7 @@ class RolloutWorker:
+             # Get observations
+             if self.recent_obs is None:
+                 obs, _ = self.env.reset()
+-                self.actor_state = self.get_initial_actor_state()
++                self.actor_state = self.get_initial_actor_state()  # Resets the hidden states (i.e. the memory) for RNN actors, no-ops otherwise
+             else:
+                 obs = self.recent_obs
+ 
+@@ -70,7 +70,7 @@ class RolloutWorker:
+ 
+             # If chunked, we need compute actions when the chunk is empty
+             if self.is_chunked_rollout:
+-                if self.env.is_chunk_empty:
++                if self.env.is_chunk_empty:  # Note that this executes the entire action chunking steps before querying the actor again (no temporal ensembling)
+                     with torch.inference_mode():
+                         if actor_was_training:
+                             self.actor.eval()
+@@ -86,6 +86,7 @@ class RolloutWorker:
+                 else:
+                     actions = None
+                     # Actions will be None because we are taking actions from the wrapper
++                    # The wrapper will pop the next action from the queue and execute it
+                     next_obs, rewards, dones, truncateds, infos = self.env.step(actions)
+ 
+                 # Update actions to grab the actual action that was taken
+diff --git a/robometer_policy_learning/utils/env_utils.py b/robometer_policy_learning/utils/env_utils.py
+index 93d2419..b7089c8 100644
+--- a/robometer_policy_learning/utils/env_utils.py
++++ b/robometer_policy_learning/utils/env_utils.py
+@@ -171,9 +171,12 @@ def _make_env(
+                                 dinov2_processor=dinov2_processor,
+                                 sentence_model=sentence_model,
+                                 device=device,
+-                                max_episode_steps=max_episode_steps, 
+-                                seed=seed, 
++                                max_episode_steps=max_episode_steps,
++                                seed=seed,
++                                image_keys=dino_image_keys if dino_image_keys is not None else ["observation/image"],
+                                 )
++        if chunk_size is not None:
++            env = VectorActionChunkingWrapper(env, chunk_size=chunk_size, n_action_steps=1)
+     else:
+         # Regular gym environment
+         if vectorized:
+diff --git a/robometer_policy_learning/utils/pi0_integration.py b/robometer_policy_learning/utils/pi0_integration.py
+index a2249fe..2a35364 100644
+--- a/robometer_policy_learning/utils/pi0_integration.py
++++ b/robometer_policy_learning/utils/pi0_integration.py
+@@ -226,6 +226,13 @@ def preprocess_obs_for_pi0(raw_obs: Dict[str, Any]) -> Dict[str, Any]:
+     img = image_tools.convert_to_uint8(image_tools.resize_with_pad(img, 224, 224))
+     wrist_img = image_tools.convert_to_uint8(image_tools.resize_with_pad(wrist_img, 224, 224))
+ 
++    # Also expose the raw (unflipped, resized) agentview image under the H5 dataset key name
++    # so that DinoEmbeddingWrapper during eval sees the same orientation as training DINO
++    # (H5 images are stored unflipped; the flip above is only for Pi0 inference).
++    agentview_rgb = image_tools.convert_to_uint8(
++        image_tools.resize_with_pad(np.ascontiguousarray(raw_obs["agentview_image"]), 224, 224)
++    )
++
+     # Process state: [eef_pos (3), eef_axis_angle (3), gripper_qpos (2)] = 8-dim
+     if "robot0_eef_quat" in raw_obs:
+         state = np.concatenate(
+@@ -242,6 +249,7 @@ def preprocess_obs_for_pi0(raw_obs: Dict[str, Any]) -> Dict[str, Any]:
+         "observation/image": img,
+         "observation/wrist_image": wrist_img,
+         "observation/state": state,
++        "agentview_rgb": agentview_rgb,
+         "prompt": raw_obs.get("prompt", raw_obs.get("language_instruction", "unknown task")),
+     }
+ 
+diff --git a/scripts/train.py b/scripts/train.py
+index 257d494..ac6d5bc 100644
+--- a/scripts/train.py
++++ b/scripts/train.py
+@@ -107,15 +107,15 @@ def main(cfg: DictConfig):
+             dinov2_model=components.dinov2_model,
+             dinov2_processor=components.dinov2_processor,
+             reward_relabeling_keys=reward_relabeling_keys,
+-            use_success_detection=cfg.reward_model.use_success_detection if cfg.reward_model is not None else False,
+-            success_detection_duration=cfg.reward_model.success_detection_duration
+-            if cfg.reward_model is not None
++            use_success_detection=reward_model_cfg.use_success_detection if reward_model_cfg is not None else False,
++            success_detection_duration=reward_model_cfg.success_detection_duration
++            if reward_model_cfg is not None
+             else 2,
+-            success_detection_threshold=cfg.reward_model.success_detection_threshold
+-            if cfg.reward_model is not None
++            success_detection_threshold=reward_model_cfg.success_detection_threshold
++            if reward_model_cfg is not None
+             else 0.65,
+-            add_estimated_reward=cfg.reward_model.add_estimated_reward
+-            if cfg.reward_model is not None
++            add_estimated_reward=reward_model_cfg.add_estimated_reward
++            if reward_model_cfg is not None
+             else False,
+         )
+ 
+@@ -149,15 +149,16 @@ def main(cfg: DictConfig):
+             logger.info(f"Saving checkpoint to {save_dir}/latest")
+             save_checkpoint(offline_algo, save_dir, "latest")
+ 
++        offline_evaluation_worker = EvaluationWorker(
++            eval_env=eval_env,
++            device=device,
++            num_episodes=cfg.eval.eval_num_episodes,
++            record_video=True,
++            logger=wandb_logger,
++        )
++
+         # If we loaded a checkpoint, we skip offline training step
+         if cfg.training.load_dir is None or cfg.training.continue_training:
+-            offline_evaluation_worker = EvaluationWorker(
+-                eval_env=eval_env,
+-                device=device,
+-                num_episodes=cfg.eval.eval_num_episodes,
+-                record_video=True,
+-                logger=wandb_logger,
+-            )
+             # Training loop
+             logger.info(f"Training offline algorithm for {cfg.training.num_offline_steps} steps")
+             with tqdm(total=cfg.training.num_offline_steps, desc="Offline Training", unit="step") as pbar:
+@@ -283,6 +284,10 @@ def main(cfg: DictConfig):
+                 load_checkpoint(algorithm, cfg.training.load_dir)
+                 logger.info(f"Resuming from checkpoint")
+ 
++        # load/copy_components replaces algorithm.actor with a new object via setattr;
++        # sync the local reference so rollout_worker and runner use the updated actor
++        actor = algorithm.actor
++
+         logger.info(f"Buffer capacity: {cfg.buffer.capacity}")
+         # Create rollout worker
+         if reward_model_cfg is not None:
