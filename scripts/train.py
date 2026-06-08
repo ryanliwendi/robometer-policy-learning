@@ -284,6 +284,10 @@ def main(cfg: DictConfig):
                 load_checkpoint(algorithm, cfg.training.load_dir)
                 logger.info(f"Resuming from checkpoint")
 
+        # load/copy_components replaces algorithm.actor with a new object via setattr;
+        # sync the local reference so rollout_worker and runner use the updated actor
+        actor = algorithm.actor
+
         logger.info(f"Buffer capacity: {cfg.buffer.capacity}")
         # Create rollout worker
         if reward_model_cfg is not None:
