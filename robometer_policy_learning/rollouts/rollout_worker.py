@@ -61,7 +61,7 @@ class RolloutWorker:
             # Get observations
             if self.recent_obs is None:
                 obs, _ = self.env.reset()
-                self.actor_state = self.get_initial_actor_state()
+                self.actor_state = self.get_initial_actor_state()  # Resets the hidden states (i.e. the memory) for RNN actors, no-ops otherwise
             else:
                 obs = self.recent_obs
 
@@ -70,7 +70,7 @@ class RolloutWorker:
 
             # If chunked, we need compute actions when the chunk is empty
             if self.is_chunked_rollout:
-                if self.env.is_chunk_empty:
+                if self.env.is_chunk_empty:  # Note that this executes the entire action chunking steps before querying the actor again (no temporal ensembling)
                     with torch.inference_mode():
                         if actor_was_training:
                             self.actor.eval()
@@ -86,6 +86,7 @@ class RolloutWorker:
                 else:
                     actions = None
                     # Actions will be None because we are taking actions from the wrapper
+                    # The wrapper will pop the next action from the queue and execute it
                     next_obs, rewards, dones, truncateds, infos = self.env.step(actions)
 
                 # Update actions to grab the actual action that was taken
