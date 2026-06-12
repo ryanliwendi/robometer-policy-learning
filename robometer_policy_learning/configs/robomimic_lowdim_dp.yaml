@@ -1,0 +1,69 @@
+defaults:
+  - algorithm@offline_algorithm: dp   # loads configs/algorithm/dp.yaml into offline_algorithm (edit there or override on the CLI)
+  - reward_model: null                # Options: null, robometer
+  - policy@policy: mlp                 # ignored by DP (it builds a DiffusionActor), but required by the schema
+
+# Debug mode
+debug: false
+
+# Environment configuration
+env:
+  env_name: "robomimic"  # task/robot/controller are read from the robomimic dataset metadata
+  h5_dataset_path: "/home/yigitkorkmaz/datasets/robomimic_lowdim/square/ph/low_dim_converted.hdf5"  # robomimic .h5 to reconstruct the env from
+  max_episode_steps: 400 # max episode steps for the environment
+  use_full_state: true  # Use the full state (default: False). If False, only proprioceptive information will be used. If True, no reward relabeling will be performed.
+  use_gt_rewards: true # Use ground truth rewards (default: False). If True, no reward relabeling will be performed. If no reward model is provided, this will be set to True.
+  dino_image_keys: null # keys for dino conversion in observation
+  extra_keys_to_drop: ["agentview_image","robot0_eye_in_hand_image", "prompt", "language"] # keys to drop from observation beyond image_keys (default: [])
+  success_bonus_amount: 0.0
+
+# Training configuration
+training:
+  num_envs: 1 # Number of parallel environments
+  chunk_size: 8 # Diffusion prediction horizon (Tp): #actions the policy denoises jointly per obs
+  n_action_steps: 6 # Actions executed open-loop per predicted chunk before replanning (Ta <= chunk_size)
+  use_rnn: false  # Use RNN actor and critic
+  num_offline_steps: 50_000  # Number of offline training steps
+  load_dir: null  # Directory to load RL models from (null for no loading)
+  save_interval: 50000  # Save interval in steps
+  continue_training: false  # Continue training from the last checkpoint
+  seed: 0  # Random seed for training
+  normalize_lowdim_obs: false  # Z-score low-dim obs using dataset stats computed at buffer init
+
+# Logging configuration
+logging:
+  wandb_project: mile_dp
+  wandb_entity: tri
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "train_dp"
+  log_level: "INFO"
+
+# Algorithm configuration
+alg:
+  offline_alg_name: dp  # Offline algorithm name (iql, bc, sac, dp)
+
+# Evaluation configuration
+eval:
+  eval_freq: 5000   # Evaluation frequency in steps
+  eval_num_episodes: 20  # Number of episodes for evaluation
+  eval_record_video: true  # Whether to record videos during evaluation
+  eval_on_first_step: true  # If true, evaluate on the first step before any training
+
+# Model configuration
+model:
+  dinov2_model: null
+  sentence_model: null
+  # Featurizer-level image encoding. When `type` is null, images are handled by precomputing DINO embedding.
+  image_encoder:
+    type: null  # null | impala | resnet | dinov2
+    finetune: false
+    image_feature_dim: 128
+    resnet_backbone: ResNet18
+    resnet_pretrained: true
+    resnet_pool: spatial_softmax
+    spatial_softmax_num_kp: 32
+    impala_nn_scale: 1
+    impala_num_blocks_per_stack: 2
+    impala_use_smaller: false
+    impala_output_dim: null

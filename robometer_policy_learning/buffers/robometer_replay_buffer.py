@@ -1,9 +1,5 @@
 import numpy as np
 from typing import List, Dict, Optional, Any, Tuple
-import os
-import hashlib
-import pickle
-import torch
 
 from loguru import logger
 from collections import deque
@@ -16,6 +12,8 @@ from robometer_policy_learning.utils.robometer_utils import (
     extract_rewards_from_server_output,
 )
 from robometer_policy_learning.utils.gpu_utils import convert_to_numpy
+from robometer.evals.eval_utils import raw_dict_to_sample, build_payload, post_batch_npy
+from robometer.evals.eval_server import process_batch_helper
 from transformers import AutoModel, AutoImageProcessor
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
@@ -271,6 +269,14 @@ class RobometerReplayBuffer(ReplayBuffer):
 
 
 class RobometerH5ReplayBuffer(H5ReplayBuffer):
+    """Offline HDF5 buffer that relabels rewards with a Robometer reward model / eval server.
+
+    DINO image embeddings and sentence (language) embeddings are handled by the base
+    :class:`H5ReplayBuffer`; this subclass only adds reward relabeling on top. Use it only
+    when reward relabeling is required (``reward_model`` or ``use_eval_server``); for plain
+    embedding-augmented offline data, use :class:`H5ReplayBuffer` directly.
+    """
+
     def __init__(
         self,
         reward_model=None,
@@ -289,15 +295,26 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
         add_estimated_reward: bool = False,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        # Reward relabeling embeds the same image keys it scores, so the base buffer
+        # computes DINO embeddings over `reward_relabeling_keys` (set before super()).
+        self.reward_relabeling_keys = reward_relabeling_keys
+        super().__init__(
+            dinov2_model=dinov2_model,
+            dinov2_processor=dinov2_processor,
+            sentence_model=sentence_model,
+            dino_embedding_keys=reward_relabeling_keys,
+            **kwargs,
+        )
+        # Base has now computed DINO/language embeddings and added them to obs.
+
         self.use_eval_server = use_eval_server
         self.eval_server_url = eval_server_url
         self.eval_server_timeout = eval_server_timeout
-        self.reward_relabeling_keys = reward_relabeling_keys
         self.use_success_detection = use_success_detection
         self.success_detection_duration = success_detection_duration
         self.success_detection_threshold = success_detection_threshold
         self.add_estimated_reward = add_estimated_reward
+        self.use_relative_rewards = use_relative_rewards
 
         # Set max_frames once from config
         if reward_model_config is not None:
@@ -328,27 +345,9 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
                 raise ValueError("eval_server_url must be provided when use_eval_server=True")
             logger.info(f"Using eval_server at {self.eval_server_url} for reward computation")
 
-        # Set up cache directory for embeddings
-        h5_paths = kwargs.get("h5_paths")
-        h5_paths_list = h5_paths if isinstance(h5_paths, list) else [h5_paths]
-        self.embeddings_cache_dir = os.path.join(os.path.dirname(h5_paths_list[0]), ".embeddings_cache")
-        os.makedirs(self.embeddings_cache_dir, exist_ok=True)
-
-        # Since we need to add embeddings to observations for policy learning, we need to initialize the models.
-        self.use_dino_embeddings = True
-        self.dinov2_model = dinov2_model
-        self.dinov2_processor = dinov2_processor
-        self.sentence_model = sentence_model
-        self.use_relative_rewards = use_relative_rewards
-
-        # Always compute language and video embeddings
-        self.precomputed_video_embeddings = self._load_or_compute_video_embeddings()
-        self.text_embeddings_dict = self._load_or_compute_language_embeddings()
-
-        # Relabel rewards if using Robometer rewards, otherwise only add embeddings to obs
+        # Relabel rewards using the reward model (embeddings already attached by the base).
         if self.reward_model is not None:
             self.relabel_rewards(verbose=True, batch_size=8)
-        self.add_embeddings_to_obs()
 
     def relabel_rewards(self, verbose: bool = True, batch_size: Optional[int] = None):
         """

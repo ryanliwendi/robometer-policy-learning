@@ -39,7 +39,6 @@ class TransformerActor(BaseActor):
         self.feature_extractor = TransformerFeatureExtractor(
             observation_space=config.observation_space,
             featurizer_cfg=config.featurizer,
-            feature_hidden_dims=config.feature_hidden_dims,
             activation=config.activation,
             use_layer_norm=config.use_layer_norm,
             dropout_rate=config.dropout_rate,
@@ -62,8 +61,6 @@ class TransformerActor(BaseActor):
             use_language_embeddings=config.use_language_embeddings,
             lang_embedding_dim=config.lang_embedding_dim,
             lang_embedding_device=config.lang_embedding_device,
-            # Disable modality projections to avoid bottlenecking high-dim states
-            use_modality_projections=False,
         )
         # Project to transformer dimension if needed
         if self.feature_extractor.output_dim != config.d_model:

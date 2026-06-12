@@ -5,6 +5,14 @@ import numpy as np
 
 from robometer_policy_learning.algorithms.modeling_algorithm import BaseAlgorithm
 from robometer_policy_learning.algorithms.bc.configuration_bc import BCConfig
+from robometer_policy_learning.modules.base.distributions import SquashedDiagGaussianDistribution
+
+
+# When the policy is tanh-squashed, its support is the open interval (-1, 1): expert actions
+# at exactly ±1 (e.g. saturated gripper commands after normalization) push the inverse-tanh and
+# the log(1 - a^2) squash correction toward infinity, producing huge/unstable NLL gradients.
+# Clamp NLL targets just inside the boundary to keep log_prob well-defined.
+_TANH_NLL_EPS = 1e-4
 
 
 class BC(BaseAlgorithm):
@@ -47,8 +55,20 @@ class BC(BaseAlgorithm):
             weight_decay=config.actor_optimizer_weight_decay,
         )
 
+        # A tanh-squashed policy only puts mass on (-1, 1); NLL targets must stay strictly inside.
+        self.is_squashed = isinstance(self.actor.action_dist, SquashedDiagGaussianDistribution)
+
         print(f"BC: loss_type = {self.loss_type}")
         print(f"BC: l2_regularization = {self.l2_regularization}")
+
+    def _nll_target_actions(self, expert_actions: torch.Tensor) -> torch.Tensor:
+        """Clamp expert actions just inside (-1, 1) for a tanh-squashed policy's NLL.
+
+        For an unsquashed Gaussian the support is all of R, so no clamping is needed.
+        """
+        if self.is_squashed:
+            return expert_actions.clamp(-1.0 + _TANH_NLL_EPS, 1.0 - _TANH_NLL_EPS)
+        return expert_actions
 
     def train_step(self, logging_prefix: str = "bc") -> dict:
         """
@@ -79,7 +99,9 @@ class BC(BaseAlgorithm):
             obs = batch["obs"]
             expert_actions = batch["action"]
             if self.use_weighted_bc:
-                reward_weights = batch["reward"]
+                # Prefer explicit per-sample weights (set via buffer.set_weights()); fall back to
+                # reward-as-weight for buffers/batches that don't surface a "weight" field.
+                weights = batch["weight"] if "weight" in batch else batch["reward"]
 
             if len(obs) == 0:
                 print("Buffer is still empty. Skipping this training step")
@@ -99,10 +121,20 @@ class BC(BaseAlgorithm):
             # Get action distribution parameters from the actor
             mean_actions, log_std, kwargs = self.actor.get_action_dist_params(obs)
 
+            # Deterministic action in the policy's (normalized, [-1, 1]) output space.
+            # For a tanh-squashed policy this is tanh(mean); for an unsquashed Gaussian it is
+            # the mean. This is exactly what act() deploys (before unnormalizing to the env
+            # action space), so regressing/logging against it keeps offline training, the
+            # buffer's normalized actions, and inference all in the SAME action space.
+            if log_std is not None:
+                det_action = self.actor.action_dist.actions_from_params(mean_actions, log_std, deterministic=True)
+            else:
+                det_action = self.actor.action_dist.actions_from_params(mean_actions, deterministic=True)
+
             if self.loss_type == "mse":
                 # For deterministic policies or when we want MSE loss
                 # Use the mean actions directly
-                predicted_actions = mean_actions
+                predicted_actions = det_action
                 if self.use_weighted_bc:
                     # Per-sample weighted MSE
                     per_elem = F.mse_loss(predicted_actions, expert_actions, reduction="none")
@@ -111,7 +143,7 @@ class BC(BaseAlgorithm):
                         per_sample = per_elem.view(per_elem.size(0), -1).mean(dim=1)
                     else:
                         per_sample = per_elem
-                    w = reward_weights.to(per_sample.dtype).view(-1)
+                    w = weights.to(per_sample.dtype).view(-1)
                     actor_loss = (w * per_sample).sum() / (w.sum() + 1e-8)
                 else:
                     actor_loss = F.mse_loss(predicted_actions, expert_actions)
@@ -126,12 +158,15 @@ class BC(BaseAlgorithm):
                 else:
                     distribution = self.actor.action_dist.proba_distribution(mean_actions)
 
+                # Targets must lie inside the policy's support (open (-1, 1) when squashed).
+                nll_target_actions = self._nll_target_actions(expert_actions)
+
                 # Compute negative log-likelihood of expert actions
                 # For chunked actions, we need to handle the shape properly
                 if expert_actions.dim() == 3:  # (batch, chunk_size, action_dim)
                     # Reshape to (batch * chunk_size, action_dim) for log_prob computation
                     batch_size, chunk_size, action_dim = expert_actions.shape
-                    expert_actions_flat = expert_actions.view(-1, action_dim)
+                    expert_actions_flat = nll_target_actions.view(-1, action_dim)
                     mean_actions_flat = mean_actions.view(-1, action_dim)
 
                     # Create distribution for flattened actions
@@ -149,7 +184,7 @@ class BC(BaseAlgorithm):
                     log_prob_actions = log_prob_actions.mean(dim=1, keepdim=True)
                 else:
                     # Non-chunked case
-                    log_prob_actions = distribution.log_prob(expert_actions)
+                    log_prob_actions = distribution.log_prob(nll_target_actions)
                     if log_prob_actions.dim() > 2:
                         log_prob_actions = log_prob_actions.mean(dim=-1, keepdim=True)
                     else:
@@ -157,21 +192,21 @@ class BC(BaseAlgorithm):
 
                 # Negative log-likelihood loss
                 if self.use_weighted_bc:
-                    w = reward_weights.to(log_prob_actions.dtype).view(-1, 1)
+                    w = weights.to(log_prob_actions.dtype).view(-1, 1)
                     actor_loss = -(w * log_prob_actions).sum() / (w.sum() + 1e-8)
                 else:
                     actor_loss = -log_prob_actions.mean()
 
             elif self.loss_type == "huber":
                 # Huber loss for robustness to outliers
-                predicted_actions = mean_actions
+                predicted_actions = det_action
                 if self.use_weighted_bc:
                     per_elem = F.huber_loss(predicted_actions, expert_actions, delta=1.0, reduction="none")
                     if per_elem.dim() > 1:
                         per_sample = per_elem.view(per_elem.size(0), -1).mean(dim=1)
                     else:
                         per_sample = per_elem
-                    w = reward_weights.to(per_sample.dtype).view(-1)
+                    w = weights.to(per_sample.dtype).view(-1)
                     actor_loss = (w * per_sample).sum() / (w.sum() + 1e-8)
                 else:
                     actor_loss = F.huber_loss(predicted_actions, expert_actions, delta=1.0)
@@ -179,14 +214,14 @@ class BC(BaseAlgorithm):
 
             elif self.loss_type == "smooth_l1":
                 # Smooth L1 loss (similar to Huber)
-                predicted_actions = mean_actions
+                predicted_actions = det_action
                 if self.use_weighted_bc:
                     per_elem = F.smooth_l1_loss(predicted_actions, expert_actions, reduction="none")
                     if per_elem.dim() > 1:
                         per_sample = per_elem.view(per_elem.size(0), -1).mean(dim=1)
                     else:
                         per_sample = per_elem
-                    w = reward_weights.to(per_sample.dtype).view(-1)
+                    w = weights.to(per_sample.dtype).view(-1)
                     actor_loss = (w * per_sample).sum() / (w.sum() + 1e-8)
                 else:
                     actor_loss = F.smooth_l1_loss(predicted_actions, expert_actions)
@@ -238,20 +273,22 @@ class BC(BaseAlgorithm):
             # Log metrics
             actor_losses.append(actor_loss.item())
 
-            mse_error = F.mse_loss(mean_actions, expert_actions)
+            # Diagnostics use the deterministic (deployed) action so they reflect what the
+            # env actually receives after unnormalization, not the raw pre-squash mean.
+            mse_error = F.mse_loss(det_action, expert_actions)
             mse_errors.append(mse_error.item())
 
-            # unnormalized mse
+            # unnormalized mse (in env action space)
             unnormalized_mse_error = F.mse_loss(
-                self.actor.unnormalize_action(mean_actions),
+                self.actor.unnormalize_action(det_action),
                 self.actor.unnormalize_action(expert_actions),
             )
             unnormalized_mse_errors.append(unnormalized_mse_error.item())
 
             # unnormalized max predicted actions
-            unnormalized_max_predicted_actions.append(self.actor.unnormalize_action(mean_actions).max().item())
+            unnormalized_max_predicted_actions.append(self.actor.unnormalize_action(det_action).max().item())
             # unnormalized min predicted actions
-            unnormalized_min_predicted_actions.append(self.actor.unnormalize_action(mean_actions).min().item())
+            unnormalized_min_predicted_actions.append(self.actor.unnormalize_action(det_action).min().item())
 
             if self.loss_type == "nll":
                 # Only log probabilities for NLL loss
@@ -271,7 +308,7 @@ class BC(BaseAlgorithm):
             if self.loss_type == "mse":
                 predicted_action_means.append(predicted_actions.mean().item())
             else:
-                predicted_action_means.append(mean_actions.mean().item())
+                predicted_action_means.append(det_action.mean().item())
 
             # Optimize actor
             self.actor_optimizer.zero_grad()
@@ -305,29 +342,6 @@ class BC(BaseAlgorithm):
 
         return metrics_dict
 
-    def get_action(self, obs, deterministic: bool = True):
-        """
-        Get action from the policy.
-
-        Args:
-            obs: Observation
-            deterministic: Whether to use deterministic action (mean) or sample
-        """
-        with torch.no_grad():
-            if isinstance(obs, np.ndarray):
-                obs = torch.from_numpy(obs).float().to(self.device)
-            elif isinstance(obs, dict):
-                obs = {k: torch.from_numpy(v).float().to(self.device) for k, v in obs.items()}
-
-            if deterministic:
-                # Return mean action
-                mean_actions, _, _ = self.actor.get_action_dist_params(obs.unsqueeze(0))
-                return mean_actions.squeeze(0).cpu().numpy()
-            else:
-                # Sample from the distribution
-                actions, _ = self.actor.action_log_prob(obs.unsqueeze(0))
-                return actions.squeeze(0).cpu().numpy()
-
     def evaluate_policy(self, eval_buffer, num_eval_batches=10):
         """
         Evaluate the policy on a separate evaluation buffer.
@@ -348,17 +362,25 @@ class BC(BaseAlgorithm):
 
                 mean_actions, log_std, kwargs = self.actor.get_action_dist_params(obs)
 
+                # Deterministic (deployed) action in normalized space; see train_step.
+                if log_std is not None:
+                    det_action = self.actor.action_dist.actions_from_params(mean_actions, log_std, deterministic=True)
+                else:
+                    det_action = self.actor.action_dist.actions_from_params(mean_actions, deterministic=True)
+
                 if self.loss_type == "mse":
-                    eval_loss = F.mse_loss(mean_actions, expert_actions)
+                    eval_loss = F.mse_loss(det_action, expert_actions)
                 elif self.loss_type == "nll":
                     if log_std is not None:
                         distribution = self.actor.action_dist.proba_distribution(mean_actions, log_std)
                     else:
                         distribution = self.actor.action_dist.proba_distribution(mean_actions)
 
+                    nll_target_actions = self._nll_target_actions(expert_actions)
+
                     if expert_actions.dim() == 3:
                         batch_size, chunk_size, action_dim = expert_actions.shape
-                        expert_actions_flat = expert_actions.view(-1, action_dim)
+                        expert_actions_flat = nll_target_actions.view(-1, action_dim)
                         mean_actions_flat = mean_actions.view(-1, action_dim)
 
                         if log_std is not None:
@@ -373,7 +395,7 @@ class BC(BaseAlgorithm):
                         log_prob_actions = log_prob_actions.view(batch_size, chunk_size)
                         log_prob_actions = log_prob_actions.mean(dim=1, keepdim=True)
                     else:
-                        log_prob_actions = distribution.log_prob(expert_actions)
+                        log_prob_actions = distribution.log_prob(nll_target_actions)
                         if log_prob_actions.dim() > 2:
                             log_prob_actions = log_prob_actions.mean(dim=-1, keepdim=True)
                         else:
@@ -381,10 +403,10 @@ class BC(BaseAlgorithm):
 
                     eval_loss = -log_prob_actions.mean()
                 else:
-                    eval_loss = F.mse_loss(mean_actions, expert_actions)
+                    eval_loss = F.mse_loss(det_action, expert_actions)
 
                 eval_losses.append(eval_loss.item())
-                eval_mse_errors.append(F.mse_loss(mean_actions, expert_actions).item())
+                eval_mse_errors.append(F.mse_loss(det_action, expert_actions).item())
 
         self.actor.train()
 

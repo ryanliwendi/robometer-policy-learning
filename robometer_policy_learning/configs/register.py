@@ -5,6 +5,7 @@ from robometer_policy_learning.configs.configs import TrainConfig, DSRLConfig, P
 from robometer_policy_learning.algorithms.sac.configuration_sac import SACConfig
 from robometer_policy_learning.algorithms.iql.configuration_iql import IQLConfig
 from robometer_policy_learning.algorithms.bc.configuration_bc import BCConfig
+from robometer_policy_learning.algorithms.dp.configuration_dp import DPConfig
 
 
 def register_configs():
@@ -18,6 +19,7 @@ def register_configs():
     cs.store(group="algorithm", name="sac", node=SACConfig)
     cs.store(group="algorithm", name="iql", node=IQLConfig)
     cs.store(group="algorithm", name="bc", node=BCConfig)
+    cs.store(group="algorithm", name="dp", node=DPConfig)
 
     # Register policy configs as a group
     cs.store(group="policy", name="mlp", node=PolicyConfig)

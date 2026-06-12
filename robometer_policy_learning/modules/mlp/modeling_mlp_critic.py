@@ -23,7 +23,7 @@ class MLPCritic(BaseCritic):
         self.output_mlp = None
 
         # Initialize observation featurizer only if featurizer config is provided
-        if config.featurizer is not None or config.image_encoder_type == "impala":
+        if config.featurizer is not None or config.image_encoder_type in ("impala", "resnet", "dinov2"):
             self.obs_featurizer = ObservationFeaturizer(
                 observation_space=config.observation_space,
                 featurizer_cfg=config.featurizer,
@@ -31,6 +31,14 @@ class MLPCritic(BaseCritic):
                 use_layer_norm=config.use_layer_norm,
                 dropout_rate=config.dropout_rate,
                 image_encoder_type=config.image_encoder_type,
+                finetune_image_encoder=config.finetune_image_encoder,
+                image_feature_dim=config.image_feature_dim,
+                resnet_backbone=config.resnet_backbone,
+                resnet_pretrained=config.resnet_pretrained,
+                resnet_pool=config.resnet_pool,
+                spatial_softmax_num_kp=config.spatial_softmax_num_kp,
+                dinov2_model=config.dinov2_model,
+                dinov2_processor=config.dinov2_processor,
                 impala_nn_scale=config.impala_nn_scale,
                 impala_num_blocks_per_stack=config.impala_num_blocks_per_stack,
                 impala_use_smaller=config.impala_use_smaller,

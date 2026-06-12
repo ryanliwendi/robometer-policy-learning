@@ -157,6 +157,8 @@ def setup_libero_env(
     image_keys: List[str] = ["observation/image"],
     extra_keys_to_drop: List[str] = [],
     async_reward_relabel_kwargs: Optional[Dict] = None,
+    chunk_size: Optional[int] = None,
+    n_action_steps: int = 1,
 ):
     """
     Setup LIBERO environment.
@@ -176,6 +178,11 @@ def setup_libero_env(
         async_reward_relabel_kwargs: Optional dict with async reward relabeling config. If None, async relabeling is disabled.
             Expected keys: server_address, batch_size, max_queue_size, timeout, flush_interval,
             success_detection_duration, success_detection_threshold, use_relative_rewards, use_placeholder_rewards
+        chunk_size: Action chunk size for the RL ``make_env`` path. When set (and async reward
+            relabeling is off), the vectorized env is wrapped with ``VectorActionChunkingWrapper``
+            so chunked policies execute ``n_action_steps`` actions open-loop before replanning.
+            Leave None for DSRL/Pi0 (which handles chunking via its own action queue / action_exec_len).
+        n_action_steps: Number of actions to execute open-loop per predicted chunk (<= chunk_size).
     Returns:
         env: Vectorized LIBERO environment
         remove_obs_keys: Keys to remove from observations for replay buffer
@@ -282,9 +289,26 @@ def setup_libero_env(
     #         # uses only observation/image no wrist imag
     #         env = VectorDinoEmbeddingWrapper(env, dinov2_model, dinov2_processor, device=device, image_keys=["observation/image"])
 
+    # Open-loop action chunking for the RL make_env path (exposes is_chunk_empty /
+    # _get_last_action so the rollout/eval workers execute n_action_steps per chunk).
+    # Skipped under async reward relabeling: DSRL/Pi0 handles chunking via its own
+    # action queue (action_exec_len) and steps the unwrapped per-env directly.
+    if chunk_size is not None:
+        if use_async_reward_relabel:
+            logger.warning(
+                "chunk_size is set but async reward relabeling (DSRL mode) is enabled; "
+                "skipping VectorActionChunkingWrapper (DSRL handles chunking via action_exec_len)."
+            )
+        else:
+            from robometer_policy_learning.envs.action_wrappers import VectorActionChunkingWrapper
+
+            env = VectorActionChunkingWrapper(env, chunk_size=chunk_size, n_action_steps=n_action_steps)
+
     logger.info(
         f"✓ Created {n_envs} LIBERO environments"
         + (" with async reward relabeling" if use_async_reward_relabel else "")
+        + (f" (open-loop chunking: chunk_size={chunk_size}, n_action_steps={n_action_steps})"
+           if (chunk_size is not None and not use_async_reward_relabel) else "")
     )
     remove_obs_keys = ["observation/wrist_image", "language", "image", "wrist_image", "prompt"] + extra_keys_to_drop
     if dinov2_model:

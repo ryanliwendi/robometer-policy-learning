@@ -231,11 +231,17 @@ class VectorActionChunkingWrapper(gym_vector.VectorWrapper):
 
     @property
     def is_chunk_empty(self) -> bool:
-        # True when all buffers are empty/None
+        # True when ANY env's buffer is empty/None, i.e. a new chunk must be planned.
+        #
+        # The rollout/eval workers replan (call the policy and supply a fresh chunk for ALL
+        # envs) whenever this is True, and only step with `actions=None` when it is False.
+        # Requiring *every* env to still have buffered actions before stepping with None
+        # keeps `_pop_next_actions` safe even when one env resets mid-chunk (its buffer is
+        # cleared on done, which would otherwise desync the per-env buffers).
         for buf in self.action_buffers:
-            if buf is not None and buf.shape[0] > 0:
-                return False
-        return True
+            if buf is None or buf.shape[0] == 0:
+                return True
+        return False
 
     def __getattr__(self, name):
         # Delegate unknown attributes to the underlying env (e.g., language_instruction)

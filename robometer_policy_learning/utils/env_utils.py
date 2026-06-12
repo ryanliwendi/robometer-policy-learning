@@ -70,6 +70,7 @@ def _make_env(
     num_envs: int = 4,
     max_episode_steps: int = 400,
     chunk_size: Optional[int] = None,
+    n_action_steps: int = 1,
     use_full_state: bool = False,
     dinov2_model: Optional[AutoModel] = None,
     dinov2_processor: Optional[AutoImageProcessor] = None,
@@ -79,6 +80,7 @@ def _make_env(
     terminate_on_success: bool = True,
     dino_image_keys: Optional[List[str]] = None,
     seed: Optional[int] = None,
+    dataset_path: Optional[str] = None,
 ) -> gym.Env:
     """
     Internal helper to create a single environment (vectorized or not) with appropriate wrappers.
@@ -98,6 +100,9 @@ def _make_env(
         terminate_on_success: Whether to terminate the environment when the goal is reached (only for Meta-World)
         dino_image_keys: List of dino image keys to use for DINO embedding wrapper
         seed: Seed for the environment
+        dataset_path: Path to a robomimic ``.h5`` dataset. Required when ``env_name``
+            selects a robomimic environment; the task/robot/controller config is read
+            from the dataset metadata.
     Returns:
         The created environment
     """
@@ -123,7 +128,7 @@ def _make_env(
                     "max_episode_steps": max_episode_steps,
                 },
                 chunk_size=chunk_size,
-                n_action_steps=1,
+                n_action_steps=n_action_steps,
                 sentence_model=sentence_model,
                 use_full_state=use_full_state,
             )
@@ -155,7 +160,7 @@ def _make_env(
                     env, dinov2_model, dinov2_processor, device=device, image_keys=dino_image_keys
                 )
             if chunk_size is not None:
-                env = ActionChunkingWrapper(env, chunk_size=chunk_size, n_action_steps=1)
+                env = ActionChunkingWrapper(env, chunk_size=chunk_size, n_action_steps=n_action_steps)
     elif "libero" in env_name:
         task_suite, task_id = env_name.split("/")
         task_id = int(task_id)
@@ -173,10 +178,65 @@ def _make_env(
                                 device=device,
                                 max_episode_steps=max_episode_steps,
                                 seed=seed,
-                                image_keys=dino_image_keys if dino_image_keys is not None else ["observation/image"],
+                                chunk_size=chunk_size,
+                                n_action_steps=n_action_steps,
                                 )
-        if chunk_size is not None:
-            env = VectorActionChunkingWrapper(env, chunk_size=chunk_size, n_action_steps=1)
+    elif "robomimic" in env_name.lower():
+        # Reconstruct a robosuite env from a robomimic dataset's metadata.
+        # Expected format: "robomimic" (or "robomimic/<anything>"); the actual task,
+        # robot and controller come from the dataset at `dataset_path`.
+        from robometer_policy_learning.envs.robosuite_wrappers import setup_robomimic_env
+        import random
+
+        if dataset_path is None:
+            raise ValueError(
+                "A robomimic env was requested but no dataset_path was provided. "
+                "Pass the robomimic .h5 path (e.g. cfg.env.h5_dataset_path) to make_env."
+            )
+        if seed is None:
+            seed = random.randint(1, 100)
+
+        dino_keys = dino_image_keys if dino_image_keys is not None else ["image"]
+        env, _ = setup_robomimic_env(
+            dataset_path=dataset_path,
+            n_envs=num_envs,
+            dinov2_model=dinov2_model,
+            dinov2_processor=dinov2_processor,
+            sentence_model=sentence_model,
+            device=device,
+            seed=seed,
+            max_episode_steps=max_episode_steps,
+            image_keys=dino_keys,
+            use_full_state=use_full_state,
+            terminate_on_success=terminate_on_success,
+            chunk_size=chunk_size,
+            n_action_steps=n_action_steps,
+        )
+    elif "robosuite" in env_name.lower():
+        # Expected format: "robosuite/<TaskName>" (robot is always a Franka Panda).
+        from robometer_policy_learning.envs.robosuite_wrappers import setup_robosuite_env
+        import random
+
+        parts = env_name.split("/")
+        task_name = parts[1] if len(parts) > 1 else "Lift"
+        if seed is None:
+            seed = random.randint(1, 100)
+
+        dino_keys = dino_image_keys if dino_image_keys is not None else ["image"]
+        env, _ = setup_robosuite_env(
+            env_name=task_name,
+            n_envs=num_envs,
+            dinov2_model=dinov2_model,
+            dinov2_processor=dinov2_processor,
+            sentence_model=sentence_model,
+            device=device,
+            seed=seed,
+            max_episode_steps=max_episode_steps,
+            image_keys=dino_keys,
+            use_full_state=use_full_state,
+            chunk_size=chunk_size,
+            n_action_steps=n_action_steps,
+        )
     else:
         # Regular gym environment
         if vectorized:
@@ -199,7 +259,7 @@ def _make_env(
                         env, dinov2_model, dinov2_processor, device=device, image_keys=dino_image_keys
                     )
             if chunk_size is not None:
-                env = VectorActionChunkingWrapper(env, chunk_size=chunk_size, n_action_steps=1)
+                env = VectorActionChunkingWrapper(env, chunk_size=chunk_size, n_action_steps=n_action_steps)
         else:
             # Create single regular gym environment
             env = gym.make(env_name, render_mode=render_mode)
@@ -219,7 +279,7 @@ def _make_env(
                     )
 
             if chunk_size is not None:
-                env = ActionChunkingWrapper(env, chunk_size=chunk_size, n_action_steps=1)
+                env = ActionChunkingWrapper(env, chunk_size=chunk_size, n_action_steps=n_action_steps)
 
     return env
 
@@ -229,6 +289,7 @@ def make_env(
     num_envs: int = 4,
     max_episode_steps: int = 400,
     chunk_size: Optional[int] = None,
+    n_action_steps: int = 1,
     use_full_state: bool = False,
     dinov2_model: Optional[AutoModel] = None,
     dinov2_processor: Optional[AutoImageProcessor] = None,
@@ -238,6 +299,7 @@ def make_env(
     terminate_on_success: bool = True,
     dino_image_keys: Optional[List[str]] = None,
     seed: Optional[int] = None,
+    dataset_path: Optional[str] = None,
 ) -> Tuple[gym.Env, gym.Env]:
     """
     Create training and evaluation environments with appropriate wrappers.
@@ -253,6 +315,9 @@ def make_env(
         sentence_model: Sentence transformer model for language embeddings (for Meta-World)
         render_mode: Render mode for the environment
         terminate_on_success: Whether to terminate the environment when the goal is reached
+        n_action_steps: Number of actions executed open-loop per predicted chunk before
+            replanning (<= chunk_size; only used when chunk_size is set)
+        dataset_path: Path to a robomimic ``.h5`` dataset (required for robomimic envs)
     Returns:
         Tuple of (training_env, eval_env)
     """
@@ -263,6 +328,7 @@ def make_env(
         num_envs=num_envs,
         max_episode_steps=max_episode_steps,
         chunk_size=chunk_size,
+        n_action_steps=n_action_steps,
         use_full_state=use_full_state,
         dinov2_model=dinov2_model,
         dinov2_processor=dinov2_processor,
@@ -272,6 +338,7 @@ def make_env(
         terminate_on_success=terminate_on_success,
         dino_image_keys=dino_image_keys,
         seed=seed,
+        dataset_path=dataset_path,
     )
 
     # Create evaluation environment (non-vectorized)
@@ -281,6 +348,7 @@ def make_env(
         num_envs=1,
         max_episode_steps=max_episode_steps,
         chunk_size=chunk_size,
+        n_action_steps=n_action_steps,
         use_full_state=use_full_state,
         dinov2_model=dinov2_model,
         dinov2_processor=dinov2_processor,
@@ -290,6 +358,7 @@ def make_env(
         terminate_on_success=terminate_on_success,
         dino_image_keys=dino_image_keys,
         seed=seed,
+        dataset_path=dataset_path,
     )
 
     return train_env, eval_env

@@ -9,6 +9,14 @@ from collections import OrderedDict
 from loguru import logger
 import inspect
 
+# ResNet/SpatialSoftmax encoders now live in modules.encoders. Re-exported here for
+# backward compatibility with any code importing them from transformer_utils.
+from robometer_policy_learning.modules.encoders.image_encoders import (  # noqa: E402
+    ResNetImageFeaturizer as ResNetEncoder,
+    SpatialSoftmax,
+    build_image_featurizers,
+)
+
 
 class MiniLMLangEncoder:
     """Language encoder using MiniLM model for generating embeddings."""
@@ -92,164 +100,6 @@ class PositionalEncoding(nn.Module):
         seq_len = x.size(1)
         x = x + self.pe[:, :seq_len, :]  # Broadcast (1, seq_len, d_model) with (batch_size, seq_len, d_model)
         return self.dropout(x)
-
-
-class ResNetEncoder(nn.Module):
-    """ResNet-based image encoder similar to robomimic's VisualCore."""
-
-    def __init__(
-        self,
-        input_shape: tuple,
-        feature_dimension: int = 64,
-        backbone_class: str = "ResNet18",
-        pretrained: bool = True,
-        pool_type: str = "spatial_softmax",
-        num_kp: int = 32,
-    ):
-        super().__init__()
-        self.input_shape = input_shape
-        self.feature_dimension = feature_dimension
-
-        # Import torchvision
-        try:
-            import torchvision
-
-            torchvision.disable_beta_transforms_warning()
-            import torchvision.models as models
-
-        except ImportError:
-            raise ImportError("torchvision is required for ResNet encoder")
-
-        # Create ResNet backbone
-        if backbone_class == "ResNet18":
-            self.backbone = models.resnet18(weights="DEFAULT" if pretrained else None)
-        elif backbone_class == "ResNet34":
-            self.backbone = models.resnet34(weights="DEFAULT" if pretrained else None)
-        elif backbone_class == "ResNet50":
-            self.backbone = models.resnet50(weights="DEFAULT" if pretrained else None)
-        else:
-            raise ValueError(f"Unsupported backbone: {backbone_class}")
-
-        # Modify first layer if input channels != 3
-        if input_shape[0] != 3:
-            self.backbone.conv1 = nn.Conv2d(input_shape[0], 64, kernel_size=7, stride=2, padding=3, bias=False)
-
-        # Remove final FC layer and avgpool
-        self.backbone = nn.Sequential(*list(self.backbone.children())[:-2])
-
-        # Freeze backbone parameters if using pretrained weights
-        self.backbone_frozen = bool(pretrained)
-        if self.backbone_frozen:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
-            # print(f"Froze pretrained {backbone_class} backbone parameters")
-            # IMPORTANT: keep BN/Dropout in eval mode for frozen backbones.
-            # Otherwise BatchNorm running stats will drift on small RL batches, causing instability.
-            self.backbone.eval()
-
-        # Calculate feature map size after backbone
-        with torch.no_grad():
-            dummy_input = torch.zeros(1, *input_shape)
-            backbone_out = self.backbone(dummy_input)
-            self.backbone_out_shape = backbone_out.shape[1:]  # (C, H, W)
-
-        # Pooling layer
-        if pool_type == "spatial_softmax":
-            self.pool = SpatialSoftmax(input_shape=self.backbone_out_shape, num_kp=num_kp)
-            pool_out_dim = num_kp * 2  # (x, y) coordinates for each keypoint
-        elif pool_type == "adaptive_avg":
-            self.pool = nn.AdaptiveAvgPool2d((1, 1))
-            pool_out_dim = self.backbone_out_shape[0]
-        elif pool_type == "flatten":
-            self.pool = nn.Flatten()
-            pool_out_dim = np.prod(self.backbone_out_shape)
-        else:
-            raise ValueError(f"Unsupported pool_type: {pool_type}")
-
-        # Final projection layer
-        self.projection = nn.Linear(pool_out_dim, feature_dimension)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Ensure input is in correct format (B, C, H, W)
-        if x.dim() == 3:
-            x = x.unsqueeze(0)
-
-        # Normalize input to [0, 1] if it looks like uint8 images
-        if x.dtype == torch.uint8 or x.max() > 1.0:
-            x = x.float() / 255.0
-
-        # Pass through backbone
-        if self.backbone_frozen:
-            # No grads needed and we must not update BN running stats
-            self.backbone.eval()
-            with torch.no_grad():
-                features = self.backbone(x)
-        else:
-            features = self.backbone(x)
-
-        # Apply pooling
-        pooled = self.pool(features)
-
-        # Final projection
-        output = self.projection(pooled)
-
-        return output
-
-    def train(self, mode: bool = True):
-        # Ensure frozen backbone stays in eval() even if parent module is put in train()
-        super().train(mode)
-        if getattr(self, "backbone_frozen", False):
-            self.backbone.eval()
-        return self
-
-
-class SpatialSoftmax(nn.Module):
-    """Spatial Softmax pooling as used in robomimic."""
-
-    def __init__(self, input_shape: tuple, num_kp: int = 32, temperature: float = 1.0):
-        super().__init__()
-        self.input_shape = input_shape  # (C, H, W)
-        self.num_kp = num_kp
-        self.temperature = temperature
-
-        C, H, W = input_shape
-
-        # Create coordinate grids
-        pos_x, pos_y = np.meshgrid(np.linspace(-1.0, 1.0, W), np.linspace(-1.0, 1.0, H))
-        pos_x = pos_x.reshape(H * W)
-        pos_y = pos_y.reshape(H * W)
-
-        self.register_buffer("pos_x", torch.from_numpy(pos_x).float())
-        self.register_buffer("pos_y", torch.from_numpy(pos_y).float())
-
-        # Linear layer to produce keypoint logits
-        self.fc = nn.Linear(C, num_kp)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        assert (C, H, W) == self.input_shape
-
-        # Flatten spatial dimensions
-        x_flat = x.view(B, C, H * W)  # (B, C, H*W)
-
-        # Transpose to (B, H*W, C) for linear layer
-        x_flat = x_flat.transpose(1, 2)  # (B, H*W, C)
-
-        # Get keypoint logits
-        keypoint_logits = self.fc(x_flat)  # (B, H*W, num_kp)
-
-        # Apply temperature and softmax
-        keypoint_logits = keypoint_logits / self.temperature
-        attention = F.softmax(keypoint_logits, dim=1)  # (B, H*W, num_kp)
-
-        # Compute expected coordinates
-        expected_x = torch.sum(attention * self.pos_x.unsqueeze(-1), dim=1)  # (B, num_kp)
-        expected_y = torch.sum(attention * self.pos_y.unsqueeze(-1), dim=1)  # (B, num_kp)
-
-        # Concatenate x and y coordinates
-        output = torch.cat([expected_x, expected_y], dim=1)  # (B, num_kp * 2)
-
-        return output
 
 
 def flatten_observations(
@@ -367,15 +217,16 @@ class TransformerFeatureExtractor(nn.Module):
         self,
         observation_space: gym.Space,
         featurizer_cfg: dict = None,
-        feature_hidden_dims: List[int] = None,
         activation: str = "relu",
         use_layer_norm: bool = False,
         dropout_rate: float = 0.0,
         preprocess_obs_transform: List[Any] = None,
         # Image encoder parameters
         image_encoder_type: str = "resnet",  # "resnet", "dinov2", "impala", or "flatten"
+        finetune_image_encoder: bool = False,  # whether image encoder params are trainable
         resnet_backbone: str = "ResNet18",  # "ResNet18", "ResNet34", "ResNet50"
         resnet_pretrained: bool = True,
+        resnet_pool: str = "spatial_softmax",  # "spatial_softmax", "adaptive_avg", "flatten"
         image_feature_dim: int = 128,
         spatial_softmax_num_kp: int = 32,
         # DINOv2 encoder parameters (used when image_encoder_type == "dinov2")
@@ -390,9 +241,6 @@ class TransformerFeatureExtractor(nn.Module):
         use_language_embeddings: bool = True,
         lang_embedding_dim: int = 384,  # MiniLM-L6 embedding dimension
         lang_embedding_device: str = "cpu",
-        # Modality projection parameters
-        use_modality_projections: bool = True,
-        modality_proj_dim: int = 256,
     ):
         super().__init__()
         self.observation_space = observation_space
@@ -416,15 +264,12 @@ class TransformerFeatureExtractor(nn.Module):
         else:
             self.lang_encoder = None
 
-        # Modality projection parameters
-        self.use_modality_projections = use_modality_projections
-        self.modality_proj_dim = int(modality_proj_dim)
-        self.modality_projections = nn.ModuleDict()
-
         # Image encoding parameters
         self.image_encoder_type = image_encoder_type
+        self.finetune_image_encoder = finetune_image_encoder
         self.resnet_backbone = resnet_backbone
         self.resnet_pretrained = resnet_pretrained
+        self.resnet_pool = resnet_pool
         self.image_feature_dim = image_feature_dim
         self.spatial_softmax_num_kp = spatial_softmax_num_kp
         self.dinov2_model = dinov2_model
@@ -452,112 +297,55 @@ class TransformerFeatureExtractor(nn.Module):
         self._expected_keys = set(self.obs_keys) if isinstance(observation_space, gym.spaces.Dict) else None
         self._processed_keys = None  # Actually processed keys
         self._key_mismatch_warned = False  # To print warning only once
-        self._first_forward_call = True  # To print key info on first call
         self.keys_to_ignore = set()  # Keys to ignore during processing
 
         # For compatibility with forward method
         self._flatten_keys = self.obs_keys if isinstance(observation_space, gym.spaces.Dict) else None
 
-        # Build ResNet encoders for image observations if using resnet
-        if self.image_encoder_type == "resnet":
-            raise ValueError(
-                "image_encoder_type='resnet' is currently not supported due to known issues. "
-                "Please select a different image encoder type (e.g., 'impala' or 'dinov2')."
+        # Build per-image-key encoders via the shared factory (impala | resnet | dinov2).
+        # Stored in an nn.ModuleDict so params register, move with .to(), and can be finetuned.
+        self.image_encoders = None
+        if self.image_encoder_type in ("impala", "resnet", "dinov2") and self.image_keys:
+            encoders = build_image_featurizers(
+                observation_space,
+                image_keys=self.image_keys,
+                image_encoder_type=self.image_encoder_type,
+                finetune=self.finetune_image_encoder,
+                output_dim=impala_output_dim,
+                image_feature_dim=image_feature_dim,
+                resnet_backbone=resnet_backbone,
+                resnet_pretrained=resnet_pretrained,
+                resnet_pool=resnet_pool,
+                spatial_softmax_num_kp=spatial_softmax_num_kp,
+                impala_nn_scale=impala_nn_scale,
+                impala_num_blocks_per_stack=impala_num_blocks_per_stack,
+                impala_use_smaller=impala_use_smaller,
+                dinov2_model=dinov2_model,
+                dinov2_processor=dinov2_processor,
             )
-        elif self.image_encoder_type == "dinov2":
-            # No per-key encoders; use shared DINO model in forward
-            self.image_encoders = None
-            if self.dinov2_model is None or self.dinov2_processor is None:
-                print(
-                    "Warning: image_encoder_type='dinov2' but model or processor not provided; falling back to flatten."
-                )
-        elif self.image_encoder_type == "impala" and self.image_keys:
-            # Build IMPALA encoders for each image key
-            from robometer_policy_learning.modules.cnn import ImpalaEncoder, SmallerImpalaEncoder
+            self.image_encoders = nn.ModuleDict(encoders)
 
-            self.image_encoders = {}
-            for img_key in self.image_keys:
-                if isinstance(observation_space, gym.spaces.Dict):
-                    img_space = observation_space.spaces[img_key]
-
-                    # Handle different image space formats
-                    if hasattr(img_space, "shape"):
-                        input_shape = img_space.shape
-
-                        # Handle shapes with extra dimensions like (1, H, W, C)
-                        if len(input_shape) == 4 and input_shape[0] == 1:
-                            input_shape = input_shape[1:]  # Remove the first dimension
-
-                        if len(input_shape) == 3:  # (H, W, C) or (C, H, W)
-                            # IMPALA encoder handles shape conversion internally
-                            pass
-                        elif len(input_shape) == 2:  # (H, W) - grayscale
-                            # IMPALA encoder will add channel dimension
-                            pass
-                        else:
-                            # Default fallback
-                            input_shape = (128, 128, 3)
-                            print(
-                                f"Warning: Irregular shape for {img_key}: {img_space.shape}, using default (128, 128, 3)"
-                            )
-                    else:
-                        input_shape = (128, 128, 3)  # Default RGB image shape
-
-                    try:
-                        if self.impala_use_smaller:
-                            encoder = SmallerImpalaEncoder(
-                                input_shape=input_shape,
-                                nn_scale=self.impala_nn_scale,
-                                output_dim=impala_output_dim,
-                            )
-                        else:
-                            encoder = ImpalaEncoder(
-                                input_shape=input_shape,
-                                nn_scale=self.impala_nn_scale,
-                                num_blocks_per_stack=self.impala_num_blocks_per_stack,
-                                output_dim=impala_output_dim,
-                            )
-                        self.image_encoders[img_key] = encoder
-                    except Exception as e:
-                        print(f"Failed to create IMPALA encoder for {img_key} with shape {input_shape}: {e}")
-                        raise
-
-        else:
-            self.image_encoders = None
-
-        # Replace featurizer_cfg keys with those already being encoded by the image encoder
+        # Register image encoders in featurizer_cfg so obs_dim accounts for their output_dim.
         if self.image_encoders:
             for key, value in self.image_encoders.items():
-                #self.featurizer_cfg[key] = value.output_dim
                 self.featurizer_cfg[key] = value
 
-        # Build featurizers for different observation modalities
-        self.featurizers = build_featurizers(
-            self.featurizer_cfg,
+        # Per-key MLP encoders for the NON-image (low-dim/vector) modalities. Image keys are
+        # handled by self.image_encoders in forward (avoids double-registering the encoder).
+        non_image_cfg = {k: v for k, v in self.featurizer_cfg.items() if not (self.image_encoders and k in self.image_encoders)}
+        self.lowdim_encoders = build_featurizers(
+            non_image_cfg,
             observation_space,
             activation,
             use_layer_norm,
             dropout_rate,
         )
 
-        # Build output layer for feature processing
-        self.feature_hidden_dims = feature_hidden_dims
-
-        # Calculate obs_dim for compatibility
+        # Per-modality features (each already encoded to a fixed size) are concatenated and
+        # returned directly. The transformer actor/critic projects this to d_model via its own
+        # obs_projection, so no extra fusion MLP is needed here.
         self.obs_dim = self._calculate_obs_dim()
-
-        if feature_hidden_dims:
-            self.feature_mlp = _build_mlp_layers(
-                self.obs_dim,
-                feature_hidden_dims,
-                activation,
-                use_layer_norm,
-                dropout_rate,
-            )
-            self.output_dim = feature_hidden_dims[-1]
-        else:
-            self.feature_mlp = None
-            self.output_dim = self.obs_dim
+        self.output_dim = self.obs_dim
 
     @property
     def device(self):
@@ -581,84 +369,31 @@ class TransformerFeatureExtractor(nn.Module):
 
                     return total_dim if total_dim > 0 else None
         else:
+            # image encoders expose .output_dim; MLP featurizers (list of dims) output their last dim
             return sum(
-                values.output_dim if hasattr(values, "output_dim") else sum(values)
-                for values in self.featurizer_cfg.values()
+                v.output_dim if hasattr(v, "output_dim") else int(v[-1])
+                for v in self.featurizer_cfg.values()
             )
 
-    def _compute_dinov2_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute image embeddings using a shared DINOv2 model and processor.
+    def _encode_image(self, key: str, v: torch.Tensor) -> torch.Tensor:
+        """Encode an image observation for ``key`` via its featurizer-level encoder.
 
-        Accepts tensors shaped as (B, H, W, C) or (B, C, H, W) or (H, W, C)/(C, H, W).
-        Returns a (B, D) float32 tensor on the module device.
+        All encoder types (impala/resnet/dinov2) share one interface: they accept raw
+        images ((B,H,W,C)/(B,C,H,W), uint8 or float), normalize internally, and return
+        (B, output_dim). Falls back to normalize+flatten if no encoder is configured.
         """
-        if x.dim() == 3:
-            x = x.unsqueeze(0)
+        if self.image_encoders is not None and key in self.image_encoders:
+            return self.image_encoders[key](v)
+        # Fallback: no encoder for this image key -> normalize and flatten.
+        if v.max() > 1.0:
+            v = v / 255.0
+        return v.reshape(v.size(0), -1) if v.dim() > 1 else v.unsqueeze(0)
 
-        if x.dim() != 4:
-            raise ValueError(f"Expected 4D tensor for DINO embedding, got {tuple(x.shape)}")
-
-        # Convert to NHWC for processor compatibility
-        if x.size(-1) == 3:
-            images = x
-        elif x.size(1) in (1, 3):
-            images = x.permute(0, 2, 3, 1)
-        else:
-            images = x
-
-        images = images.detach().to("cpu")
-
-        img_np_list = []
-        for i in range(images.size(0)):
-            arr = images[i].numpy()
-            if arr.dtype != np.uint8:
-                if arr.max() <= 1.0:
-                    arr = (arr * 255.0).clip(0, 255).astype(np.uint8)
-                else:
-                    arr = arr.clip(0, 255).astype(np.uint8)
-            img_np_list.append(arr)
-
-        with torch.no_grad():
-            processed = self.dinov2_processor(images=img_np_list, return_tensors="pt")
-            pixel_values = processed["pixel_values"].to(self.device)
-            outputs = self.dinov2_model(pixel_values=pixel_values)
-
-        emb = outputs.pooler_output
-
-        return emb.to(self.device, dtype=torch.float32)
-
-    def _build_modality_projection(self, input_dim: int) -> nn.Module:
-        """Create a projection module mapping input_dim -> modality_proj_dim.
-
-        Optionally applies LayerNorm and Dropout to help stabilize scales.
-        """
-        layers = [nn.Linear(int(input_dim), self.modality_proj_dim)]
-        return nn.Sequential(*layers)
-
-    def _apply_modality_projection(self, key: str, feature: torch.Tensor) -> torch.Tensor:
-        """Project per-modality feature to shared size if enabled.
-
-        Lazily initializes a per-key projection on first use.
-        """
-        if not self.use_modality_projections and not self.featurizer_cfg:
-            return feature
-        elif self.featurizer_cfg:
-            return self.featurizers[key](feature)
-
-        if not isinstance(feature, torch.Tensor):
-            return feature
-
-        # Ensure 2D [B, D]
-        if feature.dim() == 1:
-            feature = feature.unsqueeze(0)
-
-        input_dim = feature.size(-1)
-        if key not in self.modality_projections:
-            proj = self._build_modality_projection(input_dim)
-            proj.to(self.device)
-            self.modality_projections[key] = proj
-
-        return self.modality_projections[key](feature)
+    def _encode_lowdim(self, key: str, feature: torch.Tensor) -> torch.Tensor:
+        """Apply the per-key low-dim MLP encoder if one exists; else return the feature as-is."""
+        if key in self.lowdim_encoders:
+            return self.lowdim_encoders[key](feature)
+        return feature
 
     def _encode_language_if_needed(self, language_instructions):
         """
@@ -761,20 +496,6 @@ class TransformerFeatureExtractor(nn.Module):
         # Filter out keys to ignore
         keys_to_process = [k for k in keys_to_process if k not in self.keys_to_ignore]
 
-        # Print key usage info on first forward call
-        # if self._first_forward_call:
-        #     print(f"\n📝 POLICY OBSERVATION KEYS:")
-        #     print(f"  Keys being used by policy: {keys_to_process}")
-        #     if self.image_keys:
-        #         used_image_keys = [k for k in keys_to_process if k in self.image_keys]
-        #         print(f"  Image keys: {used_image_keys}")
-        #         non_image_keys = [
-        #             k for k in keys_to_process if k not in self.image_keys
-        #         ]
-        #         print(f"  Low-dim keys: {non_image_keys}")
-        #     print(f"  Total keys used: {len(keys_to_process)}")
-        #     self._first_forward_call = False
-
         # Store processed keys for consistency
         self._processed_keys = keys_to_process
 
@@ -809,54 +530,12 @@ class TransformerFeatureExtractor(nn.Module):
 
                 # Handle image observations
                 if k in self.image_keys:
-                    if (
-                        self.image_encoder_type == "resnet"
-                        and self.image_encoders is not None
-                        and k in self.image_encoders
-                    ):
-                        if v.dim() == 4:  # [batch, H, W, C] or [batch, C, H, W]
-                            if v.size(-1) == 3:
-                                v = v.permute(0, 3, 1, 2)
-                        elif v.dim() == 3:
-                            if v.size(-1) == 3:
-                                v = v.permute(2, 0, 1)
-                            v = v.unsqueeze(0)
-                        if v.max() > 1.0:
-                            v = v / 255.0
-                        batch_size = v.size(0)
-                        image_features = self.image_encoders[k](v)
-                        image_features = self._apply_modality_projection(k, image_features)
-                        feats.append(image_features)
-                    elif (
-                        self.image_encoder_type == "dinov2"
-                        and self.dinov2_model is not None
-                        and self.dinov2_processor is not None
-                    ):
-                        # Use DINO to compute image embeddings
-                        image_features = self._compute_dinov2_features(v)
-                        image_features = self._apply_modality_projection(k, image_features)
-                        feats.append(image_features)
-                    elif (
-                        self.image_encoder_type == "impala"
-                        and self.image_encoders is not None
-                        and k in self.image_encoders
-                    ):
-                        # IMPALA encoder handles format conversion and normalization internally
-                        image_features = self.image_encoders[k](v)
-                        feats.append(image_features)
-                    else:
-                        # No encoder available for this image key, fallback to flattening
-                        print(f"Warning: No image encoder found for image key {k}, using flattening")
-                        # Normalize and flatten
-                        if v.max() > 1.0:
-                            v = v / 255.0
-                        v_flat = v.view(v.size(0), -1) if v.dim() > 1 else v.unsqueeze(0)
-                        v_flat = self._apply_modality_projection(k, v_flat)
-                        feats.append(v_flat)
+                    # All encoder types share one interface; encoders normalize/permute internally.
+                    feats.append(self._encode_image(k, v))
                 else:
                     # Regular observation - flatten and ensure correct dtype
                     v_flat = v.view(v.size(0), -1) if v.dim() > 1 else v.unsqueeze(0)
-                    v_flat = self._apply_modality_projection(k, v_flat)
+                    v_flat = self._encode_lowdim(k, v_flat)
                     feats.append(v_flat)
 
             elif isinstance(v, np.ndarray):  # TODO: this can be problematic, proceed with caution
@@ -877,53 +556,11 @@ class TransformerFeatureExtractor(nn.Module):
 
                 # Handle image observations
                 if k in self.image_keys:
-                    if (
-                        self.image_encoder_type == "resnet"
-                        and self.image_encoders is not None
-                        and k in self.image_encoders
-                    ):
-                        if v_tensor.dim() == 4:  # [batch, H, W, C] or [batch, C, H, W]
-                            if v_tensor.size(-1) == 3:
-                                v_tensor = v_tensor.permute(0, 3, 1, 2)
-                        elif v_tensor.dim() == 3:  # [H, W, C] or [C, H, W]
-                            if v_tensor.size(-1) == 3:
-                                v_tensor = v_tensor.permute(2, 0, 1)
-                            v_tensor = v_tensor.unsqueeze(0)
-                        if v_tensor.max() > 1.0:
-                            v_tensor = v_tensor / 255.0
-                        image_features = self.image_encoders[k](v_tensor)
-                        image_features = self._apply_modality_projection(k, image_features)
-                        feats.append(image_features)
-                    elif (
-                        self.image_encoder_type == "dinov2"
-                        and self.dinov2_model is not None
-                        and self.dinov2_processor is not None
-                    ):
-                        image_features = self._compute_dinov2_features(v_tensor)
-                        image_features = self._apply_modality_projection(k, image_features)
-                        feats.append(image_features)
-                    elif (
-                        self.image_encoder_type == "impala"
-                        and self.image_encoders is not None
-                        and k in self.image_encoders
-                    ):
-                        # IMPALA encoder handles format conversion and normalization internally
-                        image_features = self.image_encoders[k](v_tensor)
-                        image_features = self._apply_modality_projection(k, image_features)
-                        feats.append(image_features)
-                    else:
-                        # No encoder available for this image key, fallback to flattening
-                        print(f"Warning: No image encoder found for image key {k}, using flattening")
-                        # Normalize and flatten
-                        if v_tensor.max() > 1.0:
-                            v_tensor = v_tensor / 255.0
-                        v_flat = v_tensor.view(v_tensor.size(0), -1)
-                        v_flat = self._apply_modality_projection(k, v_flat)
-                        feats.append(v_flat)
+                    feats.append(self._encode_image(k, v_tensor))
                 else:
                     # Regular observation - flatten
                     v_flat = v_tensor.view(v_tensor.size(0), -1)
-                    v_flat = self._apply_modality_projection(k, v_flat)
+                    v_flat = self._encode_lowdim(k, v_flat)
                     feats.append(v_flat)
 
             elif isinstance(v, str):  # TODO: this can be problematic, proceed with caution
@@ -939,7 +576,7 @@ class TransformerFeatureExtractor(nn.Module):
                         # Ensure correct batch size
                         if embeddings.size(0) != batch_size:
                             embeddings = embeddings.expand(batch_size, -1)
-                        embeddings = self._apply_modality_projection(k, embeddings)
+                        embeddings = self._encode_lowdim(k, embeddings)
                         feats.append(embeddings)
                     except Exception as e:
                         print(f"Warning: Failed to encode language for {k}: {e}")
@@ -950,7 +587,7 @@ class TransformerFeatureExtractor(nn.Module):
                             device=self.device,
                             dtype=torch.float32,
                         )
-                        zero_emb = self._apply_modality_projection(k, zero_emb)
+                        zero_emb = self._encode_lowdim(k, zero_emb)
                         feats.append(zero_emb)
                 else:
                     print(f"Warning: Language string provided but language embeddings disabled for {k}")
@@ -961,7 +598,7 @@ class TransformerFeatureExtractor(nn.Module):
                         device=self.device,
                         dtype=torch.float32,
                     )
-                    zero_emb = self._apply_modality_projection(k, zero_emb)
+                    zero_emb = self._encode_lowdim(k, zero_emb)
                     feats.append(zero_emb)
 
             elif isinstance(v, list):  # TODO: this can be problematic, proceed with caution
@@ -972,49 +609,10 @@ class TransformerFeatureExtractor(nn.Module):
                         if v_stacked.dim() > 2:
                             v_stacked = v_stacked.to(device=self.device, dtype=torch.float32)
                         if k in self.image_keys:
-                            if (
-                                self.image_encoder_type == "resnet"
-                                and self.image_encoders is not None
-                                and k in self.image_encoders
-                            ):
-                                if (
-                                    v_stacked.dim() == 4 and v_stacked.size(-1) == 3
-                                ):  # [batch, H, W, C] or [batch, C, H, W]
-                                    v_stacked = v_stacked.permute(0, 3, 1, 2)
-                                if v_stacked.max() > 1.0:
-                                    v_stacked = v_stacked / 255.0
-                                image_features = self.image_encoders[k](v_stacked)
-                                image_features = self._apply_modality_projection(k, image_features)
-                                feats.append(image_features)
-                            elif (
-                                self.image_encoder_type == "dinov2"
-                                and self.dinov2_model is not None
-                                and self.dinov2_processor is not None
-                            ):
-                                image_features = self._compute_dinov2_features(v_stacked)
-                                image_features = self._apply_modality_projection(k, image_features)
-                                feats.append(image_features)
-                            elif (
-                                self.image_encoder_type == "impala"
-                                and self.image_encoders is not None
-                                and k in self.image_encoders
-                            ):
-                                # IMPALA encoder handles format conversion and normalization internally
-                                image_features = self.image_encoders[k](v_stacked)
-                                image_features = self._apply_modality_projection(k, image_features)
-                                feats.append(image_features)
-                            else:
-                                # No encoder available for this image key, fallback to flattening
-                                print(f"Warning: No image encoder found for image key {k}, using flattening")
-                                # Normalize and flatten
-                                if v_stacked.max() > 1.0:
-                                    v_stacked = v_stacked / 255.0
-                                v_flat = v_stacked.view(v_stacked.size(0), -1)
-                                v_flat = self._apply_modality_projection(k, v_flat)
-                                feats.append(v_flat)
+                            feats.append(self._encode_image(k, v_stacked))
                         else:
                             v_flat = v_stacked.view(v_stacked.size(0), -1)
-                            v_flat = self._apply_modality_projection(k, v_flat)
+                            v_flat = self._encode_lowdim(k, v_flat)
                             feats.append(v_flat)
                     except Exception as e:
                         print(f"Warning: Failed to stack tensors for {k}: {e}")
@@ -1039,31 +637,5 @@ class TransformerFeatureExtractor(nn.Module):
             print(f"Feature dtypes: {[f.dtype for f in feats]}")
             raise
 
-        # Ensure final output is float32
-        obs_flat = obs_flat.to(dtype=torch.float32)
-
-        # Handle dynamic sizing
-        if self.obs_dim is None or obs_flat.size(-1) != self.obs_dim:
-            # Recalculate dimensions based on actual input
-            actual_obs_dim = obs_flat.size(-1)
-
-            self.obs_dim = actual_obs_dim
-
-            # Build feature MLP now that we know the actual dimensions
-            if self.feature_hidden_dims:
-                self.feature_mlp = _build_mlp_layers(
-                    self.obs_dim,
-                    self.feature_hidden_dims,
-                    self.activation,
-                    self.use_layer_norm,
-                    self.dropout_rate,
-                ).to(obs_flat.device)
-                self.output_dim = self.feature_hidden_dims[-1]
-            else:
-                self.feature_mlp = None
-                self.output_dim = self.obs_dim
-
-        if self.feature_mlp is not None:
-            obs_flat = self.feature_mlp(obs_flat)
-
-        return obs_flat
+        # Concatenated per-modality features, projected to d_model later by obs_projection.
+        return obs_flat.to(dtype=torch.float32)

@@ -37,7 +37,6 @@ class TransformerCritic(BaseCritic):
         self.obs_feature_extractor = TransformerFeatureExtractor(
             observation_space=config.observation_space,
             featurizer_cfg=config.featurizer,
-            feature_hidden_dims=config.feature_hidden_dims,
             activation=config.activation,
             use_layer_norm=config.use_layer_norm,
             dropout_rate=config.dropout_rate,
@@ -60,7 +59,6 @@ class TransformerCritic(BaseCritic):
             use_language_embeddings=config.use_language_embeddings,
             lang_embedding_dim=config.lang_embedding_dim,
             lang_embedding_device=config.lang_embedding_device,
-            use_modality_projections=False,
         )
 
         # Action processing for Q-functions

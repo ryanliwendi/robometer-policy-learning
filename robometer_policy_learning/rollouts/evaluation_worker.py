@@ -22,6 +22,7 @@ class EvaluationWorker:
         record_video: bool = True,
         logger: Logger = None,
         image_keys: List[str] = None,
+        lowdim_obs_stats: Dict[str, Dict[str, np.ndarray]] = None,
     ):
         self.eval_env = eval_env
         self.device = device
@@ -29,6 +30,9 @@ class EvaluationWorker:
         self.record_video = record_video
         self.logger = logger
         self.image_keys = image_keys
+
+        self.lowdim_obs_stats = lowdim_obs_stats or {}
+        self._norm_tensors = None
 
         # Check if this is a chunked rollout (like in RolloutWorker)
         self.is_chunked_rollout = hasattr(self.eval_env, "is_chunk_empty")
@@ -56,6 +60,33 @@ class EvaluationWorker:
             if was_training:
                 actor.train()
 
+    def _prepare_obs(self, obs):
+        """Convert an extracted obs to a device tensor and z-score low-dim keys."""
+        obs_device = convert_to_tensor(obs)
+        obs_device = move_to_device(obs_device, self.device)
+        return self._normalize_obs(obs_device)
+
+    def _normalize_obs(self, obs):
+        """Apply the training buffer's low-dim z-score stats to matching obs keys.
+
+        No-op when no stats were provided. Image/embedding keys are absent from the stats
+        dict and so are left untouched.
+        """
+        if not self.lowdim_obs_stats or not isinstance(obs, dict):
+            return obs
+        if self._norm_tensors is None:
+            self._norm_tensors = {
+                k: (
+                    torch.as_tensor(st["mean"], dtype=torch.float32, device=self.device),
+                    torch.as_tensor(st["std"], dtype=torch.float32, device=self.device),
+                )
+                for k, st in self.lowdim_obs_stats.items()
+            }
+        for k, (mean, std) in self._norm_tensors.items():
+            if k in obs and torch.is_tensor(obs[k]):
+                obs[k] = (obs[k].to(torch.float32) - mean) / std
+        return obs
+
     def _run_evaluations(self, actor: BaseActor, num_episodes: int = 10):
         """Run multiple evaluation episodes without video recording for statistics."""
         from tqdm import tqdm
@@ -78,8 +109,7 @@ class EvaluationWorker:
 
             while not is_done:
                 # Get action and step environment
-                obs_device = convert_to_tensor(obs)
-                obs_device = move_to_device(obs_device, self.device)
+                obs_device = self._prepare_obs(obs)
 
                 # Handle chunked actions (like in RolloutWorker)
                 if self.is_chunked_rollout:
@@ -215,8 +245,7 @@ class EvaluationWorker:
                         frames_dict["stacked"].append(stacked_frame)
 
             # Get action and step environment
-            obs_device = convert_to_tensor(obs)
-            obs_device = move_to_device(obs_device, self.device)
+            obs_device = self._prepare_obs(obs)
 
             # Handle chunked actions (like in RolloutWorker)
             if self.is_chunked_rollout:

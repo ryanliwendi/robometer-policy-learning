@@ -68,3 +68,16 @@ eval:
 model:
   dinov2_model: "facebook/dinov2-base"
   sentence_model: "sentence-transformers/all-MiniLM-L12-v2"
+  # Featurizer-level image encoding. When `type` is null, images are handled by precomputing DINO embedding.
+  image_encoder:
+    type: null  # null | impala | resnet | dinov2
+    finetune: false
+    image_feature_dim: 128  # projection dim for resnet (and optional dino projection)
+    resnet_backbone: ResNet18  # ResNet18 | ResNet34 | ResNet50
+    resnet_pretrained: true
+    resnet_pool: spatial_softmax  # spatial_softmax | adaptive_avg | flatten
+    spatial_softmax_num_kp: 32
+    impala_nn_scale: 1
+    impala_num_blocks_per_stack: 2
+    impala_use_smaller: false
+    impala_output_dim: null

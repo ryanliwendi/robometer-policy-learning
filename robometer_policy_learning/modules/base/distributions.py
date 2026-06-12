@@ -180,9 +180,9 @@ class DiagGaussianDistribution(Distribution):
     def entropy(self) -> Optional[th.Tensor]:
         return sum_independent_dims(self.distribution.entropy())
 
-    def sample(self) -> th.Tensor:
+    def sample(self, num_samples: int = 1) -> th.Tensor:
         # Reparametrization trick to pass gradients
-        return self.distribution.rsample()
+        return self.distribution.rsample(sample_shape=(num_samples,))
 
     def mode(self) -> th.Tensor:
         return self.distribution.mean
@@ -250,9 +250,9 @@ class SquashedDiagGaussianDistribution(DiagGaussianDistribution):
         # entropy needs to be estimated using -log_prob.mean()
         return None
 
-    def sample(self) -> th.Tensor:
+    def sample(self, num_samples: int = 1) -> th.Tensor:
         # Reparametrization trick to pass gradients
-        self.gaussian_actions = super().sample()
+        self.gaussian_actions = super().sample(num_samples)
         return th.tanh(self.gaussian_actions)
 
     def mode(self) -> th.Tensor:
@@ -300,8 +300,8 @@ class CategoricalDistribution(Distribution):
     def entropy(self) -> th.Tensor:
         return self.distribution.entropy()
 
-    def sample(self) -> th.Tensor:
-        return self.distribution.sample()
+    def sample(self, num_samples: int = 1) -> th.Tensor:
+        return self.distribution.sample(sample_shape=(num_samples,))
 
     def mode(self) -> th.Tensor:
         return th.argmax(self.distribution.probs, dim=-1)
@@ -360,8 +360,8 @@ class MultiCategoricalDistribution(Distribution):
     def entropy(self) -> th.Tensor:
         return th.stack([dist.entropy() for dist in self.distribution], dim=-1).sum(dim=-1)
 
-    def sample(self) -> th.Tensor:
-        return th.stack([dist.sample() for dist in self.distribution], dim=-1)
+    def sample(self, num_samples: int = 1) -> th.Tensor:
+        return th.stack([dist.sample(sample_shape=(num_samples,)) for dist in self.distribution], dim=-1)
 
     def mode(self) -> th.Tensor:
         return th.stack([th.argmax(dist.probs, dim=-1) for dist in self.distribution], dim=-1)
@@ -410,8 +410,8 @@ class BernoulliDistribution(Distribution):
     def entropy(self) -> th.Tensor:
         return self.distribution.entropy().sum(dim=-1)
 
-    def sample(self) -> th.Tensor:
-        return self.distribution.sample()
+    def sample(self, num_samples: int = 1) -> th.Tensor:
+        return self.distribution.sample(sample_shape=(num_samples,))
 
     def mode(self) -> th.Tensor:
         return th.round(self.distribution.probs)

@@ -27,6 +27,7 @@ class RNNActorConfig(BaseActorConfig):
     dropout_rate: float = 0.0
 
     # Action distribution parameters
+    use_tanh_output: bool = True  # Whether to tanh-squash actions into [-1, 1]
     log_std_init: float = -0.5
     log_std_min: float = -20.0
     log_std_max: float = 2.0
@@ -38,8 +39,17 @@ class RNNActorConfig(BaseActorConfig):
     featurizer: Optional[dict] = None
     preprocess_obs_transform: Optional[List[Any]] = None
 
-    # IMPALA encoder parameters (optional)
-    image_encoder_type: str = None  # "impala" to enable IMPALA for image keys
+    # Image encoder parameters (optional).
+    # image_encoder_type in {impala, resnet, dinov2} enables featurizer-level image encoding.
+    image_encoder_type: str = None
+    finetune_image_encoder: bool = False
+    image_feature_dim: int = 128
+    resnet_backbone: str = "ResNet18"
+    resnet_pretrained: bool = True
+    resnet_pool: str = "spatial_softmax"
+    spatial_softmax_num_kp: int = 32
+    dinov2_model: object = None
+    dinov2_processor: object = None
     impala_nn_scale: int = 1
     impala_num_blocks_per_stack: int = 2
     impala_use_smaller: bool = False

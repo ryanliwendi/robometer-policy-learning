@@ -20,6 +20,8 @@ class ReplayBuffer(BaseReplayBuffer):
         pre_transforms: List[Callable] = None,
         post_transforms: List[Callable] = None,
         sampler=None,
+        min_action=None,
+        max_action=None,
     ):
         super().__init__(
             obs_keys=obs_keys,
@@ -28,6 +30,8 @@ class ReplayBuffer(BaseReplayBuffer):
             pre_transforms=pre_transforms,
             post_transforms=post_transforms,
             sampler=sampler,
+            min_action=min_action,
+            max_action=max_action,
         )
         self.capacity = capacity
         self.buffer = [None] * capacity
@@ -47,6 +51,7 @@ class ReplayBuffer(BaseReplayBuffer):
         episode_id=None,
         step_in_episode=None,
         timestamp=None,
+        info=None,
         **kwargs,
     ):
         obs = {k: v for k, v in obs.items() if k not in self.remove_obs_keys}
@@ -62,6 +67,7 @@ class ReplayBuffer(BaseReplayBuffer):
             episode_id=episode_id,
             step_in_episode=step_in_episode,
             timestamp=timestamp,
+            info=info,
         )
 
         # Evict the entry being overwritten (if buffer is full)
@@ -106,6 +112,35 @@ class ReplayBuffer(BaseReplayBuffer):
         if self._size < self.capacity:
             return self.buffer[: self._size]
         return self.buffer[self._write_pos :] + self.buffer[: self._write_pos]
+
+    def set_weights(self, weights):
+        """Set per-sample weights on the stored transitions (surfaced as ``batch['weight']``).
+
+        ``weights`` may be:
+          * a callable ``f(transition) -> float`` applied per transition (e.g. using
+            ``transition.info['episode_num_interventions']`` for an intervention-count heuristic);
+          * a scalar applied to every transition;
+          * a sequence of length ``len(self)`` applied in ``get_all_transitions()`` order.
+
+        Call it again each round to refresh weights as more data is collected.
+        """
+        transitions = self.get_all_transitions()
+        if callable(weights):
+            for t in transitions:
+                if t is not None:
+                    t.weight = float(weights(t))
+        elif isinstance(weights, (int, float, np.floating, np.integer)):
+            w = float(weights)
+            for t in transitions:
+                if t is not None:
+                    t.weight = w
+        else:
+            seq = list(weights)
+            if len(seq) != len(transitions):
+                raise ValueError(f"set_weights expects {len(transitions)} weights, got {len(seq)}.")
+            for t, w in zip(transitions, seq):
+                if t is not None:
+                    t.weight = float(w)
 
     def __len__(self):
         """Return the current size of the buffer."""

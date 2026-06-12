@@ -97,6 +97,13 @@ class TrainingConfig:
     save_interval: int = field(default=10000, metadata={"help": "Save interval in steps"})
     continue_training: bool = field(default=False, metadata={"help": "Continue training from the last checkpoint"})
     train_after_episode: bool = field(default=False, metadata={"help": "Train only after episode completion"})
+    use_image_transforms: bool = field(
+        default=False,
+        metadata={"help": "Apply image augmentation transforms when sampling from the replay buffer"},
+    )
+    normalize_lowdim_obs: bool = field(
+        default=False, metadata={"help": "Z-score low-dim obs using dataset stats computed at buffer init"}
+    )
 
 
 @dataclass
@@ -131,6 +138,41 @@ class EvaluationConfig:
 
 
 @dataclass
+class ImageEncoderConfig:
+    """Configuration for featurizer-level image encoding (the nested `model.image_encoder` block).
+
+    When `type` is null, images are handled by precomputing DINO embeddings (Mode A). When set to
+    impala/resnet/dinov2, raw images are encoded at the featurizer level (Mode B).
+    """
+
+    type: Optional[str] = field(
+        default=None, metadata={"help": "Image encoder type: null | impala | resnet | dinov2"}
+    )
+    finetune: bool = field(default=False, metadata={"help": "Whether image encoder params are trainable"})
+    image_feature_dim: int = field(
+        default=128, metadata={"help": "Projection dim for resnet (and optional dino projection)"}
+    )
+    resnet_backbone: str = field(default="ResNet18", metadata={"help": "ResNet18 | ResNet34 | ResNet50"})
+    resnet_pretrained: bool = field(default=True, metadata={"help": "Whether to use pretrained ResNet weights"})
+    resnet_pool: str = field(
+        default="spatial_softmax", metadata={"help": "spatial_softmax | adaptive_avg | flatten"}
+    )
+    spatial_softmax_num_kp: int = field(
+        default=32, metadata={"help": "Number of keypoints for spatial softmax pooling"}
+    )
+    impala_nn_scale: int = field(default=1, metadata={"help": "Scaling factor for IMPALA encoder channel sizes"})
+    impala_num_blocks_per_stack: int = field(
+        default=2, metadata={"help": "Number of residual blocks per stack in IMPALA encoder"}
+    )
+    impala_use_smaller: bool = field(
+        default=False, metadata={"help": "Whether to use SmallerImpalaEncoder variant (fewer blocks)"}
+    )
+    impala_output_dim: Optional[int] = field(
+        default=None, metadata={"help": "Output dimension for IMPALA encoder (None uses default based on architecture)"}
+    )
+
+
+@dataclass
 class ModelConfig:
     """Configuration for model settings."""
 
@@ -141,6 +183,9 @@ class ModelConfig:
         default="sentence-transformers/all-MiniLM-L12-v2",
         metadata={"help": "Sentence transformer model for text embeddings (null/None to disable)"},
     )
+    # Nested featurizer-level image encoding block (read via OmegaConf.select in training_utils).
+    image_encoder: ImageEncoderConfig = field(default_factory=ImageEncoderConfig)
+    # Flat image-encoder fields (legacy convention still used by some dsrl_* configs).
     image_encoder_type: Optional[str] = field(
         default=None,
         metadata={"help": "Image encoder type: 'impala', 'resnet', 'dinov2', or 'flatten'. None means use default."},
@@ -156,6 +201,11 @@ class ModelConfig:
     impala_output_dim: Optional[int] = field(
         default=None, metadata={"help": "Output dimension for IMPALA encoder (None uses default based on architecture)"}
     )
+
+    def __post_init__(self):
+        """Convert dict sub-config to a proper dataclass instance."""
+        if isinstance(self.image_encoder, dict):
+            self.image_encoder = ImageEncoderConfig(**self.image_encoder)
 
 
 @dataclass
@@ -343,6 +393,19 @@ class RewardModelConfig:
 
 
 @dataclass
+class DistributedRewardRelabelConfig:
+    """Configuration for distributed reward relabeling client (nested `buffer.distributed_reward_relabel`)."""
+
+    enabled: bool = field(default=False, metadata={"help": "Whether to use distributed reward relabeling"})
+    server_address: str = field(
+        default="localhost:50052", metadata={"help": "Address for remote reward relabeling server"}
+    )
+    max_queue_size: int = field(default=100, metadata={"help": "Max queue size for reward relabeling client"})
+    timeout: float = field(default=60.0, metadata={"help": "Timeout for reward relabeling client"})
+    flush_interval: float = field(default=0.1, metadata={"help": "Flush interval for reward relabeling client"})
+
+
+@dataclass
 class ReplayBufferConfig:
     """Configuration for replay buffer settings."""
 
@@ -378,6 +441,21 @@ class ReplayBufferConfig:
     save_buffer_dir: str = field(
         default="replay_buffers", metadata={"help": "Directory to save buffer files"}
     )
+    success_detection_duration: int = field(
+        default=2,
+        metadata={"help": "Number of consecutive time steps to detect success (only used with reward relabeling)"},
+    )
+    success_detection_threshold: float = field(
+        default=0.65, metadata={"help": "Threshold for success detection (only used with reward relabeling)"}
+    )
+    distributed_reward_relabel: DistributedRewardRelabelConfig = field(
+        default_factory=DistributedRewardRelabelConfig
+    )
+
+    def __post_init__(self):
+        """Convert dict sub-config to a proper dataclass instance."""
+        if isinstance(self.distributed_reward_relabel, dict):
+            self.distributed_reward_relabel = DistributedRewardRelabelConfig(**self.distributed_reward_relabel)
 
 
 @dataclass

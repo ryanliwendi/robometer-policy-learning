@@ -25,6 +25,7 @@ training:
   num_envs: 1 # Number of parallel environments
   num_rollouts: 500_000  # Number of rollouts to train, this is more like env steps
   chunk_size: null # Action chunking size
+  n_action_steps: 1 # Actions executed open-loop per predicted chunk before replanning (<= chunk_size)
   use_rnn: false  # Use RNN actor and critic
   num_offline_steps: 100_000  # Number of offline training steps
   load_dir: null  # Directory to load RL models from (null for no loading)

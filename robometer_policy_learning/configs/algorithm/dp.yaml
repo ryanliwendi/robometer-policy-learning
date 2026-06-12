@@ -1,0 +1,55 @@
+# Basic DP parameters
+learning_starts: 0
+batch_size: 256
+num_updates_per_train_step: 1
+
+# Optimizer configurations
+actor_optimizer_lr: 1.0e-4
+actor_optimizer_eps: 1.0e-8
+actor_optimizer_weight_decay: 1.0e-6
+actor_optimizer_betas: [0.95, 0.999]
+clip_grad_norm: 1.0  # <= 0 disables gradient clipping
+
+# Diffusion / noise scheduler
+num_train_timesteps: 100
+num_inference_steps: 20  # <= num_train_timesteps; fewer => faster sampling
+beta_schedule: "squaredcos_cap_v2"  # ["linear", "squaredcos_cap_v2"]
+beta_start: 1.0e-4
+beta_end: 0.02
+prediction_type: "epsilon"  # ["epsilon", "sample"]
+sampler: "ddim"  # ["ddpm", "ddim"]
+clip_sample: true  # clamp predicted x0 to [-clip_sample_range, clip_sample_range]
+clip_sample_range: 1.0
+
+# Noise prediction network
+net_type: "unet"  # ["unet", "mlp", "transformer"]
+diffusion_step_embed_dim: 128
+unet_down_dims: [128, 256]  # downsampling factor is 2**(len(down_dims)-1)
+unet_kernel_size: 5
+unet_n_groups: 8
+mlp_hidden_dims: [512, 512, 512]  # conditional MLP fallback
+# Conditional Transformer
+transformer_d_model: 256
+transformer_nhead: 4
+transformer_num_layers: 4
+transformer_dim_feedforward: 1024
+transformer_dropout: 0.0
+transformer_activation: "gelu"
+
+# Observation conditioning encoder
+# MLP on top of the featurized obs producing the global conditioning vector; [] => use the
+# raw featurized observation as conditioning.
+obs_encoder_hidden_dims: [256]
+
+# Exponential moving average of weights (used for inference/eval)
+use_ema: true
+ema_decay: 0.995
+
+# Anti-overfitting regularization parameters (parity with BC)
+obs_noise_std: 0.0
+action_noise_std: 0.0
+
+# Diagnostics
+# If > 0, every N updates run the (expensive) reverse diffusion sampler on the training batch
+# and log the resulting action MSE against the expert actions. 0 disables it.
+log_sample_metrics_every: 0
