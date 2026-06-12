@@ -37,6 +37,7 @@ class Transition:
     timestamp: Optional[float] = None
     language_instruction: Optional[str] = None  # Raw language instruction
     info: Optional[Dict[str, Any]] = None  # Info dict for retroactive updates (e.g., relabeled rewards)
+    weight: float = 1.0  # Per-sample weight (e.g. for weighted BC); set via buffer.set_weights().
 
     def replace(self, **kwargs):
         """Create a copy of this transition with some fields replaced."""
@@ -54,6 +55,7 @@ class Transition:
             "timestamp": self.timestamp,
             "language_instruction": self.language_instruction,
             "info": self.info,
+            "weight": self.weight,
         }
         # Update with provided kwargs
         current_values.update(kwargs)
@@ -736,6 +738,7 @@ class BaseReplayBuffer(abc.ABC):
                 "done": [],
                 "truncated": [],
                 "info": [],
+                "weight": [],
             }
             for tr in sampled:
                 for k, v in tr.obs.items():
@@ -747,6 +750,7 @@ class BaseReplayBuffer(abc.ABC):
                 batched["done"].append(tr.done)
                 batched["truncated"].append(tr.truncated)
                 batched["info"].append(tr.info if tr.info is not None else {})
+                batched["weight"].append(getattr(tr, "weight", 1.0))
 
             # Handle observations - avoid VisibleDeprecationWarning for ragged sequences
             for k in batched["obs"]:
@@ -763,6 +767,7 @@ class BaseReplayBuffer(abc.ABC):
                 "done": np.array([tr.done for tr in sampled]),
                 "truncated": np.array([tr.truncated for tr in sampled]),
                 "info": [tr.info if tr.info is not None else {} for tr in sampled],
+                "weight": np.array([getattr(tr, "weight", 1.0) for tr in sampled], dtype=np.float32),
             }
 
         # Post-process to match ReplayBuffer API - handle actions specially
@@ -786,6 +791,7 @@ class BaseReplayBuffer(abc.ABC):
         batched["done"] = np.array(batched["done"])
         batched["truncated"] = np.array(batched["truncated"])
         batched["done"] = batched["done"] * (1 - batched["truncated"])
+        batched["weight"] = np.asarray(batched["weight"], dtype=np.float32)
 
         return batched
 
@@ -1020,10 +1026,15 @@ class BaseReplayBuffer(abc.ABC):
         rewards = torch.from_numpy(batch["reward"]).to(dtype=dtype)
         dones = torch.from_numpy(batch["done"]).to(dtype=dtype)
         truncateds = torch.from_numpy(batch["truncated"]).to(dtype=dtype)
+        weight_np = batch.get("weight")
+        if weight_np is None:
+            weight_np = np.ones(len(batch["reward"]), dtype=np.float32)
+        weights = torch.from_numpy(np.asarray(weight_np, dtype=np.float32)).to(dtype=dtype)
         if pin:
             rewards = rewards.pin_memory()
             dones = dones.pin_memory()
             truncateds = truncateds.pin_memory()
+            weights = weights.pin_memory()
 
         if device is not None:
             non_block = True
@@ -1031,6 +1042,7 @@ class BaseReplayBuffer(abc.ABC):
             rewards = rewards.to(device, non_blocking=non_block)
             dones = dones.to(device, non_blocking=non_block)
             truncateds = truncateds.to(device, non_blocking=non_block)
+            weights = weights.to(device, non_blocking=non_block)
 
         return {
             "obs": obs,
@@ -1040,6 +1052,7 @@ class BaseReplayBuffer(abc.ABC):
             "done": dones,
             "truncated": truncateds,
             "info": batch.get("info", [{}] * len(batch["reward"])),
+            "weight": weights,
         }
 
     def add(self, obs, action, reward, next_obs, done, truncated, **kwargs):

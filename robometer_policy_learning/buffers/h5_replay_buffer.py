@@ -61,6 +61,7 @@ class H5ReplayBuffer(BaseReplayBuffer):
         num_image_loading_threads: int = 4,
         pre_convert_to_tensors: bool = True,
         optimize_tensor_dtype: bool = True,
+        default_intervention_label: Optional[int] = None,
     ):
         super().__init__(
             obs_keys=obs_keys,
@@ -81,6 +82,15 @@ class H5ReplayBuffer(BaseReplayBuffer):
         self.min_action = min_action
         self.max_action = max_action
         self.dataset_weights = dataset_weights
+
+        # When set, every emitted transition's info carries {"intervention": label}. Used to tag
+        # offline-dataset samples (e.g. label 2 for MILE) so the intervention signal survives both
+        # the per-transition and chunked sampling paths.
+        self.default_intervention_label = default_intervention_label
+
+        # Uniform per-sample weight applied to all offline samples (surfaced as batch["weight"]);
+        # update via set_weights(). Offline data is assumed homogeneous, so a single scalar.
+        self._sample_weight = 1.0
 
         # Low-dim obs normalization config + computed stats ({key: {"mean": [D], "std": [D]}}).
         self.normalize_lowdim_obs = normalize_lowdim_obs
@@ -797,6 +807,11 @@ class H5ReplayBuffer(BaseReplayBuffer):
             reward = rewards[t] if rewards is not None and t < len(rewards) else 0.0
             done = dones[t] if dones is not None and t < len(dones) else (t == actual_len - 1)
             language_instruction = self._demo_id_to_demo_lang_str.get(demo_key, None)
+            info = (
+                {"intervention": self.default_intervention_label}
+                if self.default_intervention_label is not None
+                else None
+            )
             transitions.append(
                 Transition(
                     obs=obs,
@@ -810,6 +825,7 @@ class H5ReplayBuffer(BaseReplayBuffer):
                     max_steps_in_episode=actual_len,
                     timestamp=None,
                     language_instruction=language_instruction,
+                    info=info,
                 )
             )
 
@@ -1003,14 +1019,37 @@ class H5ReplayBuffer(BaseReplayBuffer):
         active_sampler = sampler or self.sampler
         if hasattr(active_sampler, "chunk_size") and hasattr(active_sampler, "_chunk_to_sequence"):
             # Use efficient batch-based chunked sampling
-            return self._sample_chunked_batch_efficient(
+            batch = self._sample_chunked_batch_efficient(
                 batch_size,
                 chunk_size=active_sampler.chunk_size,
                 obs_as_sequence=active_sampler.obs_as_sequence,
                 device=device,
                 dtype=dtype,
             )
-        return self.sample_batch(batch_size, sampler=active_sampler, device=device, dtype=dtype)
+        else:
+            batch = self.sample_batch(batch_size, sampler=active_sampler, device=device, dtype=dtype)
+        return self._stamp_sample_weight(batch)
+
+    def set_weights(self, weight: float):
+        """Set the (uniform) weight applied to every offline sample (surfaced as ``batch['weight']``).
+
+        Offline data is assumed homogeneous, so a single scalar is used. Call again to refresh.
+        """
+        self._sample_weight = float(weight)
+
+    def _stamp_sample_weight(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Add a uniform ``batch['weight']`` matching the batch's reward type/length."""
+        if not batch or "weight" in batch:
+            return batch
+        ref = batch.get("reward")
+        if ref is None:
+            return batch
+        n = ref.shape[0] if hasattr(ref, "shape") else len(ref)
+        if isinstance(ref, torch.Tensor):
+            batch["weight"] = torch.full((n,), float(self._sample_weight), dtype=ref.dtype, device=ref.device)
+        else:
+            batch["weight"] = np.full((n,), float(self._sample_weight), dtype=np.float32)
+        return batch
 
     def _sample_chunked_batch_efficient(
         self, batch_size: int, chunk_size: int, obs_as_sequence: bool, device=None, dtype=None
@@ -1107,6 +1146,14 @@ class H5ReplayBuffer(BaseReplayBuffer):
                 # Handle list or non-stackable case
                 next_obs_dict[key] = values[T - 1 :: T] if len(values) == B * T else values
 
+        # Preserve each chunk's first-timestep info (e.g. the intervention label) instead of
+        # discarding it; flat_batch["info"] is per-transition (length B*T), chunk i starts at i*T.
+        flat_info = flat_batch.get("info")
+        if isinstance(flat_info, (list, tuple)) and len(flat_info) == B * T:
+            chunk_info = [flat_info[i * T] for i in range(B)]
+        else:
+            chunk_info = [{} for _ in range(B)]
+
         return {
             "obs": obs_dict,
             "action": actions,
@@ -1114,7 +1161,7 @@ class H5ReplayBuffer(BaseReplayBuffer):
             "next_obs": next_obs_dict,
             "done": done,
             "truncated": torch.zeros_like(done),
-            "info": [{} for _ in range(B)],
+            "info": chunk_info,
         }
 
     def _sample_chunked_batch_fast(self, batch_size: int, chunk_size: int, obs_as_sequence: bool) -> Dict[str, Any]:
@@ -1314,6 +1361,7 @@ class H5ReplayBuffer(BaseReplayBuffer):
             "episode_id": [],
             "step_in_episode": [],
             "timestamp": [],
+            "info": [],
         }
         all_obs_keys = set()
         for tr in transitions:
@@ -1352,6 +1400,7 @@ class H5ReplayBuffer(BaseReplayBuffer):
             batched["episode_id"].append(tr.episode_id)
             batched["step_in_episode"].append(tr.step_in_episode)
             batched["timestamp"].append(tr.timestamp)
+            batched["info"].append(tr.info if tr.info is not None else {})
 
         for k in all_obs_keys:
             try:
@@ -1551,7 +1600,7 @@ class H5ReplayBuffer(BaseReplayBuffer):
                             values = values.astype(np.int64)
                     tensor_batch[key] = torch.tensor(values, device=device, dtype=target_dtype)
 
-        for key in ["episode_id", "timestamp"]:
+        for key in ["episode_id", "timestamp", "info"]:
             if key in batch:
                 tensor_batch[key] = batch[key]
 

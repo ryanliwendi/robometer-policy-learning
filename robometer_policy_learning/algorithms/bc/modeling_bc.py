@@ -99,7 +99,9 @@ class BC(BaseAlgorithm):
             obs = batch["obs"]
             expert_actions = batch["action"]
             if self.use_weighted_bc:
-                reward_weights = batch["reward"]
+                # Prefer explicit per-sample weights (set via buffer.set_weights()); fall back to
+                # reward-as-weight for buffers/batches that don't surface a "weight" field.
+                weights = batch["weight"] if "weight" in batch else batch["reward"]
 
             if len(obs) == 0:
                 print("Buffer is still empty. Skipping this training step")
@@ -141,7 +143,7 @@ class BC(BaseAlgorithm):
                         per_sample = per_elem.view(per_elem.size(0), -1).mean(dim=1)
                     else:
                         per_sample = per_elem
-                    w = reward_weights.to(per_sample.dtype).view(-1)
+                    w = weights.to(per_sample.dtype).view(-1)
                     actor_loss = (w * per_sample).sum() / (w.sum() + 1e-8)
                 else:
                     actor_loss = F.mse_loss(predicted_actions, expert_actions)
@@ -190,7 +192,7 @@ class BC(BaseAlgorithm):
 
                 # Negative log-likelihood loss
                 if self.use_weighted_bc:
-                    w = reward_weights.to(log_prob_actions.dtype).view(-1, 1)
+                    w = weights.to(log_prob_actions.dtype).view(-1, 1)
                     actor_loss = -(w * log_prob_actions).sum() / (w.sum() + 1e-8)
                 else:
                     actor_loss = -log_prob_actions.mean()
@@ -204,7 +206,7 @@ class BC(BaseAlgorithm):
                         per_sample = per_elem.view(per_elem.size(0), -1).mean(dim=1)
                     else:
                         per_sample = per_elem
-                    w = reward_weights.to(per_sample.dtype).view(-1)
+                    w = weights.to(per_sample.dtype).view(-1)
                     actor_loss = (w * per_sample).sum() / (w.sum() + 1e-8)
                 else:
                     actor_loss = F.huber_loss(predicted_actions, expert_actions, delta=1.0)
@@ -219,7 +221,7 @@ class BC(BaseAlgorithm):
                         per_sample = per_elem.view(per_elem.size(0), -1).mean(dim=1)
                     else:
                         per_sample = per_elem
-                    w = reward_weights.to(per_sample.dtype).view(-1)
+                    w = weights.to(per_sample.dtype).view(-1)
                     actor_loss = (w * per_sample).sum() / (w.sum() + 1e-8)
                 else:
                     actor_loss = F.smooth_l1_loss(predicted_actions, expert_actions)

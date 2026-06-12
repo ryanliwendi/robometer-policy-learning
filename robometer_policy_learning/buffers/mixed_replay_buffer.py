@@ -14,7 +14,9 @@ class MixedReplayBuffer(BaseReplayBuffer):
     Args:
         buffer_1: First buffer to sample from
         buffer_2: Second buffer to sample from
-        sample_ratio: Ratio for sampling from buffer_1 vs buffer_2 (default 0.5 for 50/50)
+        sample_ratio: Fraction of each batch drawn from buffer_1 (default 0.5 for 50/50). If
+            ``None``, the buffers' live size ratio ``len(buffer_1) / (len(buffer_1) + len(buffer_2))``
+            is used and recomputed each sample (so it tracks a growing buffer).
         obs_keys: List of keys to include in the observation
         remove_obs_keys: List of keys to remove from the observation
         rename_obs_keys: Dictionary of keys to rename in the observation
@@ -25,7 +27,7 @@ class MixedReplayBuffer(BaseReplayBuffer):
         self,
         buffer_1: BaseReplayBuffer,
         buffer_2: BaseReplayBuffer,
-        sample_ratio: float = 0.5,
+        sample_ratio: Optional[float] = None,
         obs_keys: List[str] = None,
         remove_obs_keys: List[str] = None,
         rename_obs_keys: Dict[str, str] = None,
@@ -44,9 +46,9 @@ class MixedReplayBuffer(BaseReplayBuffer):
         self.sample_ratio = sample_ratio
         self.buffer_to_add_to = buffer_to_add_to
 
-        # Validate sample ratio
-        if not 0.0 <= sample_ratio <= 1.0:
-            raise ValueError("sample_ratio must be between 0.0 and 1.0")
+        # Validate sample ratio (None => use the buffers' live size ratio, computed at sample time)
+        if sample_ratio is not None and not 0.0 <= sample_ratio <= 1.0:
+            raise ValueError("sample_ratio must be between 0.0 and 1.0 (or None for the size ratio)")
 
     @property
     def observation_space(self):
@@ -171,11 +173,24 @@ class MixedReplayBuffer(BaseReplayBuffer):
             "total_size": len(self),
         }
 
-    def set_sample_ratio(self, ratio: float):
-        """Update the sampling ratio."""
-        if not 0.0 <= ratio <= 1.0:
-            raise ValueError("sample_ratio must be between 0.0 and 1.0")
+    def set_sample_ratio(self, ratio: Optional[float]):
+        """Update the sampling ratio (``None`` => use the buffers' live size ratio)."""
+        if ratio is not None and not 0.0 <= ratio <= 1.0:
+            raise ValueError("sample_ratio must be between 0.0 and 1.0 (or None for the size ratio)")
         self.sample_ratio = ratio
+
+    def _effective_sample_ratio(self) -> float:
+        """Fraction of each batch to draw from buffer_1.
+
+        Returns the fixed ``sample_ratio`` if set; otherwise the buffers' true size ratio
+        ``len(buffer_1) / (len(buffer_1) + len(buffer_2))``, recomputed each call so it tracks
+        a growing buffer. Falls back to 0.5 only if both buffers are empty.
+        """
+        if self.sample_ratio is not None:
+            return self.sample_ratio
+        n1, n2 = len(self.buffer_1), len(self.buffer_2)
+        total = n1 + n2
+        return (n1 / total) if total > 0 else 0.5
 
     def sample(
         self,
@@ -193,8 +208,8 @@ class MixedReplayBuffer(BaseReplayBuffer):
         active_sampler = sampler or self.sampler
         is_chunked = hasattr(active_sampler, "chunk_size")
 
-        # Calculate samples from each buffer
-        samples_1 = int(batch_size * self.sample_ratio)
+        # Calculate samples from each buffer (None sample_ratio -> live buffer size ratio)
+        samples_1 = int(batch_size * self._effective_sample_ratio())
         samples_2 = batch_size - samples_1
 
         # For chunked sampling, check if buffers have enough data
