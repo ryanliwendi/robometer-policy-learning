@@ -8,11 +8,10 @@ transformer:
   d_model: 256
   nhead: 8
   num_encoder_layers: 4
-  transformer_dropout: 0.0
+  transformer_dropout: 0.1
   transformer_activation: gelu
   output_hidden_dims: null
   use_layer_norm: false
   activation: relu
-  dropout_rate: 0.0
-  log_std_init: -2.0
+  dropout_rate: 0.1
 
