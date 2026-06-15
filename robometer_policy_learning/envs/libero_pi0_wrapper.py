@@ -47,8 +47,6 @@ class LiberoPI0Wrapper(gym.Wrapper):
                 "observation/state": gym.spaces.Box(low=-1, high=1, shape=(8,), dtype=np.float32),
                 "observation/image": gym.spaces.Box(low=0, high=255, shape=(224, 224, 3), dtype=np.uint8),
                 "observation/wrist_image": gym.spaces.Box(low=0, high=255, shape=(224, 224, 3), dtype=np.uint8),
-                # Raw (unflipped) agentview — same orientation as H5 dataset; used by DinoEmbeddingWrapper
-                "agentview_rgb": gym.spaces.Box(low=0, high=255, shape=(224, 224, 3), dtype=np.uint8),
             }
         )
 

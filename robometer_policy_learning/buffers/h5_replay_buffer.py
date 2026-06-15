@@ -502,10 +502,15 @@ class H5ReplayBuffer(BaseReplayBuffer):
             # Load subsequent frames in a single read: shape [episode_len, H, W, C]
             with self._get_hdf5_file(h5_path) as file:
                 demo_group = self._get_demo_group(file, original_demo_name)
-                all_next_frames = np.array(demo_group["next_obs"][img_key][:episode_len])
+                try:
+                    all_next_frames = np.array(demo_group["next_obs"][img_key][:episode_len])
+                except Exception:
+                    obs_frames = np.array(demo_group["obs"][img_key][:episode_len])
+                    all_next_frames = np.concatenate([obs_frames[1:], obs_frames[-1:]], axis=0)
 
-            # Concatenate to [episode_len+1, H, W, C]
+            # Concatenate to [episode_len+1, H, W, C] and rotate 180° (H5 images are stored rotated)
             video_frames = np.concatenate([initial_frame[np.newaxis, ...], all_next_frames], axis=0)
+            video_frames = np.flip(video_frames, axis=(1, 2)).copy()
 
             all_trajectory_frames.append((demo_key, cached_demo, video_frames))
 
@@ -538,6 +543,7 @@ class H5ReplayBuffer(BaseReplayBuffer):
             hash_input += f"_st{self.sentence_model.get_sentence_embedding_dimension()}"
         if self.use_dino_embeddings and self.dinov2_model is not None:
             hash_input += f"_dinov2_{self.dinov2_model.config.name_or_path}"
+        hash_input += "_flipped"
         for h5_path in h5_paths_list:
             if os.path.exists(h5_path):
                 hash_input += f"_{os.path.getmtime(h5_path)}"
@@ -700,6 +706,14 @@ class H5ReplayBuffer(BaseReplayBuffer):
             if self.use_dino_embeddings and demo_key in self.precomputed_video_embeddings:
                 obs_dict["dino_embedding"] = self.precomputed_video_embeddings[demo_key]  # [T, D]
 
+            if "observation/state" not in obs_dict:
+                ee_states = obs_dict.get("ee_states")
+                gripper_states = obs_dict.get("gripper_states")
+                if ee_states is not None and gripper_states is not None:
+                    obs_dict["observation/state"] = np.concatenate(
+                        [ee_states, gripper_states], axis=-1
+                    ).astype(np.float32)
+
             cached_demo["obs"] = obs_dict
 
         # Register the synthesized keys as low-dim obs keys.
@@ -710,6 +724,10 @@ class H5ReplayBuffer(BaseReplayBuffer):
                 self.low_dim_keys.append(new_key)
             if getattr(self, "obs_keys", None) is not None and new_key not in self.obs_keys:
                 self.obs_keys.append(new_key)
+        if hasattr(self, "low_dim_keys") and "observation/state" not in self.low_dim_keys:
+            self.low_dim_keys.append("observation/state")
+        if getattr(self, "obs_keys", None) is not None and "observation/state" not in self.obs_keys:
+            self.obs_keys.append("observation/state")
 
     # --------------------------
     # Index and sampling

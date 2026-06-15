@@ -226,13 +226,6 @@ def preprocess_obs_for_pi0(raw_obs: Dict[str, Any]) -> Dict[str, Any]:
     img = image_tools.convert_to_uint8(image_tools.resize_with_pad(img, 224, 224))
     wrist_img = image_tools.convert_to_uint8(image_tools.resize_with_pad(wrist_img, 224, 224))
 
-    # Also expose the raw (unflipped, resized) agentview image under the H5 dataset key name
-    # so that DinoEmbeddingWrapper during eval sees the same orientation as training DINO
-    # (H5 images are stored unflipped; the flip above is only for Pi0 inference).
-    agentview_rgb = image_tools.convert_to_uint8(
-        image_tools.resize_with_pad(np.ascontiguousarray(raw_obs["agentview_image"]), 224, 224)
-    )
-
     # Process state: [eef_pos (3), eef_axis_angle (3), gripper_qpos (2)] = 8-dim
     if "robot0_eef_quat" in raw_obs:
         state = np.concatenate(
@@ -249,7 +242,6 @@ def preprocess_obs_for_pi0(raw_obs: Dict[str, Any]) -> Dict[str, Any]:
         "observation/image": img,
         "observation/wrist_image": wrist_img,
         "observation/state": state,
-        "agentview_rgb": agentview_rgb,
         "prompt": raw_obs.get("prompt", raw_obs.get("language_instruction", "unknown task")),
     }
 

@@ -1,7 +1,6 @@
 # Basic BC parameters
 learning_starts: 0
 batch_size: 256
-gamma: 0.99  # unused by BC loss; required by ChunkedSequentialSampler when chunk_size is set
 
 # Training configuration
 num_updates_per_train_step: 1

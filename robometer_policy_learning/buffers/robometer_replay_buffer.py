@@ -573,8 +573,9 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
                     all_next_frames = np.concatenate([obs_frames[1:], obs_frames[-1:]], axis=0)
 
 
-            # Concatenate to [episode_len+1, H, W, C]
+            # Concatenate to [episode_len+1, H, W, C] and rotate 180° (H5 images are stored rotated)
             video_frames = np.concatenate([initial_frame[np.newaxis, ...], all_next_frames], axis=0)
+            video_frames = np.flip(video_frames, axis=(1, 2)).copy()
 
             all_trajectory_frames.append((demo_key, cached_demo, video_frames))
 
@@ -605,6 +606,7 @@ class RobometerH5ReplayBuffer(H5ReplayBuffer):
         )
         if self.use_dino_embeddings and self.dinov2_model is not None:
             hash_input += f"_dinov2_{self.dinov2_model.config.name_or_path}"
+        hash_input += "_flipped"
 
         # Use file modification times to detect dataset changes
         for h5_path in h5_paths_list:
