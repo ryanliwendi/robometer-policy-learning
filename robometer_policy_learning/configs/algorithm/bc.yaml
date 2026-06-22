@@ -8,7 +8,6 @@ num_updates_per_train_step: 1
 # Optimizer configurations
 actor_optimizer_lr: 1.0e-4
 actor_optimizer_eps: 1.0e-8
-actor_optimizer_weight_decay: 0.0
 
 # BC-specific parameters
 loss_type: "mse"  # ["mse", "nll", "huber", "smooth_l1"] - MSE for deterministic, NLL for stochastic

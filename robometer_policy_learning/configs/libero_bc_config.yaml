@@ -26,7 +26,7 @@ training:
   num_rollouts: 0  # Number of rollouts to train, this is more like env steps
   # chunk_size: null # Action chunking size
   chunk_size: 20 # Action chunking size for transformer policy
-  n_action_steps: 2
+  n_action_steps: 4
   use_rnn: false  # Use RNN actor and critic
   num_offline_steps: 100_000  # Number of offline training steps
   load_dir: null  # Directory to load RL models from (null for no loading)
@@ -66,7 +66,7 @@ alg:
 # Evaluation configuration
 eval:
   eval_freq: 10000   # Evaluation frequency in rollouts
-  eval_num_episodes: 25  # Number of episodes for evaluation
+  eval_num_episodes: 50  # Number of episodes for evaluation
   eval_record_video: true  # Whether to record videos during evaluation
   eval_on_first_step: false  # If true, evaluate on the first step before any training
 

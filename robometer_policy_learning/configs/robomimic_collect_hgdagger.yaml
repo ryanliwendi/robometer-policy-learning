@@ -1,0 +1,46 @@
+# HG-DAgger rollout COLLECTION config for scripts/collect_hitl_rollouts_publish.py.
+#
+# A real teleoperator corrects a data-collection policy (load_dir); the collected trajectories are
+# written as a robomimic-style HDF5 dataset (loadable by H5ReplayBuffer). The env / training /
+# model / policy config is read at runtime from the pretraining run's saved Hydra config
+# (load_dir/.hydra/config.yaml) so it matches the loaded policy.
+#
+# Run with:  uv run python scripts/collect_hitl_rollouts_publish.py --config-name robomimic_collect_hgdagger \
+#                load_dir=/path/to/run hitl.collect_output_path=/path/to/hitl_rollouts.hdf5
+defaults:
+  - _self_
+
+debug: false
+
+# Data-collection (rollout) policy: a pretraining run OUTPUT DIRECTORY containing `.hydra/config.yaml`
+# and `checkpoints/<step>/actor.pt`. `checkpoint` selects which <step> (null = latest available).
+load_dir: null
+checkpoint: null
+
+hitl:
+  seed: 0
+  online_buffer_capacity: 500000
+  # HG-DAgger: store only the human-correction steps (label 1). Set false to store ALL steps
+  # (labels 0/1) — required if you intend to train the weighted IWR/SIRIUS variants, which need
+  # both policy and human transitions.
+  store_only_human: true
+
+  # ----- output -----
+  collect_num_rollouts: 50        # number of KEPT rollouts to collect
+  # true => keep only successful rollouts with >= 1 human intervention; false => keep all successful.
+  keep_only_hitl_rollouts: false
+  collect_output_path: null       # output .hdf5 path; null => <hydra_output_dir>/hitl_rollouts.hdf5
+
+  human_mode: real                # real teleoperator (only mode supported in this release)
+
+# Teleop (keyboard or 3D SpaceMouse) + rendering
+teleop:
+  device: "spacemouse"            # keyboard | spacemouse
+  takeover_key: "tab"
+  camera: "agentview"
+  wrist_camera: "robot0_eye_in_hand"
+  show_wrist: true
+  enable_render: true             # set false for headless runs (no cv2 window)
+
+logging:
+  log_level: "INFO"

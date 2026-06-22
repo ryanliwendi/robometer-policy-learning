@@ -1,0 +1,72 @@
+# HG-DAgger training config for scripts/train_hitl_publish.py.
+#
+# Trains behavior cloning ("bc") on human-in-the-loop interventions collected online with a real
+# teleoperator, or loaded from a precollected dataset. The env / training / model / policy config is
+# read at runtime from the pretraining run's saved Hydra config (load_dir/.hydra/config.yaml) so it
+# always matches the loaded actor; this config only carries the HITL settings.
+#
+# Plain HG-DAgger:  store_only_human=true (clone only human corrections), reweighting=null.
+# Weighted variants (need BOTH policy and human steps): store_only_human=false, reweighting=iwr|sirius,
+#   and offline_algorithm.use_weighted_bc=true.
+defaults:
+  - algorithm@offline_algorithm: bc   # HG-DAgger trains behavior cloning
+  - _self_
+
+debug: false
+
+# Pretrained policy to start from: a pretraining run OUTPUT DIRECTORY containing `.hydra/config.yaml`
+# (env/training/model/policy read from there) and `checkpoints/<step>/actor.pt`. `checkpoint` selects
+# which <step> (null = latest available).
+load_dir: null
+checkpoint: null
+
+# HG-DAgger trains behavior cloning. Only "bc" is supported in this release.
+alg:
+  offline_alg_name: bc
+
+hitl:
+  seed: 0
+  # Train on a precollected HITL dataset (HDF5 written by collect_hitl_rollouts_publish.py) instead
+  # of collecting online. When set, requires num_iterations=1 and skips online collection. null =>
+  # collect online.
+  precollected_hitl_dataset: null
+  num_iterations: 10              # must be 1 when precollected_hitl_dataset is set
+  rollouts_per_iter: 5            # KEPT intervention rollouts collected each iteration (online mode)
+  train_steps_per_iter: 1000      # BC train_step calls each iteration
+  online_buffer_capacity: 500000
+  clear_buffer_each_iter: false   # false = accumulate online data across iterations
+  save_interval: 1                # save a checkpoint every N HITL iterations
+  store_only_human: true          # HG-DAgger: clone only human corrections (label 1).
+                                  # Set false (+ reweighting + use_weighted_bc) for weighted variants.
+  # true => keep only successful rollouts with >= 1 human intervention; false => keep all successful.
+  keep_only_hitl_rollouts: false
+  use_offline: false              # mix the offline H5 dataset (labelled intervention=2)
+  offline_sample_ratio: 0.5       # fraction of each batch from the offline buffer; null = live size ratio
+  human_mode: real                # real teleoperator (only mode supported in this release)
+  # Per-sample reweighting for weighted BC (requires offline_algorithm.use_weighted_bc=true):
+  #   sirius -> SIRIUS class weights (demo / intervention / pre-intervention / rollout)
+  #   iwr    -> Intervention-Weighted Regression (corrections vs autonomy)
+  reweighting: null               # null | sirius | iwr
+
+# Teleop (keyboard or 3D SpaceMouse) + rendering (used for online collection only)
+teleop:
+  device: "spacemouse"            # keyboard | spacemouse
+  takeover_key: "tab"
+  camera: "agentview"
+  wrist_camera: "robot0_eye_in_hand"
+  show_wrist: true
+  enable_render: true             # set false for headless runs (no cv2 window)
+
+logging:
+  wandb_project: hgdagger
+  wandb_entity: null              # null => your default wandb entity
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "train_hgdagger"
+  log_level: "INFO"
+
+eval:
+  eval_freq: 500                  # autonomous (no-human) eval every N train steps
+  eval_num_episodes: 10
+  eval_record_video: true
+  eval_on_first_step: true        # eval the initial policy before any training

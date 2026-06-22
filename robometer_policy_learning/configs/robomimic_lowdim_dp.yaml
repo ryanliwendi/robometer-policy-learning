@@ -1,7 +1,8 @@
 defaults:
   - algorithm@offline_algorithm: dp   # loads configs/algorithm/dp.yaml into offline_algorithm (edit there or override on the CLI)
   - reward_model: null                # Options: null, robometer
-  - policy@policy: mlp                 # ignored by DP (it builds a DiffusionActor), but required by the schema
+  # DP builds its own DiffusionActor and does not use a `policy` group; the featurizer/obs-encoder
+  # settings it reads (policy.mlp.activation/use_layer_norm/dropout_rate) fall back to relu/false/0.0.
 
 # Debug mode
 debug: false
@@ -23,9 +24,9 @@ training:
   chunk_size: 8 # Diffusion prediction horizon (Tp): #actions the policy denoises jointly per obs
   n_action_steps: 6 # Actions executed open-loop per predicted chunk before replanning (Ta <= chunk_size)
   use_rnn: false  # Use RNN actor and critic
-  num_offline_steps: 50_000  # Number of offline training steps
+  num_offline_steps: 100_000  # Number of offline training steps
   load_dir: null  # Directory to load RL models from (null for no loading)
-  save_interval: 50000  # Save interval in steps
+  save_interval: 10000  # Save interval in steps
   continue_training: false  # Continue training from the last checkpoint
   seed: 0  # Random seed for training
   normalize_lowdim_obs: false  # Z-score low-dim obs using dataset stats computed at buffer init
@@ -45,7 +46,7 @@ alg:
 
 # Evaluation configuration
 eval:
-  eval_freq: 5000   # Evaluation frequency in steps
+  eval_freq: 10000   # Evaluation frequency in steps
   eval_num_episodes: 20  # Number of episodes for evaluation
   eval_record_video: true  # Whether to record videos during evaluation
   eval_on_first_step: true  # If true, evaluate on the first step before any training

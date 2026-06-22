@@ -64,6 +64,7 @@ dependencies = [
     "openpi",
     "diffusers>=0.38.0",
     "pynput>=1.8.2",
+    "hidapi>=0.15.0",
 ]
 
 [project.urls]

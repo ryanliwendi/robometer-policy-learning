@@ -22,7 +22,7 @@ clip_sample: true  # clamp predicted x0 to [-clip_sample_range, clip_sample_rang
 clip_sample_range: 1.0
 
 # Noise prediction network
-net_type: "unet"  # ["unet", "mlp", "transformer"]
+net_type: "transformer"  # ["unet", "mlp", "transformer"]
 diffusion_step_embed_dim: 128
 unet_down_dims: [128, 256]  # downsampling factor is 2**(len(down_dims)-1)
 unet_kernel_size: 5
@@ -30,16 +30,16 @@ unet_n_groups: 8
 mlp_hidden_dims: [512, 512, 512]  # conditional MLP fallback
 # Conditional Transformer
 transformer_d_model: 256
-transformer_nhead: 4
+transformer_nhead: 8
 transformer_num_layers: 4
 transformer_dim_feedforward: 1024
-transformer_dropout: 0.0
+transformer_dropout: 0.1
 transformer_activation: "gelu"
 
 # Observation conditioning encoder
 # MLP on top of the featurized obs producing the global conditioning vector; [] => use the
 # raw featurized observation as conditioning.
-obs_encoder_hidden_dims: [256]
+obs_encoder_hidden_dims: []
 
 # Exponential moving average of weights (used for inference/eval)
 use_ema: true
