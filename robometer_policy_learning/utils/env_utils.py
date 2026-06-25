@@ -169,6 +169,18 @@ def _make_env(
         import random
         if seed is None:
             seed = random.randint(1,100)
+        # Map the training DINO image keys (H5 names) to the eval env's observation keys, preserving
+        # ORDER, so the eval DinoEmbeddingWrapper embeds the SAME cameras in the SAME order the policy
+        # was trained on (the buffer concatenates per-key embeddings in dino_image_keys order). Without
+        # this, the LIBERO eval env defaults to only `observation/image`, so a multi-camera policy gets
+        # a wrong-sized `dino_embedding` at eval (e.g. 384 instead of 768) -> train/eval mismatch.
+        _h5_to_env_img = {
+            "agentview_rgb": "observation/image",
+            "eye_in_hand_rgb": "observation/wrist_image",
+        }
+        eval_image_keys = (
+            [_h5_to_env_img.get(k, k) for k in dino_image_keys] if dino_image_keys else ["observation/image"]
+        )
         env, _ = setup_libero_env(task_suite_name=task_suite,
                                 task_id=task_id,
                                 n_envs=num_envs,
@@ -178,6 +190,7 @@ def _make_env(
                                 device=device,
                                 max_episode_steps=max_episode_steps,
                                 seed=seed,
+                                image_keys=eval_image_keys,
                                 chunk_size=chunk_size,
                                 n_action_steps=n_action_steps,
                                 )
