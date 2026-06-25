@@ -1,7 +1,7 @@
 defaults:
   - algorithm@offline_algorithm: dp
   - reward_model: null
-  - policy@policy: mlp  # ignored by DP (it builds DiffusionActor internally), required by schema
+  - policy@policy: transformer 
 
 # Debug mode
 debug: false
@@ -21,15 +21,15 @@ env:
 # Training configuration
 training:
   num_envs: 1
-  chunk_size: 16  # Diffusion prediction horizon (Tp)
-  n_action_steps: 4  # Actions executed open-loop per chunk before replanning (Ta)
+  chunk_size: 20  # Diffusion prediction horizon (Tp)
+  n_action_steps: 5  # Actions executed open-loop per chunk before replanning (Ta)
   use_rnn: false
-  num_offline_steps: 50_000
+  num_offline_steps: 40_000
   load_dir: null
   save_interval: 10000
   continue_training: false
   seed: 0
-  normalize_lowdim_obs: true  # Z-score low-dim obs using dataset stats (important for DP)
+  normalize_lowdim_obs: false  # BUG (see libero_bc_config): buffer normalizes ee_states/gripper BEFORE observation/state is synthesized -> train/eval scale mismatch on observation/state. Keep false until the buffer ordering is fixed.
 
 # Replay buffer configuration
 buffer:
