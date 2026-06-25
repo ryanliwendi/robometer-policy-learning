@@ -147,6 +147,14 @@ class H5ReplayBuffer(BaseReplayBuffer):
         self._load_with_optimizations()
         self._build_lightweight_index_if_needed()
 
+        # Synthesize `observation/state` (= concat of raw ee_states + gripper_states) BEFORE
+        # normalization. This is required for correctness: observation/state is the proprioception
+        # key the policy actually consumes, and eval normalizes it via lowdim_obs_stats. If it were
+        # synthesized AFTER normalization (the old order), it would be built from already-z-scored
+        # components AND be absent from lowdim_obs_stats, so eval could not apply matching
+        # normalization -> train (normalized) vs eval (raw) scale mismatch -> policy fails.
+        self._synthesize_observation_state()
+
         # Normalize low-dim obs BEFORE embeddings are attached, so the synthesized
         # `dino_embedding`/`language` keys (added by _setup_embeddings) are never z-scored.
         self._setup_lowdim_normalization()
@@ -180,6 +188,37 @@ class H5ReplayBuffer(BaseReplayBuffer):
     # --------------------------
     # Low-dim observation normalization
     # --------------------------
+    def _synthesize_observation_state(self):
+        """Build ``observation/state`` = concat(ee_states, gripper_states) from RAW components and
+        register it as a low-dim key, BEFORE normalization runs.
+
+        This must precede ``_setup_lowdim_normalization`` so that (a) observation/state gets its own
+        z-score stats and is normalized as a single unit, and (b) ``lowdim_obs_stats`` contains an
+        ``observation/state`` entry that the EvaluationWorker applies to the raw env observation at
+        inference. The raw components (ee_states/gripper_states) are still normalized too, but they
+        are unused by the policy (only observation/state and dino_embedding are in the policy's
+        observation space), so that is harmless. Idempotent: skips demos that already have the key.
+        """
+        if self.hdf5_cache is None or len(self.hdf5_cache) == 0:
+            return
+        synthesized = False
+        for cached_demo in self.hdf5_cache.values():
+            obs_dict = cached_demo.get("obs")
+            if not obs_dict or "observation/state" in obs_dict:
+                continue
+            ee_states = obs_dict.get("ee_states")
+            gripper_states = obs_dict.get("gripper_states")
+            if ee_states is not None and gripper_states is not None:
+                obs_dict["observation/state"] = np.concatenate(
+                    [ee_states, gripper_states], axis=-1
+                ).astype(np.float32)
+                synthesized = True
+        if synthesized:
+            if hasattr(self, "low_dim_keys") and "observation/state" not in self.low_dim_keys:
+                self.low_dim_keys.append("observation/state")
+            if getattr(self, "obs_keys", None) is not None and "observation/state" not in self.obs_keys:
+                self.obs_keys.append("observation/state")
+
     def _setup_lowdim_normalization(self):
         """Compute per-key z-score statistics over all cached low-dim obs and apply them
         in place.
@@ -512,6 +551,18 @@ class H5ReplayBuffer(BaseReplayBuffer):
             video_frames = np.concatenate([initial_frame[np.newaxis, ...], all_next_frames], axis=0)
             video_frames = np.flip(video_frames, axis=(1, 2)).copy()
 
+            # Match the eval pipeline EXACTLY: eval computes DINO embeddings from
+            # `observation/image`, which is resize_with_pad'ed to 224 before the DINOv2 processor
+            # (see preprocess_obs_for_pi0). Feeding the raw 256x256 frame straight to the processor
+            # instead produces a different 224 image -> ~20% different embeddings -> the policy gets
+            # OOD conditioning at eval. Apply the same resize here so cached/train embeddings match.
+            from openpi_client import image_tools
+
+            video_frames = np.stack(
+                [image_tools.convert_to_uint8(image_tools.resize_with_pad(f, 224, 224)) for f in video_frames],
+                axis=0,
+            )
+
             all_trajectory_frames.append((demo_key, cached_demo, video_frames))
 
         return all_trajectory_frames, all_language_instructions, all_episode_lengths
@@ -543,7 +594,7 @@ class H5ReplayBuffer(BaseReplayBuffer):
             hash_input += f"_st{self.sentence_model.get_sentence_embedding_dimension()}"
         if self.use_dino_embeddings and self.dinov2_model is not None:
             hash_input += f"_dinov2_{self.dinov2_model.config.name_or_path}"
-        hash_input += "_flipped"
+        hash_input += "_flipped_pad224"
         for h5_path in h5_paths_list:
             if os.path.exists(h5_path):
                 hash_input += f"_{os.path.getmtime(h5_path)}"
