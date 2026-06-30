@@ -625,6 +625,19 @@ def setup_training(
     log_level = cfg.log_level if hasattr(cfg, "log_level") else "INFO"
     setup_loguru_logging(log_level=log_level, output_dir=output_dir)
 
+    # Seed all RNGs from cfg.training.seed. The config exposed `training.seed` but it was never
+    # applied to torch/numpy/python RNGs, so "fixed-seed" runs were actually non-deterministic
+    # (a silent bug). Wiring it in here makes training reproducible and seed sweeps meaningful.
+    # (DP's per-rollout eval action sampling is still stochastic unless separately seeded.)
+    import random as _random
+
+    _seed = int(OmegaConf.select(cfg, "training.seed", default=0))
+    _random.seed(_seed)
+    np.random.seed(_seed)
+    torch.manual_seed(_seed)
+    torch.cuda.manual_seed_all(_seed)
+    logger.info(f"Seeded RNGs (python/numpy/torch/cuda) with training.seed={_seed}")
+
     # Setup wandb logger
     string_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     exp_name = f"{cfg.logging.wandb_name}_{string_time}"
