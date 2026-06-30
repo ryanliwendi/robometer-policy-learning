@@ -12,22 +12,21 @@ debug: false
 env:
   env_name: "libero_10"
   task_id: 3 # task id for libero environment
-  max_episode_steps: 800 # max episode steps for libero environment
+  max_episode_steps: 500 # max episode steps for libero environment
   use_full_state: false  # Use the full state (default: False). If False, only proprioceptive information will be used. If True, no reward relabeling will be performed.
   use_gt_rewards: true # Use ground truth rewards (default: False). If True, no reward relabeling will be performed. If no reward model is provided, this will be set to True.
   h5_dataset_path: "/scr/liryan/LIBERO/libero/datasets/libero_10_only_successful/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo.hdf5"
-  dino_image_keys: ["agentview_rgb"] # keys for dino conversion in observation
-  extra_keys_to_drop: ["eye_in_hand_rgb", "prompt", "language", "observation/image", "observation/wrist_image"] # keys to drop from observation beyond image_keys (default: [])
+  dino_image_keys: ["agentview_rgb", "eye_in_hand_rgb"] # keys for dino conversion in observation
+  extra_keys_to_drop: ["prompt", "language", "observation/image", "observation/wrist_image"] # keys to drop from observation beyond image_keys (default: [])
   success_bonus_amount: 0.0
 
 # Training configuration
 training:
   num_envs: 1 # Number of parallel environments
   num_rollouts: 0  # Number of rollouts to train, this is more like env steps
-  # chunk_size: null # Action chunking size
   chunk_size: 20 # Action chunking size for transformer policy
-  n_action_steps: 5
-  normalize_lowdim_obs: false  # BUG: buffer normalizes ee_states/gripper BEFORE observation/state is synthesized, so observation/state ends up scale-mismatched between train and eval. Keep false until the buffer is fixed (synthesize observation/state, THEN normalize).
+  n_action_steps: 10 # Execution horizon for action chunking
+  normalize_lowdim_obs: true  # BUG: buffer normalizes ee_states/gripper BEFORE observation/state is synthesized, so observation/state ends up scale-mismatched between train and eval. Keep false until the buffer is fixed (synthesize observation/state, THEN normalize).
   use_rnn: false  # Use RNN actor and critic
   num_offline_steps: 100_000  # Number of offline training steps
   load_dir: null  # Directory to load RL models from (null for no loading)

@@ -12,7 +12,7 @@ clip_grad_norm: 1.0  # <= 0 disables gradient clipping
 
 # Diffusion / noise scheduler
 num_train_timesteps: 100
-num_inference_steps: 20  # <= num_train_timesteps; fewer => faster sampling
+num_inference_steps: 50  # <= num_train_timesteps; fewer => faster sampling
 beta_schedule: "squaredcos_cap_v2"  # ["linear", "squaredcos_cap_v2"]
 beta_start: 1.0e-4
 beta_end: 0.02

@@ -14,22 +14,22 @@ env:
   use_full_state: false
   use_gt_rewards: true
   h5_dataset_path: "/scr/liryan/LIBERO/libero/datasets/libero_10_only_successful/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo.hdf5"
-  dino_image_keys: ["agentview_rgb"]
-  extra_keys_to_drop: ["eye_in_hand_rgb", "prompt", "language", "observation/image", "observation/wrist_image"]
+  dino_image_keys: ["agentview_rgb", "eye_in_hand_rgb"]
+  extra_keys_to_drop: ["prompt", "language", "observation/image", "observation/wrist_image"]
   success_bonus_amount: 0.0
 
 # Training configuration
 training:
   num_envs: 1
   chunk_size: 20  # Diffusion prediction horizon (Tp)
-  n_action_steps: 5  # Actions executed open-loop per chunk before replanning (Ta)
+  n_action_steps: 10  # Actions executed open-loop per chunk before replanning (Ta)
   use_rnn: false
-  num_offline_steps: 40_000
+  num_offline_steps: 100_000
   load_dir: null
   save_interval: 10000
   continue_training: false
   seed: 0
-  normalize_lowdim_obs: false  # BUG (see libero_bc_config): buffer normalizes ee_states/gripper BEFORE observation/state is synthesized -> train/eval scale mismatch on observation/state. Keep false until the buffer ordering is fixed.
+  normalize_lowdim_obs: true
 
 # Replay buffer configuration
 buffer:
@@ -52,7 +52,7 @@ logging:
   wandb_entity: liryan-usc
   wandb_offline: false
   wandb_log_dir_base: logs/wandb
-  wandb_name: "train_dp"
+  wandb_name: "train_dp_task_3"
   log_level: "INFO"
 
 # Algorithm configuration
