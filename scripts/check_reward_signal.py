@@ -1,4 +1,5 @@
 #! /usr/bin/env python3
+# Usage: srun --mem=16G --gres=shard:10 --time=0:05:00 uv run python scripts/check_reward_signal.py
 
 """Feasibility check: does Robometer's progress/success signal real task
 progress on LIBERO? Rolls out policies of varying quality and plots progress vs step"""
@@ -66,7 +67,7 @@ def build_reward_env():
 def load_demo(h5_path=DEMO_H5, demo_key=None):
     with h5py.File(h5_path, "r") as f:
         demo_key = demo_key or list(f["data"].keys())[0]
-        g = f["data"]["demo_key"]
+        g = f["data"][demo_key]
         return np.array(g["states"][0]), np.array(g["actions"])
 
 
@@ -98,25 +99,32 @@ def run_rollout(env, action_fn, max_steps=50, label=""):
     }
 
 
-def run_demo_rollout(env, init_state, actions, label="demo"):
+def run_demo_rollout(env, init_state, actions, label="demo", settle=10):
     env.reset()
-    env.set_init_state(init_state)
+    env.env.set_init_state(init_state)  # Forwards from GymtoGymnasiumWrapper to ControlWrapper
+    # let the scene settle before replaying
+    dummy = np.array([0, 0, 0, 0, 0, 0, -1], dtype=np.float32)
+    for _ in range(settle):
+        env.env.step(dummy)
     env._frames = {k: [] for k in env.reward_relabeling_keys}
-    progress, success_prob, true_success = [], [], False
+
+    progress, success_prob, frames, true_success = [], [], [], False
     for action in actions:
         obs, reward, terminated, truncated, info = env.step(action)
         progress.append(float(info["predicted_reward"]))
         success_prob.append(float(info["success_prob"]))
+        frames.append(np.asarray(obs["agentview_image"]))
         if info.get("success", False):
             true_success = True
         if terminated or truncated:
             break
-        return {
-            "progress": progress,
-            "success_prob": success_prob,
-            "true_success": true_success,
-            "label": label,
-        }
+    return {
+        "progress": progress,
+        "success_prob": success_prob,
+        "true_success": true_success,
+        "label": label,
+        "frames": frames,
+    }
 
 
 def plot_results(results, out_path="reward_signal_check.png"):
@@ -130,8 +138,15 @@ def plot_results(results, out_path="reward_signal_check.png"):
     ax2.set(title="Robometer P(success) vs step", xlabel="step", ylabel="success_prob")
     ax1.legend(); ax2.legend()
     fig.tight_layout()
-    fig.save_fig(out_path, dpi=120)
+    fig.savefig(out_path, dpi=120)
     print(f"saved plot -> {out_path}")
+
+
+def save_video(frames, out_path, fps=20):
+    import imageio
+    # agentview is stored upside-down; flip for viewing
+    imageio.mimsave(out_path, [np.asarray(f)[::-1, ::-1] for f in frames], fps=fps)
+    print(f"saved video -> {out_path}")
 
 
 if __name__ == "__main__":
@@ -143,8 +158,9 @@ if __name__ == "__main__":
 
     # success trajectory: replay a successful demo
     init_states, actions = load_demo()
-    demo = run_demo_rollout(env, init_state, actions, label="demo (success)")
+    demo = run_demo_rollout(env, init_states, actions, label="demo (success)")
     print("demo true_success:", demo["true_success"])
-    
+    save_video(demo["frames"], "demo_replay.mp4")
+
     env.close()
     plot_results([demo, rand])
