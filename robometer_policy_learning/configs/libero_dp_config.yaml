@@ -29,7 +29,7 @@ training:
   save_interval: 10000
   continue_training: false
   seed: 0
-  normalize_lowdim_obs: true
+  normalize_lowdim_obs: false
 
 # Replay buffer configuration
 buffer:
