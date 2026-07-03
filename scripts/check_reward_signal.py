@@ -1,5 +1,5 @@
 #! /usr/bin/env python3
-# Usage: srun --mem=16G --gres=shard:10 --time=0:05:00 uv run python scripts/check_reward_signal.py
+# Usage: srun --mem=16G --gres=shard:10 --time=0:10:00 uv run python scripts/check_reward_signal.py
 
 """Feasibility check: does Robometer's progress/success signal real task
 progress on LIBERO? Rolls out policies of varying quality and plots progress vs step"""
@@ -80,13 +80,14 @@ def run_rollout(env, action_fn, max_steps=50, label=""):
     """Step the env with actions from action_fn(obs), recording Robometer's per-step signal.
     Returns {progress[], success_prob[], true_success, label}."""
     obs, info = env.reset()
-    progress, success_prob = [], []
+    progress, success_prob, frames = [], [], []
     true_success = False
     for t in range(max_steps):
         action = action_fn(obs)
         obs, reward, terminated, truncated, info = env.step(action)
         progress.append(float(info["predicted_reward"]))
         success_prob.append(float(info["success_prob"]))
+        frames.append(np.asarray(obs["agentview_image"]))
         if info.get("success", False):
             true_success = True
         if terminated or truncated: 
@@ -96,6 +97,7 @@ def run_rollout(env, action_fn, max_steps=50, label=""):
         "success_prob": success_prob,
         "true_success": true_success,
         "label": label,
+        "frames": frames,
     }
 
 
@@ -154,7 +156,8 @@ if __name__ == "__main__":
     print("Task:", language)
     
     # failure baseline
-    rand = run_rollout(env, random_action, max_steps=30, label="random")
+    rand = run_rollout(env, random_action, max_steps=200, label="random")
+    save_video(rand["frames"], "rand_replay.mp4")
 
     # success trajectory: replay a successful demo
     init_states, actions = load_demo()
