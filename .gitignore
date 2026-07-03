@@ -35,3 +35,6 @@ checkpoints/*
 extracted_episodes*
 replay_buffer/*
 replay_buffers/*
+
+# Job submission files
+*.slurm
