@@ -40,10 +40,12 @@ from omegaconf import OmegaConf
 
 # Robometer's inference mixin lives in the vendored robometer scripts dir (not a package).
 sys.path.insert(0, "/scr/liryan/robometer_policy_learning/robometer/scripts")
-from example_libero_robometer_wrapper import _RewardModelInferenceMixin  # noqa: E402
+from example_libero_robometer_wrapper import _RewardModelInferenceMixin  # noqa: E402  # pyright: ignore[reportMissingImports]
 
 from robometer_policy_learning.utils.gpu_utils import convert_to_tensor, move_to_device  # noqa: E402
 from robometer_policy_learning.utils.reward_gate import RewardGate  # noqa: E402
+from robometer_policy_learning.modules.transformer.modeling_transformer_actor import TransformerActor  # noqa: E402
+from robometer_policy_learning.algorithms.dp.modeling_dp import DiffusionActor  # noqa: E402
 
 # Intervention-label convention (matches the HITL buffers): 0=student rollout, 1=expert.
 ROLLOUT_LABEL, INTERVENTION_LABEL = 0, 1
@@ -172,16 +174,16 @@ class GatedRolloutWorker:
         device,
         action_dim: int,
         *,
-        lowdim_stats: dict = None,
-        remove_obs_keys=None,
+        lowdim_stats: dict | None = None,
+        remove_obs_keys = None,
         reward_frame_key: str = "observation/image",
         student_n_action_steps: int = 10,
-        expert_n_action_steps: int = 5,
+        expert_n_action_steps: int = 10,
         expert_k: int = 40,
         warmup_steps: int = 10,
         score_every: int = 1,
         store_only_expert: bool = False,
-        video_dir: str = None,
+        video_dir: str | None = None,
         video_fps: int = 20,
     ):
         self.env = env
@@ -206,14 +208,14 @@ class GatedRolloutWorker:
         if self.video_dir:
             os.makedirs(self.video_dir, exist_ok=True)
 
-    # -- policy action with receding-horizon chunking (same pattern as HitlRolloutWorker) --
+    # -- policy action with receding-horizon chunking --
     def _policy_action(self, actor, obs_t, st, n_exec):
-        """st is a mutable {"chunk", "pos"} dict; set st["chunk"]=None to force a replan."""
+        """st is a mutable {"chunk" (action_sequence), "pos" (scalar current_index)} dict; set st["chunk"]=None to force a replan."""
         if st["chunk"] is None or st["pos"] >= len(st["chunk"]) or st["pos"] >= n_exec:
             with torch.inference_mode():
                 pred, _ = actor.act(obs_t, deterministic=True)
             pred = pred.detach().cpu().numpy()
-            st["chunk"] = pred.reshape(-1, self.action_dim) if pred.ndim == 3 else np.atleast_2d(pred)
+            st["chunk"] = pred.reshape(-1, self.action_dim) if pred.ndim == 3 else np.atleast_2d(pred)  # Batch_size = 1 since we're running with one env
             st["pos"] = 0
         a = st["chunk"][st["pos"]]
         st["pos"] += 1
@@ -263,7 +265,7 @@ class GatedRolloutWorker:
         was_training = self.student.training
         self.student.eval()  # no dropout/BN-updates while collecting; restored at episode end
         obs, _ = self.env.reset()
-        obs = _extract0(obs)
+        obs = _extract0(obs)  # Removes the batch dimension from the obs
 
         self.scorer.reset(task=str(obs.get("prompt", "")))
         self.gate.reset()
@@ -446,6 +448,10 @@ def main():
     # Prefer the actor's own trained-with drop list (superset of the config's extra_keys_to_drop).
     remove_obs_keys = list(getattr(student, "remove_obs_keys", None)
                            or OmegaConf.select(pre_cfg, "env.extra_keys_to_drop", default=[]) or [])
+    # Add redundant state keys added by env wrappers (already in observation/state)
+    for key in ["ee_ori", "ee_pos", "ee_states", "gripper_states", "joint_states"]:
+        if key not in remove_obs_keys:
+            remove_obs_keys.append(key)
     scorer = RobometerScorer(model_path=args.reward_model, device=device)
     gate = RewardGate(
         short_window=args.short_window,
