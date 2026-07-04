@@ -108,7 +108,7 @@ def run_demo_rollout(env, init_state, actions, label="demo", settle=10):
     dummy = np.array([0, 0, 0, 0, 0, 0, -1], dtype=np.float32)
     for _ in range(settle):
         env.env.step(dummy)
-    env._frames = {k: [] for k in env.reward_relabeling_keys}
+    env._frames = {k: [] for k in env.reward_relabeling_keys}  # Empty the no-ops in Robometer's context window
 
     progress, success_prob, frames, true_success = [], [], [], False
     for action in actions:
