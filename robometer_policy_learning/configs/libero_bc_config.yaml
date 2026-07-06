@@ -26,11 +26,11 @@ training:
   num_rollouts: 0  # Number of rollouts to train, this is more like env steps
   chunk_size: 20 # Action chunking size for transformer policy
   n_action_steps: 10 # Execution horizon for action chunking
-  normalize_lowdim_obs: true  # BUG: buffer normalizes ee_states/gripper BEFORE observation/state is synthesized, so observation/state ends up scale-mismatched between train and eval. Keep false until the buffer is fixed (synthesize observation/state, THEN normalize).
+  normalize_lowdim_obs: false  # BUG: buffer normalizes ee_states/gripper BEFORE observation/state is synthesized, so observation/state ends up scale-mismatched between train and eval. Keep false until the buffer is fixed (synthesize observation/state, THEN normalize).
   use_rnn: false  # Use RNN actor and critic
-  num_offline_steps: 100_000  # Number of offline training steps
+  num_offline_steps: 40_000  # Number of offline training steps
   load_dir: null  # Directory to load RL models from (null for no loading)
-  save_interval: 10000  # Save interval in steps
+  save_interval: 5000  # Save interval in steps
   continue_training: false  # Continue training from the last checkpoint
   seed: 0  # Random seed for training
 
@@ -65,7 +65,7 @@ alg:
 
 # Evaluation configuration
 eval:
-  eval_freq: 10000   # Evaluation frequency in rollouts
+  eval_freq: 5000   # Evaluation frequency in rollouts
   eval_num_episodes: 25  # Number of episodes for evaluation
   eval_record_video: true  # Whether to record videos during evaluation
   eval_on_first_step: false  # If true, evaluate on the first step before any training
