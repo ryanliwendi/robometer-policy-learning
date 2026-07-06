@@ -43,21 +43,6 @@ alg:
   offline_alg_name: dp
   online_alg_name: null
 
-# Replay buffer
-buffer:
-  capacity: 500_000
-  sample_ratio: 0.5
-  use_success_fail_buffer: false
-  success_fail_sample_ratio: 0.5
-  success_detection_duration: 2
-  success_detection_threshold: 0.65
-  distributed_reward_relabel:
-    enabled: false
-    server_address: "localhost:50052"
-    max_queue_size: 100
-    timeout: 60.0
-    flush_interval: 0.1
-
 # Eval
 eval:
   eval_freq: 10000
