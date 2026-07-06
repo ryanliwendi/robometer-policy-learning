@@ -1,0 +1,75 @@
+defaults:
+  - algorithm@offline_algorithm: dp  # must match the STUDENT actor type in load_dir (bc|dp)
+  - reward_model: null
+  - policy@policy: transformer
+
+debug: false
+
+load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-03/20-19-13  # Student policy dir
+checkpoint: 50000  # student: 68% eval
+
+rdagger:
+  expert_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-03/20-19-13
+  expert_checkpoint: 70000  # expert: 92% eval
+  reward_model: robometer/Robometer-4B
+
+  # Gating
+  short_window: 5
+  drop_threshold: 0.15
+  long_window: 30
+  plateau_threshold: 0.05
+  warmup_steps: 15
+  score_every: 3 
+
+  # Expert
+  expert_k: 40  # steps the expert keeps control after a gate fire
+  expert_n_action_steps: 5 
+
+  # DAgger
+  num_iterations: 10
+  rollouts_per_iter: 5
+  train_steps_per_iter: 2000
+  use_offline: true  # mix offline demos with gated online data
+  store_only_expert: false
+  require_intervention: false 
+  require_success: false
+  reweighting: null
+  save_interval: 1
+  online_buffer_capacity: 200000
+  seed: 0
+
+# Algorithm used to continue training the student
+alg:
+  offline_alg_name: dp
+  online_alg_name: null
+
+# Replay buffer
+buffer:
+  capacity: 500_000
+  sample_ratio: 0.5
+  use_success_fail_buffer: false
+  success_fail_sample_ratio: 0.5
+  success_detection_duration: 2
+  success_detection_threshold: 0.65
+  distributed_reward_relabel:
+    enabled: false
+    server_address: "localhost:50052"
+    max_queue_size: 100
+    timeout: 60.0
+    flush_interval: 0.1
+
+# Eval
+eval:
+  eval_freq: 10000
+  eval_num_episodes: 25
+  eval_record_video: true
+  eval_on_first_step: false
+
+# Logging
+logging:
+  wandb_project: libero_rdagger
+  wandb_entity: liryan-usc
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "rdagger_dp_task_5"
+  log_level: "INFO"
