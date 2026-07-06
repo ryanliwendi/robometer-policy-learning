@@ -17,11 +17,7 @@ matplotlib.use("Agg")   # no display on the cluster -> write PNGs instead of sho
 import matplotlib.pyplot as plt
 import h5py
 
-# --- make the Robometer reward wrapper and LIBERO importable ---
-# The wrapper lives in robometer's scripts/ dir, which is NOT an installed package, so we add it
-# to sys.path. Use the SAME robometer copy that's importable as a package (the vendored one under
-# robometer_policy_learning/robometer) so the wrapper's internal `from robometer...` imports resolve
-# against the same codebase.
+# Add paths for importing from libero and robometer
 sys.path.insert(0, "/scr/liryan/robometer_policy_learning/robometer/scripts")
 sys.path.insert(0, "/scr/liryan/LIBERO")
 
@@ -42,17 +38,14 @@ DEMO_H5 = "/scr/liryan/LIBERO/libero/datasets/libero_10_only_successful/KITCHEN_
 def build_reward_env():
     """Build the LIBERO env for TASK_ID, wrapped so Robometer scores progress/success each step.
     Returns (env, language_instruction)."""
-    # 1. look up the task and its scene-definition (bddl) file
     suite = benchmark.get_benchmark_dict()[TASK_SUITE]()  # a LIBERO_10 object
     task: Task = suite.get_task(TASK_ID)
     bddl_path = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
 
-    # 2. build the headless LIBERO sim (256x256 to match the training render)
     base_env = OffScreenRenderEnv(bddl_file_name=bddl_path, camera_heights=256, camera_widths=256)
     base_env.seed(0)
 
-    # 3. wrap it: every step() now also runs Robometer on the accumulated frames and puts
-    #    predicted_reward (progress) + success_prob into info.
+    # Wrap the env around robometer rewards
     env = LiberoRobometerRewardWrapper(
         base_env,
         model_path=MODEL_PATH,
@@ -130,7 +123,6 @@ def run_demo_rollout(env, init_state, actions, label="demo", settle=10):
 
 
 def plot_results(results, out_path="reward_signal_check.png"):
-    """Plot Robometer progress and success_prob vs step for each rollout"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
     for r in results: 
         steps = range(len(r["progress"]))
@@ -159,7 +151,7 @@ if __name__ == "__main__":
     rand = run_rollout(env, random_action, max_steps=200, label="random")
     save_video(rand["frames"], "rand_replay.mp4")
 
-    # success trajectory: replay a successful demo
+    # replay a successful demo
     init_states, actions = load_demo()
     demo = run_demo_rollout(env, init_states, actions, label="demo (success)")
     print("demo true_success:", demo["true_success"])
