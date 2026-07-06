@@ -38,3 +38,7 @@ replay_buffers/*
 
 # Job submission files
 *.slurm
+
+# Others
+.vscode/
+pyrightconfig.json
