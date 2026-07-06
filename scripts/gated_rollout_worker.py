@@ -437,10 +437,6 @@ def main():
     # Prefer the actor's own trained-with drop list (superset of the config's extra_keys_to_drop).
     remove_obs_keys = list(getattr(student, "remove_obs_keys", None)
                            or OmegaConf.select(pre_cfg, "env.extra_keys_to_drop", default=[]) or [])
-    # Add redundant state keys added by env wrappers (already in observation/state)
-    for key in ["ee_ori", "ee_pos", "ee_states", "gripper_states", "joint_states"]:
-        if key not in remove_obs_keys:
-            remove_obs_keys.append(key)
     scorer = RobometerScorer(model_path=args.reward_model, device=device)
     gate = RewardGate(
         short_window=args.short_window,
