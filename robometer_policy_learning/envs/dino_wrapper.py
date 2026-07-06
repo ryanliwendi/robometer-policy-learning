@@ -148,7 +148,7 @@ class DinoEmbeddingWrapper(gym.ObservationWrapper):
         else:
             # If observation is not a dict, assume it's an image
             embedding = self._compute_dino_embedding(obs)
-            return {"dino_embedding": embedding, **obs}
+            return {"dino_embedding": embedding, "image": obs}
 
     def _compute_dino_embedding(self, image: np.ndarray) -> np.ndarray:
         """Compute DINO embedding for a single image."""
