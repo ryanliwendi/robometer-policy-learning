@@ -57,14 +57,14 @@ class RewardGate:
 
 
 if __name__ == "__main__":
-    # Test on empirical demo trace: should NOT fire (demo is working)
+    # Test on successful trace: should not fire
     demo_1 = [0.35, 0.37, 0.40, 0.43, 0.45, 0.68, 0.70, 0.72, 0.82, 0.85, 0.87, 0.90, 0.92, 0.93, 0.94, 0.95]
     gate = RewardGate(short_window=5, drop_threshold=0.15, long_window=30, plateau_threshold=0.05)
     fires_demo_1 = [gate.update(p) for p in demo_1]
     print(f"Demo 1: {fires_demo_1}")
 
-    # Test on failure (random): flat progress, should fire on plateau
+    # Test on failure trace: should fire on plateau
     demo_2 = [0.25, 0.28, 0.30, 0.32, 0.33, 0.32, 0.17, 0.36, 0.19]
     gate.reset()
     fires_demo_2 = [gate.update(p) for p in demo_2]
-    print(f"Demo 2: {fires_demo_2}")  # last 5
+    print(f"Demo 2: {fires_demo_2}")
