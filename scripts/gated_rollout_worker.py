@@ -6,12 +6,8 @@ scores the causal frame history and the RewardGate watches the progress series. 
 gate fires (sharp drop or plateau) the DP expert takes over for k steps, then control
 returns to the student and the gate resets.
 
-Adapted from HitlRolloutWorker (hitl_utils_publish.py): human toggle -> RewardGate,
-human teleop action -> expert.act(). Same receding-horizon chunking, obs prep, and
-episode-at-once buffering; per-step labels 0=student, 1=expert intervention.
-
 Design notes:
-  * ONE env, both obs streams: the eval stack (LiberoPI0Wrapper + DinoEmbeddingWrapper)
+  * One env, both obs streams: the eval stack (LiberoPI0Wrapper + DinoEmbeddingWrapper)
     yields dino_embedding + observation/state for the actors AND keeps the raw
     observation/image frames, which we feed to a standalone RobometerScorer. This avoids
     stacking LiberoRobometerRewardWrapper (which expects the raw LIBERO env) under the
@@ -19,7 +15,7 @@ Design notes:
   * The env is built with chunk_size=None; the worker manages receding-horizon chunking
     manually (like the HITL worker), so student and expert can replan on control switches.
 
-Standalone usage (watch the gate fire; nothing is stored or trained):
+Standalone usage:
     srun --gres=shard:8 --mem=32G --time=2:00:00 \
       uv run python scripts/gated_rollout_worker.py \
         --student-dir outputs/<bc_run> --expert-dir outputs/<dp_run> \
@@ -38,7 +34,6 @@ import torch
 from loguru import logger
 from omegaconf import OmegaConf
 
-# Robometer's inference mixin lives in the vendored robometer scripts dir (not a package).
 sys.path.insert(0, "/scr/liryan/robometer_policy_learning/robometer/scripts")
 from example_libero_robometer_wrapper import _RewardModelInferenceMixin  # noqa: E402  # pyright: ignore[reportMissingImports]
 
@@ -191,18 +186,18 @@ class GatedRolloutWorker:
         self.expert = expert
         self.scorer = scorer
         self.gate = gate
-        self.online_buffer = online_buffer  # may be None (standalone / watch-only mode)
+        self.online_buffer = online_buffer  # Store transitions for future training
         self.device = device
         self.action_dim = int(action_dim)
         self.lowdim_stats = lowdim_stats or {}
         self.remove_obs_keys = list(remove_obs_keys or [])
-        self.reward_frame_key = reward_frame_key
+        self.reward_frame_key = reward_frame_key  # keys used by robometer scorer
         self.student_n_action_steps = int(student_n_action_steps)
         self.expert_n_action_steps = int(expert_n_action_steps)
-        self.expert_k = int(expert_k)
+        self.expert_k = int(expert_k) # number of steps expert executes
         self.warmup_steps = int(warmup_steps)  # student steps before the gate may fire
-        self.score_every = max(1, int(score_every))  # Robometer cadence (1 = every step; >1 saves 4B-VLM calls)
-        self.store_only_expert = bool(store_only_expert)
+        self.score_every = max(1, int(score_every))  # robometer cadence (need >1 for real world experiment due to latency)
+        self.store_only_expert = bool(store_only_expert)  # Whether to store only expert transitions in the buffer
         self.video_dir = video_dir
         self.video_fps = int(video_fps)
         if self.video_dir:
@@ -256,11 +251,8 @@ class GatedRolloutWorker:
         """Run one gated episode. Returns a stats dict.
 
         Transitions are buffered and added to the online buffer ALL AT ONCE at episode end
-        (so episode-level stats are known), mirroring HitlRolloutWorker's storage policy:
-          * store_only_expert=False -> store every step under the episode id;
-          * store_only_expert=True  -> store only expert-correction steps, each contiguous
-            expert segment under its own episode id (valid chunks never span a student gap);
-          * require_success / require_intervention filter which episodes are kept.
+        (so episode-level stats are known).
+        require_success / require_intervention filter which episodes are kept.
         """
         was_training = self.student.training
         self.student.eval()  # no dropout/BN-updates while collecting; restored at episode end
@@ -275,8 +267,8 @@ class GatedRolloutWorker:
         student_st = {"chunk": None, "pos": 0}
         expert_st = {"chunk": None, "pos": 0}
         expert_left = 0          # >0 -> expert in control for this many more steps
-        expert_seg, seg_step = 0, 0
-        steps, expert_steps, num_interventions = 0, 0, 0
+        expert_seg, seg_step = 0, 0  # number of expert interventions and the step within the current expert takeover; used for storage
+        steps, expert_steps, num_interventions = 0, 0, 0 
         success, done = False, False
         pending = []
         progress_trace, gate_fires = [], []
@@ -311,13 +303,12 @@ class GatedRolloutWorker:
                 success = True
 
             # ---- Robometer + gate (on the post-step frame) ----
-            # Frames are appended EVERY step (complete causal history for the model), but the
-            # 4B-VLM is only queried every score_every steps -- and the gate only updates on
-            # FRESH scores, so its windows aren't padded with stale repeated values.
+            # Frames are appended EVERY step, but the 4B-VLM is only queried every score_every steps
+            # The reward gate also updates every score_every steps
             self.scorer.append(next_obs[self.reward_frame_key])
             scored_now = steps % self.score_every == 0
             if scored_now:
-                last_progress, _success_prob = self.scorer.score()
+                last_progress, _success_prob = self.scorer.score()  # scalar
             progress_trace.append(last_progress)
             if scored_now and label == ROLLOUT_LABEL and steps >= self.warmup_steps and expert_left == 0:
                 if self.gate.update(last_progress):
@@ -358,7 +349,7 @@ class GatedRolloutWorker:
             obs = next_obs
             steps += 1
 
-        # ---- flush the whole episode at once (mirrors HitlRolloutWorker) ----
+        # ---- flush the whole episode ----
         stored = 0
         if store and self.online_buffer is not None and pending:
             n_intv = sum(1 for t in pending if t["info"]["intervention"] == INTERVENTION_LABEL)
@@ -386,9 +377,7 @@ class GatedRolloutWorker:
         )
 
 
-# ---------------------------------------------------------------------------------------
-# Standalone entry point: watch the gate fire (Step-2 deliverable; no buffer, no training)
-# ---------------------------------------------------------------------------------------
+# --- Testing ---
 def main():
     import argparse
 
@@ -413,10 +402,10 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Env/model params come from the STUDENT's saved training config, so the env build,
-    # chunking and DINO keys match what the student was trained with.
+    # chunking and DINO keys match what the student was trained with
     pre_cfg = OmegaConf.load(os.path.join(args.student_dir, ".hydra", "config.yaml"))
     dino_image_keys = list(OmegaConf.select(pre_cfg, "env.dino_image_keys", default=[]) or [])
-    n_exec = int(OmegaConf.select(pre_cfg, "training.n_action_steps", default=10) or 10)
+    n_exec = int(OmegaConf.select(pre_cfg, "training.n_action_steps", default=10))
 
     dinov2_model = dinov2_processor = None
     if dino_image_keys:
