@@ -422,11 +422,12 @@ def main():
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--expert-k", type=int, default=40)
     parser.add_argument("--short-window", type=int, default=5)
-    parser.add_argument("--drop-threshold", type=float, default=0.15)
     parser.add_argument("--long-window", type=int, default=30)
-    parser.add_argument("--plateau-threshold", type=float, default=0.05)
-    parser.add_argument("--method", type=str, default="spearman")
-    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--method", type=str, default="spearman", choices=["spearman", "pearson", "naive"])
+    parser.add_argument("--drop-threshold", type=float, default=-0.5)
+    parser.add_argument("--plateau-threshold", type=float, default=0.3)
+    parser.add_argument("--smoothing", type=float, default=0.0, help="EMA weight on history in [0,1); 0 = off")
+    parser.add_argument("--warmup", type=int, default=15)
     parser.add_argument("--score-every", type=int, default=1)
     parser.add_argument("--video-dir", default="gated_videos")
     parser.add_argument("--seed", type=int, default=0)
@@ -477,6 +478,7 @@ def main():
         long_window=args.long_window,
         plateau_threshold=args.plateau_threshold,
         method=args.method,
+        smoothing=args.smoothing,
     )
 
     worker = GatedRolloutWorker(
