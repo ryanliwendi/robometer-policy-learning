@@ -13,7 +13,7 @@ Design notes:
     stacking LiberoRobometerRewardWrapper (which expects the raw LIBERO env) under the
     policy wrappers.
   * The env is built with chunk_size=None; the worker manages receding-horizon chunking
-    manually (like the HITL worker), so student and expert can replan on control switches.
+    manually, so student and expert can replan on control switches.
 
 Standalone usage:
     srun --gres=shard:8 --mem=32G --time=2:00:00 \
@@ -42,13 +42,10 @@ from robometer_policy_learning.utils.reward_gate import RewardGate  # noqa: E402
 from robometer_policy_learning.modules.transformer.modeling_transformer_actor import TransformerActor  # noqa: E402
 from robometer_policy_learning.algorithms.dp.modeling_dp import DiffusionActor  # noqa: E402
 
-# Intervention-label convention (matches the HITL buffers): 0=student rollout, 1=expert.
-ROLLOUT_LABEL, INTERVENTION_LABEL = 0, 1
+ROLLOUT_LABEL, INTERVENTION_LABEL = 0, 1  # Intervention-label convention
 
 
-# ---------------------------------------------------------------------------------------
-# Robometer scoring, decoupled from any env wrapper
-# ---------------------------------------------------------------------------------------
+# ---- Robometer scoring for rewards and success_probs----
 class RobometerScorer(_RewardModelInferenceMixin):
     """Standalone causal Robometer scorer: feed one frame per executed step, get
     (progress, success_prob) for the history so far — the same numbers
@@ -87,9 +84,7 @@ class RobometerScorer(_RewardModelInferenceMixin):
         return float(rewards[0]), float(success_probs[0])
 
 
-# ---------------------------------------------------------------------------------------
-# Small helpers (mirrors hitl_utils_publish.py)
-# ---------------------------------------------------------------------------------------
+# ---- Small helpers ----
 def _extract0(batched):
     """Extract env 0 from a vectorized obs dict / array (n_envs=1)."""
     if isinstance(batched, dict):
@@ -142,9 +137,6 @@ def load_actor(run_dir: str, device: str, checkpoint=None, trainable: bool = Fal
     return actor
 
 
-# ---------------------------------------------------------------------------------------
-# The gated rollout worker
-# ---------------------------------------------------------------------------------------
 class GatedRolloutWorker:
     """HG-DAgger-style rollouts where a reward-model gate replaces the human.
 
@@ -203,7 +195,7 @@ class GatedRolloutWorker:
         if self.video_dir:
             os.makedirs(self.video_dir, exist_ok=True)
 
-    # -- policy action with receding-horizon chunking --
+    # ---- Policy action with receding-horizon chunking ----
     def _policy_action(self, actor, obs_t, st, n_exec):
         """st is a mutable {"chunk" (action_sequence), "pos" (scalar current_index)} dict; set st["chunk"]=None to force a replan."""
         if st["chunk"] is None or st["pos"] >= len(st["chunk"]) or st["pos"] >= n_exec:
@@ -321,7 +313,7 @@ class GatedRolloutWorker:
                     logger.info(f"  [gate] fired at step {steps} (progress={last_progress:.3f}) "
                                 f"-> expert takes over for {self.expert_k} steps")
 
-            # ---- storage (episode buffered, flushed at the end) ----
+            # ---- Storage (episode buffered, flushed at the end) ----
             if store and self.online_buffer is not None and (not self.store_only_expert or label == INTERVENTION_LABEL):
                 if self.store_only_expert:
                     ep_store, step_store = f"{episode_id}_e{expert_seg}", seg_step
@@ -349,7 +341,7 @@ class GatedRolloutWorker:
             obs = next_obs
             steps += 1
 
-        # ---- flush the whole episode ----
+        # ---- Flush the whole episode ----
         stored = 0
         if store and self.online_buffer is not None and pending:
             n_intv = sum(1 for t in pending if t["info"]["intervention"] == INTERVENTION_LABEL)
@@ -377,7 +369,7 @@ class GatedRolloutWorker:
         )
 
 
-# --- Testing ---
+# ---- Testing ----
 def main():
     import argparse
 
