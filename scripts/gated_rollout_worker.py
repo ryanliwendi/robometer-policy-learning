@@ -33,6 +33,7 @@ import numpy as np
 import torch
 from loguru import logger
 from omegaconf import OmegaConf
+from typing import List
 
 sys.path.insert(0, "/scr/liryan/robometer_policy_learning/robometer/scripts")
 from example_libero_robometer_wrapper import _RewardModelInferenceMixin  # noqa: E402  # pyright: ignore[reportMissingImports]
@@ -102,6 +103,45 @@ def _success_from_info(info) -> bool:
             if key in info:
                 return bool(np.asarray(info[key]).reshape(-1)[0])
     return False
+
+
+def plot_progress_trace(stats, expert_k: int, save_path: str, title: str | None = None):
+    """Plot the Robometer progress signal over one episode, marking expert interventions.
+    Red line = gate fires (expert takes over); green line = control returns to the student;
+    the span between them is lightly shaded."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    progress = stats["progress_trace"]
+    fires: List[int] = stats["gate_fires"]
+    steps = len(progress)
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(range(steps), progress, color="#1f77b4", lw=1.5)
+
+    for f in fires:
+        end = min(f + expert_k, steps - 1)
+        ax.axvspan(f, end, color="red", alpha=0.08)
+        ax.axvline(f, color="red", lw=1.5)
+        ax.axvline(end, color="green", lw=1.5)
+    
+    ax.set_xlabel("environment step")
+    ax.set_ylabel("Robometer progress")
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_title(title or f"success={stats['success']}  interventions={stats['num_interventions']}")
+    # Proxy handles so the vertical lines get a clean legend (axvline labels would duplicate).
+    ax.legend(handles=[
+        Line2D([0], [0], color="#1f77b4", lw=1.5, label="progress"),
+        Line2D([0], [0], color="red", lw=1.5, label="expert takeover"),
+        Line2D([0], [0], color="green", lw=1.5, label="return to student"),
+    ], loc="lower right", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=120)
+    plt.close(fig)
+
 
 
 def load_actor(run_dir: str, device: str, checkpoint=None, trainable: bool = False):
@@ -385,6 +425,7 @@ def main():
     parser.add_argument("--drop-threshold", type=float, default=0.15)
     parser.add_argument("--long-window", type=int, default=30)
     parser.add_argument("--plateau-threshold", type=float, default=0.05)
+    parser.add_argument("--method", type=str, default="spearman")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--score-every", type=int, default=1)
     parser.add_argument("--video-dir", default="gated_videos")
@@ -435,6 +476,7 @@ def main():
         drop_threshold=args.drop_threshold,
         long_window=args.long_window,
         plateau_threshold=args.plateau_threshold,
+        method=args.method,
     )
 
     worker = GatedRolloutWorker(
@@ -462,6 +504,12 @@ def main():
             f"interventions={stats['num_interventions']} (at steps {stats['gate_fires']}) "
             f"expert_steps={stats['expert_steps']}"
         )
+        if args.video_dir: 
+            plot_progress_trace(
+                stats, args.expert_k,
+                os.path.join(args.video_dir, f"progress_watch_{ep}.png"),
+                title=f"episode {ep}: success={stats['success']}, interventions={stats['num_interventions']}",
+            )
 
     env.close()
 
