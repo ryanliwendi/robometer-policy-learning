@@ -47,6 +47,7 @@ class RewardGate:
         self.smoothing = smoothing
         self._ema = None
         self._corr = {"spearman": _compute_spearman, "pearson": _compute_pearson}
+        self.last_trigger = None  # "drop" | "plateau" | None -- which trigger fired on the last update()
 
         assert long_window >= short_window, "Long window should be greater than or equal to short window"
         assert 0 <= smoothing < 1, "Smoothing should be in range [0, 1)"
@@ -83,8 +84,12 @@ class RewardGate:
             else:
                 should_plateau = False
 
-        return should_drop or should_plateau
-    
+        fired = should_drop or should_plateau
+        # Record which trigger fired (drop takes priority when both fire -- it's the sharper,
+        # short-window signal). Read by callers after update() returns True.
+        self.last_trigger = ("drop" if should_drop else "plateau") if fired else None
+        return fired
+
     def _check_drop(self) -> bool:
         """Correlation gate: progress is trending down over the short window."""
         recent = list(self.history)[-self.short_window:]

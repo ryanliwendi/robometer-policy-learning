@@ -107,8 +107,9 @@ def _success_from_info(info) -> bool:
 
 def plot_progress_trace(stats, expert_k: int, save_path: str, title: str | None = None):
     """Plot the Robometer progress signal over one episode, marking expert interventions.
-    Red line = gate fires (expert takes over); green line = control returns to the student;
-    the span between them is lightly shaded."""
+    Takeover lines are colored by trigger (drop=red, plateau=orange) and annotated with the
+    step and trigger; a dashed green line = control returns to the student; the expert-active
+    span is lightly shaded."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -116,26 +117,31 @@ def plot_progress_trace(stats, expert_k: int, save_path: str, title: str | None 
 
     progress = stats["progress_trace"]
     fires: List[int] = stats["gate_fires"]
+    reasons = stats.get("gate_reasons") or [None] * len(fires)  # old runs lack reasons
     steps = len(progress)
+    trigger_color = {"drop": "#d62728", "plateau": "#ff7f0e"}   # red / orange
 
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(range(steps), progress, color="#1f77b4", lw=1.5)
+    fig, ax = plt.subplots(figsize=(11, 4))
+    ax.plot(range(steps), progress, color="#1f77b4", lw=1.5, zorder=2)
 
-    for f in fires:
+    for f, reason in zip(fires, reasons):
+        c = trigger_color.get(reason, "#7f7f7f")               # gray if unknown
         end = min(f + expert_k, steps - 1)
-        ax.axvspan(f, end, color="red", alpha=0.08)
-        ax.axvline(f, color="red", lw=1.5)
-        ax.axvline(end, color="green", lw=1.5)
-    
+        ax.axvspan(f, end, color=c, alpha=0.08, zorder=1)
+        ax.axvline(f, color=c, lw=1.5, zorder=3)               # expert takeover (by trigger)
+        ax.axvline(end, color="green", lw=1.2, ls="--", zorder=3)  # return to student
+        ax.annotate(f"{reason or '?'}\n@{f}", xy=(f, 1.0), xytext=(2, -2),
+                    textcoords="offset points", ha="left", va="top", fontsize=7, color=c)
+
     ax.set_xlabel("environment step")
     ax.set_ylabel("Robometer progress")
-    ax.set_ylim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.08)   # headroom for the top annotations
     ax.set_title(title or f"success={stats['success']}  interventions={stats['num_interventions']}")
-    # Proxy handles so the vertical lines get a clean legend (axvline labels would duplicate).
     ax.legend(handles=[
         Line2D([0], [0], color="#1f77b4", lw=1.5, label="progress"),
-        Line2D([0], [0], color="red", lw=1.5, label="expert takeover"),
-        Line2D([0], [0], color="green", lw=1.5, label="return to student"),
+        Line2D([0], [0], color="#d62728", lw=1.5, label="drop takeover"),
+        Line2D([0], [0], color="#ff7f0e", lw=1.5, label="plateau takeover"),
+        Line2D([0], [0], color="green", lw=1.2, ls="--", label="return to student"),
     ], loc="lower right", fontsize=8)
 
     fig.tight_layout()
@@ -303,7 +309,7 @@ class GatedRolloutWorker:
         steps, expert_steps, num_interventions = 0, 0, 0 
         success, done = False, False
         pending = []
-        progress_trace, gate_fires = [], []
+        progress_trace, gate_fires, gate_reasons = [], [], []
         video_frames, video_labels = [], []
         last_progress = 0.0
 
@@ -345,13 +351,14 @@ class GatedRolloutWorker:
             if scored_now and label == ROLLOUT_LABEL and steps >= self.warmup_steps and expert_left == 0:
                 if self.gate.update(last_progress):
                     gate_fires.append(steps)
+                    gate_reasons.append(self.gate.last_trigger)  # "drop" | "plateau"
                     num_interventions += 1
                     expert_left = self.expert_k
                     expert_st["chunk"] = None  # expert replans from the current state
                     expert_seg += 1
                     seg_step = 0
-                    logger.info(f"  [gate] fired at step {steps} (progress={last_progress:.3f}) "
-                                f"-> expert takes over for {self.expert_k} steps")
+                    logger.info(f"  [gate] fired at step {steps} (progress={last_progress:.3f}, "
+                                f"trigger={self.gate.last_trigger}) -> expert takes over for {self.expert_k} steps")
 
             # ---- Storage (episode buffered, flushed at the end) ----
             if store and self.online_buffer is not None and (not self.store_only_expert or label == INTERVENTION_LABEL):
@@ -405,6 +412,7 @@ class GatedRolloutWorker:
             success=success,
             stored=stored,
             gate_fires=gate_fires,
+            gate_reasons=gate_reasons,
             progress_trace=progress_trace,
         )
 
