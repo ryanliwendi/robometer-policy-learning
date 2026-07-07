@@ -1,39 +1,108 @@
 """Robot-gated intervention trigger: fires on a sharp progress drop or a long plateau
 in the Robometer progress signal, for reward-DAgger."""
 
+import math
 from collections import deque
+
+from scipy.stats import spearmanr
+from scipy.stats import pearsonr
+
+
+def _compute_spearman(values) -> float:
+    """Spearman correlation between step index and `values`."""
+    n = len(values)
+    if n < 2 or min(values) == max(values):
+        return float("nan")
+    res, _ = spearmanr(range(n), values)
+    return float(res)
+
+
+def _compute_pearson(values) -> float:
+    """Pearson correlation between step index and `values`."""
+    n = len(values)
+    if n < 2 or min(values) == max(values):
+        return float("nan")
+    res, _ = pearsonr(range(n), values)
+    return float(res)
+
 
 class RewardGate:
     """Consumes the causal progress series (one value per step) and decides when the
     expert should take over. Stateful; call reset() after an intervention."""
 
-    def __init__(self, short_window=5, drop_threshold=0.15, long_window=30, plateau_threshold=0.05):
+    def __init__(self, 
+        short_window=5, 
+        drop_threshold=-0.5, 
+        long_window=30, 
+        plateau_threshold=0.05, 
+        method="spearman", 
+        smoothing=0,
+    ):
         self.short_window = short_window
         self.drop_threshold = drop_threshold
         self.long_window = long_window
         self.plateau_threshold = plateau_threshold
         self.history = deque(maxlen=long_window)
+        self.method = method
+        self.smoothing = smoothing
+        self._ema = None
+        self._corr = {"spearman": _compute_spearman, "pearson": _compute_pearson}
+
+        assert long_window >= short_window, "Long window should be greater than or equal to short window"
+        assert 0 <= smoothing < 1, "Smoothing should be in range [0, 1)"
+        if method == "naive":
+            assert 0 <= drop_threshold <= 1, "Drop threshold has to be in range [0, 1] for naive gating"
+            assert 0 <= plateau_threshold <= 1, "Plateau threshold has to be in range [0, 1] for naive gating"
+        elif method in ["pearson", "spearman"]:
+            assert -1 <= drop_threshold <= 1, "Drop threshold has to be in range [-1, 1] for pearson/spearman gating"
+            assert -1 <= plateau_threshold <= 1, "Plateau threshold has to be in range [-1, 1] for pearson/spearman gating"
+        else:
+            raise ValueError("Unknown gating method; expected 'naive', 'pearson', or 'spearman'")
 
     def update(self, progress_value: float) -> bool:
         """Ingest one causal progress value. Return True if either trigger fires (intervene now)."""
-        self.history.append(progress_value)
+        self._ema = progress_value if self._ema is None else self.smoothing * self._ema + (1 - self.smoothing) * progress_value
+        self.history.append(self._ema)
 
         # Only checks triggers once we have enough history
         if len(self.history) < self.short_window:
             return False
         
-        should_drop = self._check_sharp_drop()
-        if len(self.history) >= self.long_window:
-            should_plateau = self._check_plateau()
-        else:
-            should_plateau = False
+        if self.method == "naive":
+            should_drop = self._check_drop_naive()
+
+            if len(self.history) >= self.long_window:
+                should_plateau = self._check_plateau_naive()
+            else:
+                should_plateau = False
+        else: 
+            should_drop = self._check_drop()
+
+            if len(self.history) >= self.long_window:
+                should_plateau = self._check_plateau()
+            else:
+                should_plateau = False
 
         return should_drop or should_plateau
-
-    def _check_sharp_drop(self) -> bool:
-        """Fire if progress just dropped sharply from a recent peak."""
-        if len(self.history) < self.short_window:
+    
+    def _check_drop(self) -> bool:
+        """Correlation gate: progress is trending down over the short window."""
+        recent = list(self.history)[-self.short_window:]
+        corr = self._corr[self.method](recent)
+        if math.isnan(corr):
             return False
+        return corr < self.drop_threshold
+
+    def _check_plateau(self) -> bool:
+        """Correlation gate: progress is not trending up over the long window."""
+        recent = list(self.history)[-self.long_window:]
+        corr = self._corr[self.method](recent)
+        if math.isnan(corr):
+            return True
+        return corr < self.plateau_threshold
+
+    def _check_drop_naive(self) -> bool:
+        """Fire if progress just dropped sharply from a recent peak."""
         recent = list(self.history)[-self.short_window:]
         peak = max(recent)
         current = recent[-1]
@@ -41,7 +110,7 @@ class RewardGate:
         fired = drop >= self.drop_threshold
         return fired
     
-    def _check_plateau(self) -> bool:
+    def _check_plateau_naive(self) -> bool:
         """Fire if progress has stalled over a long window."""
         if len(self.history) < self.long_window:
             return False
@@ -51,20 +120,34 @@ class RewardGate:
         fired = improvement <= self.plateau_threshold
         return fired
     
-    def reset(self): 
+    def reset(self):
         """Call after an intervention to clear history (don't re-fire on old data)"""
         self.history.clear()
+        self._ema = None
 
 
 if __name__ == "__main__":
-    # Test on successful trace: should not fire
-    demo_1 = [0.35, 0.37, 0.40, 0.43, 0.45, 0.68, 0.70, 0.72, 0.82, 0.85, 0.87, 0.90, 0.92, 0.93, 0.94, 0.95]
-    gate = RewardGate(short_window=5, drop_threshold=0.15, long_window=30, plateau_threshold=0.05)
-    fires_demo_1 = [gate.update(p) for p in demo_1]
-    print(f"Demo 1: {fires_demo_1}")
+    def run(label, trace, **kwargs):
+        gate = RewardGate(**kwargs)
+        fires = [gate.update(p) for p in trace]
+        first = next((i for i, f in enumerate(fires) if f), None)
+        print(f"    {label:34s} -> {'no fire' if first is None else f'fires @ step {first}'}")
 
-    # Test on failure trace: should fire on plateau
-    demo_2 = [0.25, 0.28, 0.30, 0.32, 0.33, 0.32, 0.17, 0.36, 0.19]
-    gate.reset()
-    fires_demo_2 = [gate.update(p) for p in demo_2]
-    print(f"Demo 2: {fires_demo_2}")
+    rising  = [0.20, 0.28, 0.35, 0.42, 0.50, 0.58, 0.66, 0.74, 0.82, 0.90, 0.95] 
+    regress = [0.20, 0.40, 0.60, 0.75, 0.82, 0.70, 0.55, 0.40, 0.25, 0.15, 0.10] 
+    flat    = [0.50] * 11                                                         
+    spike   = [0.20, 0.30, 0.40, 0.50, 0.60, 0.30, 0.70, 0.80, 0.90, 0.95, 0.98]
+
+    corr = dict(short_window=5, long_window=10, drop_threshold=-0.5, plateau_threshold=0.3)
+    for method in ("spearman", "pearson"):
+        print(f"[{method}]  drop<{corr['drop_threshold']} over {corr['short_window']}, "
+              f"plateau<{corr['plateau_threshold']} over {corr['long_window']}")
+        run("rising  (expect: no fire)", rising,  method=method, **corr)
+        run("regress (expect: drop)",    regress, method=method, **corr)
+        run("flat    (expect: plateau)", flat,    method=method, **corr)
+
+    print("[naive]  single down-spike glitch, drop>=0.15 over 5")
+    naive = dict(short_window=5, long_window=10, drop_threshold=0.15, plateau_threshold=0.05, method="naive")
+    run("smoothing=0.0 (expect: false fire)", spike, smoothing=0.0, **naive)
+    run("smoothing=0.7 (expect: suppressed)", spike, smoothing=0.7, **naive)
+
