@@ -3,8 +3,8 @@
 
 Rolls out the student policy on the DINO eval env stack; every executed step, Robometer
 scores the causal frame history and the RewardGate watches the progress series. When the
-gate fires (sharp drop or plateau) the DP expert takes over for k steps, then control
-returns to the student and the gate resets.
+gate fires (sharp drop or plateau) the DP expert takes over. The return mechanism decides
+when the control is returned to the student policy.
 
 Design notes:
   * One env, both obs streams: the eval stack (LiberoPI0Wrapper + DinoEmbeddingWrapper)
@@ -36,21 +36,20 @@ from omegaconf import OmegaConf
 from typing import List
 
 sys.path.insert(0, "/scr/liryan/robometer_policy_learning/robometer/scripts")
-from example_libero_robometer_wrapper import _RewardModelInferenceMixin  # noqa: E402  # pyright: ignore[reportMissingImports]
+from example_libero_robometer_wrapper import _RewardModelInferenceMixin  # noqa: E402
 
 from robometer_policy_learning.utils.gpu_utils import convert_to_tensor, move_to_device  # noqa: E402
 from robometer_policy_learning.utils.reward_gate import RewardGate  # noqa: E402
 from robometer_policy_learning.modules.transformer.modeling_transformer_actor import TransformerActor  # noqa: E402
 from robometer_policy_learning.algorithms.dp.modeling_dp import DiffusionActor  # noqa: E402
 
-ROLLOUT_LABEL, INTERVENTION_LABEL = 0, 1  # Intervention-label convention
+ROLLOUT_LABEL, INTERVENTION_LABEL = 0, 1
 
 
 # ---- Robometer scoring for rewards and success_probs----
 class RobometerScorer(_RewardModelInferenceMixin):
     """Standalone causal Robometer scorer: feed one frame per executed step, get
-    (progress, success_prob) for the history so far — the same numbers
-    LiberoRobometerRewardWrapper puts into info, minus the env plumbing.
+    (progress, success_prob) for the history so far.
 
     raw_dict_to_sample subsamples the history to the model's max_frames internally,
     so we keep the full episode frame list (matches the non-vector wrapper).
@@ -63,7 +62,6 @@ class RobometerScorer(_RewardModelInferenceMixin):
         self.episode_id = 0
 
     def reset(self, task: str):
-        """Start a new episode: set the language instruction and clear the frame history."""
         self.task = str(task)
         self.frames = []
         self.episode_id += 1
@@ -85,7 +83,7 @@ class RobometerScorer(_RewardModelInferenceMixin):
         return float(rewards[0]), float(success_probs[0])
 
 
-# ---- Small helpers ----
+# ---- Helpers ----
 def _extract0(batched):
     """Extract env 0 from a vectorized obs dict / array (n_envs=1)."""
     if isinstance(batched, dict):
@@ -105,11 +103,8 @@ def _success_from_info(info) -> bool:
     return False
 
 
-def plot_progress_trace(stats, expert_k: int, save_path: str, title: str | None = None):
-    """Plot the Robometer progress signal over one episode, marking expert interventions.
-    Takeover lines are colored by trigger (drop=red, plateau=orange) and annotated with the
-    step and trigger; a dashed green line = control returns to the student; the expert-active
-    span is lightly shaded."""
+def plot_progress_trace(stats, save_path: str, title: str | None = None):
+    """Plot the Robometer progress signal over one episode."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -117,31 +112,36 @@ def plot_progress_trace(stats, expert_k: int, save_path: str, title: str | None 
 
     progress = stats["progress_trace"]
     fires: List[int] = stats["gate_fires"]
-    reasons = stats.get("gate_reasons") or [None] * len(fires)  # old runs lack reasons
+    reasons = stats["gate_reasons"]  # "drop" | "plateau"
+    handbacks = stats["handback_steps"]
+    handback_reasons = stats["handback_reasons"]
     steps = len(progress)
-    trigger_color = {"drop": "#d62728", "plateau": "#ff7f0e"}   # red / orange
+    trigger_color = {"drop": "#d62728", "plateau": "#ff7f0e"}
 
     fig, ax = plt.subplots(figsize=(11, 4))
     ax.plot(range(steps), progress, color="#1f77b4", lw=1.5, zorder=2)
 
-    for f, reason in zip(fires, reasons):
-        c = trigger_color.get(reason, "#7f7f7f")               # gray if unknown
-        end = min(f + expert_k, steps - 1)
+    for i, (f, reason) in enumerate(zip(fires, reasons)):
+        c = trigger_color.get(reason, "#7f7f7f")
+        end = handbacks[i] if i < len(handbacks) else steps - 1  # episode ended mid-takeover
+        hb = handback_reasons[i] if i < len(handback_reasons) else "episode_end"
         ax.axvspan(f, end, color=c, alpha=0.08, zorder=1)
-        ax.axvline(f, color=c, lw=1.5, zorder=3)               # expert takeover (by trigger)
-        ax.axvline(end, color="green", lw=1.2, ls="--", zorder=3)  # return to student
+        ax.axvline(f, color=c, lw=1.5, zorder=3)  # mark gate trigger
+        hb_color = "#000000" if hb == "cap" else "green"   
+        ax.axvline(end, color=hb_color, lw=1.2, ls="--", zorder=3)  # mark gate handback
         ax.annotate(f"{reason or '?'}\n@{f}", xy=(f, 1.0), xytext=(2, -2),
                     textcoords="offset points", ha="left", va="top", fontsize=7, color=c)
 
     ax.set_xlabel("environment step")
     ax.set_ylabel("Robometer progress")
-    ax.set_ylim(-0.02, 1.08)   # headroom for the top annotations
+    ax.set_ylim(-0.02, 1.08)
     ax.set_title(title or f"success={stats['success']}  interventions={stats['num_interventions']}")
     ax.legend(handles=[
         Line2D([0], [0], color="#1f77b4", lw=1.5, label="progress"),
         Line2D([0], [0], color="#d62728", lw=1.5, label="drop takeover"),
         Line2D([0], [0], color="#ff7f0e", lw=1.5, label="plateau takeover"),
         Line2D([0], [0], color="green", lw=1.2, ls="--", label="return to student"),
+        Line2D([0], [0], color="#000000", lw=1.2, ls="--", label="handback: capped"),
     ], loc="lower right", fontsize=8)
 
     fig.tight_layout()
@@ -151,13 +151,7 @@ def plot_progress_trace(stats, expert_k: int, save_path: str, title: str | None 
 
 
 def load_actor(run_dir: str, device: str, checkpoint=None, trainable: bool = False):
-    """Load a BaseActor from a pretraining run dir (checkpoints/<step>/...).
-
-    trainable=False -> the deployable ``actor.pt`` (for DP that's the FROZEN EMA copy; fine
-    for acting, not for training). trainable=True -> prefer ``online_actor.pt`` (DP's
-    trainable network; falls back to actor.pt for BC, which saves only actor.pt) and
-    re-enable grads, so an algorithm can continue training it.
-    """
+    """Load a BaseActor from a pretraining run dir (checkpoints/<step>/...)."""
     if os.path.exists(os.path.join(run_dir, "actor.pt")):
         ckpt_dir = run_dir
     else:
@@ -170,7 +164,7 @@ def load_actor(run_dir: str, device: str, checkpoint=None, trainable: bool = Fal
         else:
             chosen = max((d for d in steps if d.isdigit()), key=int)
         ckpt_dir = os.path.join(root, chosen)
-    names = ["online_actor.pt", "actor.pt"] if trainable else ["actor.pt"]
+    names = ["online_actor.pt", "actor.pt"] if trainable else ["actor.pt"]  # online_actor.pt is DP's trainable network
     path = next(os.path.join(ckpt_dir, n) for n in names if os.path.exists(os.path.join(ckpt_dir, n)))
     actor = torch.load(path, map_location=device, weights_only=False).to(device)
     if trainable:
@@ -184,18 +178,7 @@ def load_actor(run_dir: str, device: str, checkpoint=None, trainable: bool = Fal
 
 
 class GatedRolloutWorker:
-    """HG-DAgger-style rollouts where a reward-model gate replaces the human.
-
-    Per-step state machine:
-      STUDENT: student acts (its receding-horizon chunk). The new frame is appended to the
-               scorer; gate.update(progress) -> on fire, switch to EXPERT for expert_k steps.
-      EXPERT : expert acts (its own chunk state; replans on takeover) for expert_k steps
-               (label=1), then control returns to STUDENT (replans) and gate.reset().
-
-    Robometer is still queried during expert control (for logging), but the gate is only
-    updated while the student is in control; after handoff it restarts from empty history.
-    """
-
+    """HG-DAgger-style rollouts where a reward-model gate replaces human interventions."""
     def __init__(
         self,
         env,
@@ -213,6 +196,10 @@ class GatedRolloutWorker:
         student_n_action_steps: int = 10,
         expert_n_action_steps: int = 10,
         expert_k: int = 40,
+        expert_exit_mode: str = "fixed",   # "fixed" | "takeover" | "progress" | "gate"
+        recovery_delta: float = 0.2,
+        min_expert_steps: int = 5,
+        max_expert_steps: int = 80,
         warmup_steps: int = 10,
         score_every: int = 1,
         store_only_expert: bool = False,
@@ -232,7 +219,14 @@ class GatedRolloutWorker:
         self.reward_frame_key = reward_frame_key  # keys used by robometer scorer
         self.student_n_action_steps = int(student_n_action_steps)
         self.expert_n_action_steps = int(expert_n_action_steps)
-        self.expert_k = int(expert_k) # number of steps expert executes
+        self.expert_k = int(expert_k) # number of steps expert executes ('fixed' mode)
+        self.expert_exit_mode = str(expert_exit_mode)
+        self.recovery_delta = float(recovery_delta)
+        self.min_expert_steps = int(min_expert_steps)
+        self.max_expert_steps = int(max_expert_steps)
+        assert self.expert_exit_mode in ("fixed", "takeover", "progress", "gate"), \
+            f"unknown expert_exit_mode {self.expert_exit_mode!r}"
+        assert self.min_expert_steps <= self.max_expert_steps, "min_expert_steps must be <= max_expert_steps"
         self.warmup_steps = int(warmup_steps)  # student steps before the gate may fire
         self.score_every = max(1, int(score_every))  # robometer cadence (need >1 for real world experiment due to latency)
         self.store_only_expert = bool(store_only_expert)  # Whether to store only expert transitions in the buffer
@@ -266,6 +260,28 @@ class GatedRolloutWorker:
             out[k] = v
         return out
 
+    def _handback_reason(self, takeover_steps, last_progress, takeover_progress, gate_fired_now):
+        """Why the expert hands control back this step; None = keep control.
+        Modes: 'fixed' (expert_k steps), 'takeover' (until episode end), 'progress' (progress
+        recovered by recovery_delta above the takeover point), 'gate' (the gate would no longer
+        fire on the expert-driven window). 'progress'/'gate' share the min/max-steps guardrails."""
+        mode = self.expert_exit_mode
+        if mode == "fixed":
+            return "fixed" if takeover_steps >= self.expert_k else None
+        if mode == "takeover":
+            return None
+        if takeover_steps >= self.max_expert_steps:
+            return "cap"  # force handback if expert is also stuck
+        if takeover_steps < self.min_expert_steps:
+            return None
+        if mode == "progress":
+            return "progress recovered" if last_progress >= takeover_progress + self.recovery_delta else None
+        if mode == "gate":
+            # Hand back once the gate has a full short window AND would not fire
+            if gate_fired_now is False and len(self.gate.history) >= self.gate.short_window:
+                return "healthy"
+        return None
+
     def _write_video(self, frames, labels, episode_id):
         """Write the episode video with a STUDENT/EXPERT banner per frame."""
         if not self.video_dir or not frames:
@@ -286,16 +302,11 @@ class GatedRolloutWorker:
         logger.info(f"Saved gated rollout video ({len(frames)} frames) to {path}")
 
     def rollout_episode(self, episode_id, store=True, require_success=False, require_intervention=False):
-        """Run one gated episode. Returns a stats dict.
-
-        Transitions are buffered and added to the online buffer ALL AT ONCE at episode end
-        (so episode-level stats are known).
-        require_success / require_intervention filter which episodes are kept.
-        """
+        """Run one gated episode. Returns a stats dict."""
         was_training = self.student.training
-        self.student.eval()  # no dropout/BN-updates while collecting; restored at episode end
+        self.student.eval()
         obs, _ = self.env.reset()
-        obs = _extract0(obs)  # Removes the batch dimension from the obs
+        obs = _extract0(obs)  # removes batched dimension
 
         self.scorer.reset(task=str(obs.get("prompt", "")))
         self.gate.reset()
@@ -304,12 +315,15 @@ class GatedRolloutWorker:
 
         student_st = {"chunk": None, "pos": 0}
         expert_st = {"chunk": None, "pos": 0}
-        expert_left = 0          # >0 -> expert in control for this many more steps
-        expert_seg, seg_step = 0, 0  # number of expert interventions and the step within the current expert takeover; used for storage
-        steps, expert_steps, num_interventions = 0, 0, 0 
+        expert_active = False
+        takeover_steps = 0
+        takeover_progress = 0.0  # progress captured at takeover (for the 'progress' exit mode)
+        expert_seg, seg_step = 0, 0  # expert-segment index + step within it
+        steps, expert_steps, num_interventions = 0, 0, 0
         success, done = False, False
         pending = []
         progress_trace, gate_fires, gate_reasons = [], [], []
+        handback_steps, handback_reasons = [], []
         video_frames, video_labels = [], []
         last_progress = 0.0
 
@@ -317,16 +331,11 @@ class GatedRolloutWorker:
             cur = self._prep_obs(obs)
             obs_t = move_to_device(convert_to_tensor(cur), self.device)
 
-            if expert_left > 0:
+            if expert_active:
                 action = self._policy_action(self.expert, obs_t, expert_st, self.expert_n_action_steps)
                 mode, label = "EXPERT", INTERVENTION_LABEL
-                expert_left -= 1
                 expert_steps += 1
-                if expert_left == 0:
-                    # Handoff back to the student: replan from the corrected state, and give
-                    # the gate a clean history (don't re-fire on pre-correction values).
-                    student_st["chunk"] = None
-                    self.gate.reset()
+                takeover_steps += 1
             else:
                 action = self._policy_action(self.student, obs_t, student_st, self.student_n_action_steps)
                 mode, label = "STUDENT", ROLLOUT_LABEL
@@ -341,24 +350,39 @@ class GatedRolloutWorker:
                 success = True
 
             # ---- Robometer + gate (on the post-step frame) ----
-            # Frames are appended EVERY step, but the 4B-VLM is only queried every score_every steps
-            # The reward gate also updates every score_every steps
+            # Frames are appended every step, but the 4B-VLM is only queried every score_every steps
             self.scorer.append(next_obs[self.reward_frame_key])
             scored_now = steps % self.score_every == 0
             if scored_now:
                 last_progress, _success_prob = self.scorer.score()  # scalar
             progress_trace.append(last_progress)
-            if scored_now and label == ROLLOUT_LABEL and steps >= self.warmup_steps and expert_left == 0:
-                if self.gate.update(last_progress):
+
+            # ---- Control transitions ----
+            if not expert_active:
+                if scored_now and steps >= self.warmup_steps and self.gate.update(last_progress):
                     gate_fires.append(steps)
                     gate_reasons.append(self.gate.last_trigger)  # "drop" | "plateau"
                     num_interventions += 1
-                    expert_left = self.expert_k
-                    expert_st["chunk"] = None  # expert replans from the current state
+                    expert_active = True
+                    takeover_steps = 0
+                    takeover_progress = last_progress
+                    expert_st["chunk"] = None
+                    self.gate.reset()  # fresh history for reward gate when switching control
                     expert_seg += 1
                     seg_step = 0
                     logger.info(f"  [gate] fired at step {steps} (progress={last_progress:.3f}, "
-                                f"trigger={self.gate.last_trigger}) -> expert takes over for {self.expert_k} steps")
+                                f"trigger={self.gate.last_trigger}) -> expert takeover (mode={self.expert_exit_mode})")
+            else:
+                gate_fired_now = self.gate.update(last_progress) if (scored_now and self.expert_exit_mode == "gate") else None
+                reason = self._handback_reason(takeover_steps, last_progress, takeover_progress, gate_fired_now)
+                if reason is not None:
+                    handback_steps.append(steps)
+                    handback_reasons.append(reason)
+                    expert_active = False
+                    student_st["chunk"] = None
+                    self.gate.reset()
+                    logger.info(f"  [gate] handback at step {steps} after {takeover_steps} expert steps "
+                                f"(reason={reason})")
 
             # ---- Storage (episode buffered, flushed at the end) ----
             if store and self.online_buffer is not None and (not self.store_only_expert or label == INTERVENTION_LABEL):
@@ -413,6 +437,8 @@ class GatedRolloutWorker:
             stored=stored,
             gate_fires=gate_fires,
             gate_reasons=gate_reasons,
+            handback_steps=handback_steps,
+            handback_reasons=handback_reasons,
             progress_trace=progress_trace,
         )
 
@@ -428,7 +454,13 @@ def main():
     parser.add_argument("--expert-checkpoint", default=None)
     parser.add_argument("--reward-model", default="robometer/Robometer-4B")
     parser.add_argument("--episodes", type=int, default=3)
-    parser.add_argument("--expert-k", type=int, default=40)
+    parser.add_argument("--expert-k", type=int, default=40, help="'fixed' exit mode: expert holds for this many steps")
+    parser.add_argument("--expert-exit-mode", type=str, default="fixed",
+                        choices=["fixed", "takeover", "progress", "gate"],
+                        help="when the expert hands back: fixed k steps | until episode end | progress recovered | gate no longer fires")
+    parser.add_argument("--recovery-delta", type=float, default=0.2, help="'progress' mode: rise above takeover progress to hand back")
+    parser.add_argument("--min-expert-steps", type=int, default=5, help="'progress'/'gate': min hold before condition handback")
+    parser.add_argument("--max-expert-steps", type=int, default=80, help="'progress'/'gate': hard cap (stuck-expert guardrail)")
     parser.add_argument("--short-window", type=int, default=5)
     parser.add_argument("--long-window", type=int, default=30)
     parser.add_argument("--method", type=str, default="spearman", choices=["spearman", "pearson", "naive"])
@@ -495,13 +527,17 @@ def main():
         expert=expert,
         scorer=scorer,
         gate=gate,
-        online_buffer=None,  # watch-only: nothing stored
+        online_buffer=None,  # watch-only
         device=device,
         action_dim=action_dim,
         remove_obs_keys=remove_obs_keys,
         student_n_action_steps=n_exec,
         expert_n_action_steps=5,
         expert_k=args.expert_k,
+        expert_exit_mode=args.expert_exit_mode,
+        recovery_delta=args.recovery_delta,
+        min_expert_steps=args.min_expert_steps,
+        max_expert_steps=args.max_expert_steps,
         warmup_steps=args.warmup,
         score_every=args.score_every,
         video_dir=args.video_dir,
@@ -512,11 +548,11 @@ def main():
         logger.info(
             f"episode {ep}: steps={stats['steps']} success={stats['success']} "
             f"interventions={stats['num_interventions']} (at steps {stats['gate_fires']}) "
-            f"expert_steps={stats['expert_steps']}"
+            f"expert_steps={stats['expert_steps']} handbacks={stats['handback_reasons']}"
         )
         if args.video_dir: 
             plot_progress_trace(
-                stats, args.expert_k,
+                stats,
                 os.path.join(args.video_dir, f"progress_watch_{ep}.png"),
                 title=f"episode {ep}: success={stats['success']}, interventions={stats['num_interventions']}",
             )
