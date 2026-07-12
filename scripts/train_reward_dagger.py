@@ -93,13 +93,13 @@ def main(cfg: DictConfig):
     if not expert_dir:
         raise ValueError("Set rdagger.expert_dir=<expert (DP) pretraining run dir>.")
     expert_checkpoint = OmegaConf.select(cfg, "rdagger.expert_checkpoint", default=None)
-    reward_model_path = OmegaConf.select(cfg, "rdagger.reward_model", default="robometer/Robometer-4B")
+    reward_model_path = OmegaConf.select(cfg, "rdagger.reward_model", default="jesbu1/robometer-4b-fft-libero")
     expert_k = int(OmegaConf.select(cfg, "rdagger.expert_k", default=40))
     expert_n_exec = int(OmegaConf.select(cfg, "rdagger.expert_n_action_steps", default=5))
-    expert_exit_mode = str(OmegaConf.select(cfg, "rdagger.expert_exit_mode", default="fixed")),
-    recovery_delta = float(OmegaConf.select(cfg, "rdagger.recovery_delta", default=0.2)),
-    min_expert_steps = int(OmegaConf.select(cfg, "rdagger.min_expert_steps", default=5)),
-    max_expert_steps = int(OmegaConf.select(cfg, "rdagger.max_expert_steps", default=80)),
+    expert_exit_mode = str(OmegaConf.select(cfg, "rdagger.expert_exit_mode", default="fixed"))
+    recovery_delta = float(OmegaConf.select(cfg, "rdagger.recovery_delta", default=0.2))
+    min_expert_steps = int(OmegaConf.select(cfg, "rdagger.min_expert_steps", default=5))
+    max_expert_steps = int(OmegaConf.select(cfg, "rdagger.max_expert_steps", default=80))
     warmup_steps = int(OmegaConf.select(cfg, "rdagger.warmup_steps", default=10))
     score_every = int(OmegaConf.select(cfg, "rdagger.score_every", default=1))
     num_iterations = int(OmegaConf.select(cfg, "rdagger.num_iterations", default=10))
@@ -113,10 +113,13 @@ def main(cfg: DictConfig):
     reweighting = OmegaConf.select(cfg, "rdagger.reweighting", default=None)
     save_interval = int(OmegaConf.select(cfg, "rdagger.save_interval", default=1))
     gate_kwargs = dict(
+        method=str(OmegaConf.select(cfg, "rdagger.method", default="spearman")),
         short_window=int(OmegaConf.select(cfg, "rdagger.short_window", default=5)),
-        drop_threshold=float(OmegaConf.select(cfg, "rdagger.drop_threshold", default=0.15)),
+        drop_threshold=float(OmegaConf.select(cfg, "rdagger.drop_threshold", default=-0.5)),
         long_window=int(OmegaConf.select(cfg, "rdagger.long_window", default=30)),
-        plateau_threshold=float(OmegaConf.select(cfg, "rdagger.plateau_threshold", default=0.05)),
+        plateau_threshold=float(OmegaConf.select(cfg, "rdagger.plateau_threshold", default=0.3)),
+        min_drop_magnitude=float(OmegaConf.select(cfg, "rdagger.min_drop_magnitude", default=0.0)),
+        smoothing=float(OmegaConf.select(cfg, "rdagger.smoothing", default=0.0)),
     )
 
     student = load_actor(load_dir, device, OmegaConf.select(cfg, "checkpoint", default=None), trainable=True)
