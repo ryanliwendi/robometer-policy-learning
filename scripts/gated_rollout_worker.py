@@ -452,9 +452,10 @@ def main():
     parser.add_argument("--expert-dir", required=True, help="expert (DP) pretraining run dir")
     parser.add_argument("--student-checkpoint", default=None)
     parser.add_argument("--expert-checkpoint", default=None)
-    parser.add_argument("--reward-model", default="robometer/Robometer-4B")
+    parser.add_argument("--reward-model", default="jesbu1/robometer-4b-fft-libero")  # LIBERO-finetuned ckpt
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--expert-k", type=int, default=40, help="'fixed' exit mode: expert holds for this many steps")
+    parser.add_argument("--expert-n-action-steps", type=int, default=5, help="action-chunking steps the expert executes")
     parser.add_argument("--expert-exit-mode", type=str, default="fixed",
                         choices=["fixed", "takeover", "progress", "gate"],
                         help="when the expert hands back: fixed k steps | until episode end | progress recovered | gate no longer fires")
@@ -465,7 +466,7 @@ def main():
     parser.add_argument("--long-window", type=int, default=30)
     parser.add_argument("--method", type=str, default="spearman", choices=["spearman", "pearson", "naive"])
     parser.add_argument("--drop-threshold", type=float, default=-0.5)
-    parser.add_argument("--plateau-threshold", type=float, default=0.3)
+    parser.add_argument("--plateau-threshold", type=float, default=0.2)
     parser.add_argument("--min-drop-magnitude", type=float, default=0.0,
                         help="absolute drop for correlation methods. Correlation is scale-free so a tiny wiggle fires like a real collapse.")
     parser.add_argument("--smoothing", type=float, default=0.0, help="EMA weight on history in [0,1); 0 = off")
@@ -535,7 +536,7 @@ def main():
         action_dim=action_dim,
         remove_obs_keys=remove_obs_keys,
         student_n_action_steps=n_exec,
-        expert_n_action_steps=5,
+        expert_n_action_steps=args.expert_n_action_steps,
         expert_k=args.expert_k,
         expert_exit_mode=args.expert_exit_mode,
         recovery_delta=args.recovery_delta,
