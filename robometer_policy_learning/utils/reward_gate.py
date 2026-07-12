@@ -30,24 +30,27 @@ class RewardGate:
     """Consumes the causal progress series (one value per step) and decides when the
     expert should take over. Stateful; call reset() after an intervention."""
 
-    def __init__(self, 
-        short_window=5, 
-        drop_threshold=-0.5, 
-        long_window=30, 
-        plateau_threshold=0.05, 
-        method="spearman", 
+    def __init__(self,
+        short_window=5,
+        drop_threshold=-0.5,
+        long_window=30,
+        plateau_threshold=0.05,
+        method="spearman",
         smoothing=0,
+        min_drop_magnitude=0.0,
     ):
         self.short_window = short_window
         self.drop_threshold = drop_threshold
         self.long_window = long_window
         self.plateau_threshold = plateau_threshold
+        # For the correlation methods; requires the absolute drop to be large enough to fire
+        self.min_drop_magnitude = min_drop_magnitude
         self.history = deque(maxlen=long_window)
         self.method = method
         self.smoothing = smoothing
         self._ema = None
         self._corr = {"spearman": _compute_spearman, "pearson": _compute_pearson}
-        self.last_trigger = None  # "drop" | "plateau" | None -- which trigger fired on the last update()
+        self.last_trigger = None  # "drop" | "plateau" | None
 
         assert long_window >= short_window, "Long window should be greater than or equal to short window"
         assert 0 <= smoothing < 1, "Smoothing should be in range [0, 1)"
@@ -91,12 +94,18 @@ class RewardGate:
         return fired
 
     def _check_drop(self) -> bool:
-        """Correlation gate: progress is trending down over the short window."""
+        """Correlation gate: progress is trending down over the short window AND (optionally)
+        the fall is large enough."""
         recent = list(self.history)[-self.short_window:]
         corr = self._corr[self.method](recent)
         if math.isnan(corr):
             return False
-        return corr < self.drop_threshold
+        if corr >= self.drop_threshold:
+            return False
+        if self.min_drop_magnitude > 0:
+            if (max(recent) - recent[-1]) < self.min_drop_magnitude:
+                return False  # trend is down, but the actual fall is noise-sized -> ignore
+        return True
 
     def _check_plateau(self) -> bool:
         """Correlation gate: progress is not trending up over the long window."""

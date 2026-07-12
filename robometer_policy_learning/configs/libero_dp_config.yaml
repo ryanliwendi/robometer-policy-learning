@@ -9,11 +9,11 @@ debug: false
 # Environment configuration
 env:
   env_name: "libero_10"
-  task_id: 3
+  task_id: 1
   max_episode_steps: 800
   use_full_state: false
   use_gt_rewards: true
-  h5_dataset_path: "/scr/liryan/LIBERO/libero/datasets/libero_10_only_successful/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo.hdf5"
+  h5_dataset_path: "/scr/liryan/LIBERO/libero/datasets/libero_10_only_successful/LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket_demo.hdf5"
   dino_image_keys: ["agentview_rgb", "eye_in_hand_rgb"]
   extra_keys_to_drop: ["prompt", "language", "observation/image", "observation/wrist_image"]
   success_bonus_amount: 0.0
@@ -24,9 +24,9 @@ training:
   chunk_size: 20  # Diffusion prediction horizon (Tp)
   n_action_steps: 10  # Actions executed open-loop per chunk before replanning (Ta)
   use_rnn: false
-  num_offline_steps: 100_000
+  num_offline_steps: 50_000
   load_dir: null
-  save_interval: 10000
+  save_interval: 5000
   continue_training: false
   seed: 0
   normalize_lowdim_obs: false
@@ -52,7 +52,7 @@ logging:
   wandb_entity: liryan-usc
   wandb_offline: false
   wandb_log_dir_base: logs/wandb
-  wandb_name: "train_dp_task_3"
+  wandb_name: "train_dp_task_1"
   log_level: "INFO"
 
 # Algorithm configuration
@@ -62,7 +62,7 @@ alg:
 
 # Evaluation configuration
 eval:
-  eval_freq: 10000
+  eval_freq: 5000
   eval_num_episodes: 25
   eval_record_video: true
   eval_on_first_step: false
