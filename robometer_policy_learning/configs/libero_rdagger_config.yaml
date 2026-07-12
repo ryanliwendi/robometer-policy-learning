@@ -11,19 +11,28 @@ checkpoint: 50000  # student: 68% eval
 rdagger:
   expert_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-03/20-19-13
   expert_checkpoint: 70000  # expert: 92% eval
-  reward_model: robometer/Robometer-4B
+  reward_model: jesbu1/robometer-4b-fft-libero  # LIBERO-finetuned ckpt 
 
-  # Gating
+  # Gating. NOTE: thresholds are method-dependent.
+  # spearman/pearson -> correlation in [-1, 1]
+  # naive            -> raw progress deltas in [0, 1]
+  method: spearman
   short_window: 5
-  drop_threshold: 0.15
+  drop_threshold: -0.5
   long_window: 30
-  plateau_threshold: 0.05
+  plateau_threshold: 0.3
+  min_drop_magnitude: 0.1
+  smoothing: 0.0  # EMA weight on history, [0, 1); 0 = off
   warmup_steps: 15
-  score_every: 3 
+  score_every: 1
 
   # Expert
-  expert_k: 40  # steps the expert keeps control after a gate fire
-  expert_n_action_steps: 5 
+  expert_k: 40  # steps the expert keeps control after a gate fire ('fixed' mode)
+  expert_n_action_steps: 5
+  expert_exit_mode: fixed  # fixed | takeover | progress | gate
+  recovery_delta: 0.2      # 'progress': rise above takeover progress to hand back
+  min_expert_steps: 5      # 'progress'/'gate': min hold before condition handback
+  max_expert_steps: 80     # 'progress'/'gate': hard cap (stuck-expert guardrail)
 
   # DAgger
   num_iterations: 10
