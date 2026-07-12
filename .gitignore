@@ -42,3 +42,4 @@ replay_buffers/*
 # Others
 .vscode/
 pyrightconfig.json
+gated_videos/
