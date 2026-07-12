@@ -96,6 +96,10 @@ def main(cfg: DictConfig):
     reward_model_path = OmegaConf.select(cfg, "rdagger.reward_model", default="robometer/Robometer-4B")
     expert_k = int(OmegaConf.select(cfg, "rdagger.expert_k", default=40))
     expert_n_exec = int(OmegaConf.select(cfg, "rdagger.expert_n_action_steps", default=5))
+    expert_exit_mode = str(OmegaConf.select(cfg, "rdagger.expert_exit_mode", default="fixed")),
+    recovery_delta = float(OmegaConf.select(cfg, "rdagger.recovery_delta", default=0.2)),
+    min_expert_steps = int(OmegaConf.select(cfg, "rdagger.min_expert_steps", default=5)),
+    max_expert_steps = int(OmegaConf.select(cfg, "rdagger.max_expert_steps", default=80)),
     warmup_steps = int(OmegaConf.select(cfg, "rdagger.warmup_steps", default=10))
     score_every = int(OmegaConf.select(cfg, "rdagger.score_every", default=1))
     num_iterations = int(OmegaConf.select(cfg, "rdagger.num_iterations", default=10))
@@ -238,6 +242,10 @@ def main(cfg: DictConfig):
         student_n_action_steps=n_exec,
         expert_n_action_steps=expert_n_exec,
         expert_k=expert_k,
+        expert_exit_mode=expert_exit_mode,
+        recovery_delta=recovery_delta,
+        min_expert_steps=min_expert_steps,
+        max_expert_steps=max_expert_steps,
         warmup_steps=warmup_steps,
         score_every=score_every,
         store_only_expert=store_only_expert,
