@@ -149,6 +149,39 @@ def plot_progress_trace(stats, save_path: str, title: str | None = None):
     plt.close(fig)
 
 
+def dump_episode_stats(episodes, save_path: str, meta: dict | None = None):
+    """Write per-episode progress traces + success labels to JSON.
+
+    The gate is a pure function of the progress trace, so these dumps let us grid-search
+    gate hyperparameters OFFLINE on CPU (replaying RewardGate over the traces) instead of
+    paying Robometer GPU inference once per candidate config.
+    """
+    import json
+
+    payload = dict(
+        meta=meta or {},
+        episodes=[
+            dict(
+                episode=i,
+                success=bool(s["success"]),
+                steps=int(s["steps"]),
+                progress_trace=[float(p) for p in s["progress_trace"]],
+                gate_fires=[int(f) for f in s["gate_fires"]],
+                gate_reasons=list(s["gate_reasons"]),
+                handback_steps=[int(h) for h in s["handback_steps"]],
+                handback_reasons=list(s["handback_reasons"]),
+                expert_steps=int(s["expert_steps"]),
+                num_interventions=int(s["num_interventions"]),
+            )
+            for i, s in enumerate(episodes)
+        ],
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    with open(save_path, "w") as f:
+        json.dump(payload, f)
+    n_succ = sum(e["success"] for e in payload["episodes"])
+    logger.info(f"wrote {len(payload['episodes'])} episodes ({n_succ} success) -> {save_path}")
+
 
 def load_actor(run_dir: str, device: str, checkpoint=None, trainable: bool = False):
     """Load a BaseActor from a pretraining run dir (checkpoints/<step>/...)."""
@@ -460,23 +493,31 @@ def main():
                         choices=["fixed", "takeover", "progress", "gate"],
                         help="when the expert hands back: fixed k steps | until episode end | progress recovered | gate no longer fires")
     parser.add_argument("--recovery-delta", type=float, default=0.2, help="'progress' mode: rise above takeover progress to hand back")
-    parser.add_argument("--min-expert-steps", type=int, default=5, help="'progress'/'gate': min hold before condition handback")
-    parser.add_argument("--max-expert-steps", type=int, default=80, help="'progress'/'gate': hard cap (stuck-expert guardrail)")
-    parser.add_argument("--short-window", type=int, default=5)
-    parser.add_argument("--long-window", type=int, default=30)
+    parser.add_argument("--min-expert-steps", type=int, default=10, help="'progress'/'gate': min hold before condition handback")
+    parser.add_argument("--max-expert-steps", type=int, default=100, help="'progress'/'gate': hard cap (stuck-expert guardrail)")
+    parser.add_argument("--short-window", type=int, default=30)
+    parser.add_argument("--long-window", type=int, default=120)
     parser.add_argument("--method", type=str, default="spearman", choices=["spearman", "pearson", "naive"])
-    parser.add_argument("--drop-threshold", type=float, default=-0.5)
-    parser.add_argument("--plateau-threshold", type=float, default=0.2)
-    parser.add_argument("--min-drop-magnitude", type=float, default=0.0,
+    parser.add_argument("--drop-threshold", type=float, default=-0.7)
+    parser.add_argument("--plateau-threshold", type=float, default=0.1)
+    parser.add_argument("--min-drop-magnitude", type=float, default=0.1,
                         help="absolute drop for correlation methods. Correlation is scale-free so a tiny wiggle fires like a real collapse.")
     parser.add_argument("--smoothing", type=float, default=0.0, help="EMA weight on history in [0,1); 0 = off")
     parser.add_argument("--warmup", type=int, default=15)
     parser.add_argument("--score-every", type=int, default=1)
     parser.add_argument("--video-dir", default="gated_videos")
+    parser.add_argument("--stats-json-dir", default="gated_videos/episode_stats.json",
+                        help="per-episode progress traces + success labels (input to the offline gate sweep)")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    import random as _random
+    _random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
     # Env/model params come from the STUDENT's saved training config, so the env build,
     # chunking and DINO keys match what the student was trained with
@@ -547,20 +588,46 @@ def main():
         video_dir=args.video_dir,
     )
 
+    episodes = []
     for ep in range(args.episodes):
+        # Re-seed per episode
+        _random.seed(args.seed + ep)
+        np.random.seed(args.seed + ep)
+        torch.manual_seed(args.seed + ep)
+        torch.cuda.manual_seed_all(args.seed + ep)
+
         stats = worker.rollout_episode(f"watch_{ep}", store=False)
+        episodes.append(stats)
         logger.info(
             f"episode {ep}: steps={stats['steps']} success={stats['success']} "
             f"interventions={stats['num_interventions']} (at steps {stats['gate_fires']}) "
             f"expert_steps={stats['expert_steps']} handbacks={stats['handback_reasons']}"
         )
-        if args.video_dir: 
+        if args.video_dir:
             plot_progress_trace(
                 stats,
                 os.path.join(args.video_dir, f"progress_watch_{ep}.png"),
                 title=f"episode {ep}: success={stats['success']}, interventions={stats['num_interventions']}",
             )
+        # Re-dump every episode: a 50-episode job is long, don't lose it all to a late crash.
+        dump_episode_stats(
+            episodes,
+            args.stats_json_dir,
+            meta=dict(
+                reward_model=args.reward_model,
+                student_dir=args.student_dir, student_checkpoint=args.student_checkpoint,
+                expert_dir=args.expert_dir, expert_checkpoint=args.expert_checkpoint,
+                method=args.method, short_window=args.short_window, long_window=args.long_window,
+                drop_threshold=args.drop_threshold, plateau_threshold=args.plateau_threshold,
+                min_drop_magnitude=args.min_drop_magnitude, smoothing=args.smoothing,
+                warmup=args.warmup, score_every=args.score_every, seed=args.seed,
+                expert_exit_mode=args.expert_exit_mode,
+            ),
+        )
 
+    n_succ = sum(bool(s["success"]) for s in episodes)
+    n_int = sum(s["num_interventions"] for s in episodes)
+    logger.info(f"DONE: {n_succ}/{len(episodes)} success, {n_int} total interventions")
     env.close()
 
 
