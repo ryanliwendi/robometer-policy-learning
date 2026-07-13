@@ -16,13 +16,21 @@ rdagger:
   # Gating. NOTE: thresholds are method-dependent.
   # spearman/pearson -> correlation in [-1, 1]
   # naive            -> raw progress deltas in [0, 1]
+  #
+  # Tuned by scripts/sweep_gate_hparams.py over 46 ungated student rollouts (16 fail / 30 succ):
+  # catches 16/16 failures at 12-40% into the episode, disturbs 2/30 successes.
+  # The two false fires are both PLATEAU; the drop trigger had zero false positives.
+  # Keep plateau anyway: it catches the failures that never leave the floor (peak progress
+  # ~0.05), which the drop trigger structurally CANNOT see -- no height to fall from.
   method: spearman
-  short_window: 5
-  drop_threshold: -0.5
-  long_window: 30
-  plateau_threshold: 0.3
+  short_window: 30
+  drop_threshold: -0.7
+  long_window: 100
+  plateau_threshold: 0.1
   min_drop_magnitude: 0.1
-  smoothing: 0.0  # EMA weight on history, [0, 1); 0 = off
+  smoothing: 0.5  # EMA weight on history, [0, 1); 0 = off. Damps the transient dips that
+                  # healthy rollouts show -- within a window, successes dip up to ~0.3 too,
+                  # so depth alone does not separate; persistence does.
   warmup_steps: 15
   score_every: 1
 
