@@ -565,6 +565,9 @@ def main():
                         help="per-episode progress traces + success labels (input to the offline gate sweep)")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    
+    if args.expert_type == "dp" and not args.expert_dir:
+        parser.error("--expert-dir is required for --expert-type dp")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
