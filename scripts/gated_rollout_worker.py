@@ -27,6 +27,11 @@ import os
 if "MUJOCO_GL" not in os.environ:
     os.environ["MUJOCO_GL"] = "egl"
 
+# A pi0 expert is JAX; Robometer and DINOv2 are torch. JAX preallocates ~75% of the GPU on first
+# use, which starves torch and OOMs the reward model. Must be set before jax is imported.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.45")
+
 import sys
 
 import numpy as np
@@ -183,6 +188,38 @@ def dump_episode_stats(episodes, save_path: str, meta: dict | None = None):
     logger.info(f"wrote {len(payload['episodes'])} episodes ({n_succ} success) -> {save_path}")
 
 
+class Pi0Actor:
+    """openpi pi0 policy behind the BaseActor .act() interface the worker expects.
+
+    No preprocessing needed: LiberoPI0Wrapper already emits exactly pi0's input format (224x224
+    uint8 images, 8-dim state, prompt) -- the DP actors just drop those keys via remove_obs_keys."""
+
+    raw_obs = True  # take the unconverted numpy obs dict, not a device tensor
+
+    # Whitelist, not blacklist: pi0 takes ONLY these. The DINO embeddings the DP student runs on
+    # are meaningless to it, and their key names vary with env.dino_image_keys.
+    obs_keys = ("observation/image", "observation/wrist_image", "observation/state", "prompt")
+
+    def __init__(self, checkpoint_dir: str, device: str = "cuda"):
+        from robometer_policy_learning.utils.pi0_integration import load_pi0_policy
+
+        self.policy = load_pi0_policy(checkpoint_dir)
+        self.training = False
+        self.remove_obs_keys = []
+
+    # Compatibility if pi0 policy is instantiated as student
+    def eval(self):
+        return self
+
+    def train(self, mode: bool = True):
+        return self
+
+    def act(self, obs, deterministic: bool = True):
+        """obs: pi0-format numpy dict. Returns (actions (horizon, action_dim), actor_state)."""
+        result = self.policy.infer(obs)
+        return np.asarray(result["actions"], dtype=np.float32), None
+
+
 def load_actor(run_dir: str, device: str, checkpoint=None, trainable: bool = False):
     """Load a BaseActor from a pretraining run dir (checkpoints/<step>/...)."""
     if os.path.exists(os.path.join(run_dir, "actor.pt")):
@@ -269,12 +306,23 @@ class GatedRolloutWorker:
             os.makedirs(self.video_dir, exist_ok=True)
 
     # ---- Policy action with receding-horizon chunking ----
-    def _policy_action(self, actor, obs_t, st, n_exec):
+    def _actor_obs(self, actor, obs):
+        """Each actor gets the observation it was trained on. The student (DP) runs on DINO
+        embeddings + state as torch tensors; a pi0 expert runs on raw 224px images + prompt as
+        numpy. A single shared obs dict cannot serve both -- the DP's remove_obs_keys drops
+        exactly the keys pi0 needs."""
+        if getattr(actor, "raw_obs", False):
+            return {k: obs[k] for k in actor.obs_keys if k in obs}
+        return move_to_device(convert_to_tensor(self._prep_obs(obs)), self.device)
+
+    def _policy_action(self, actor, obs, st, n_exec):
         """st is a mutable {"chunk" (action_sequence), "pos" (scalar current_index)} dict; set st["chunk"]=None to force a replan."""
         if st["chunk"] is None or st["pos"] >= len(st["chunk"]) or st["pos"] >= n_exec:
             with torch.inference_mode():
-                pred, _ = actor.act(obs_t, deterministic=True)
-            pred = pred.detach().cpu().numpy()
+                pred, _ = actor.act(self._actor_obs(actor, obs), deterministic=True)
+            if torch.is_tensor(pred):  # pi0 returns numpy; the torch actors return tensors
+                pred = pred.detach().cpu().numpy()
+            pred = np.asarray(pred)
             st["chunk"] = pred.reshape(-1, self.action_dim) if pred.ndim == 3 else np.atleast_2d(pred)  # Batch_size = 1 since we're running with one env
             st["pos"] = 0
         a = st["chunk"][st["pos"]]
@@ -362,15 +410,14 @@ class GatedRolloutWorker:
 
         while not done:
             cur = self._prep_obs(obs)
-            obs_t = move_to_device(convert_to_tensor(cur), self.device)
 
             if expert_active:
-                action = self._policy_action(self.expert, obs_t, expert_st, self.expert_n_action_steps)
+                action = self._policy_action(self.expert, obs, expert_st, self.expert_n_action_steps)
                 mode, label = "EXPERT", INTERVENTION_LABEL
                 expert_steps += 1
                 takeover_steps += 1
             else:
-                action = self._policy_action(self.student, obs_t, student_st, self.student_n_action_steps)
+                action = self._policy_action(self.student, obs, student_st, self.student_n_action_steps)
                 mode, label = "STUDENT", ROLLOUT_LABEL
 
             next_b, rew, term, trunc, info = self.env.step(
@@ -482,13 +529,21 @@ def main():
 
     parser = argparse.ArgumentParser(description="Watch reward-gated rollouts (student + expert + gate).")
     parser.add_argument("--student-dir", required=True, help="student pretraining run dir (has .hydra/config.yaml)")
-    parser.add_argument("--expert-dir", required=True, help="expert (DP) pretraining run dir")
+    parser.add_argument("--expert-dir", required=False, help="expert (DP) pretraining run dir; not needed for --expert-type pi0")
+    parser.add_argument("--student-type", choices=["dp", "pi0"], default="dp")
+    parser.add_argument("--expert-type", choices=["dp", "pi0"], default="dp")
+    parser.add_argument("--pi0-checkpoint", default=os.path.expanduser(
+                        "~/.cache/openpi/openpi-assets/checkpoints/pi0_libero"),
+                        help="'pi0' expert-type: openpi checkpoint dir (must contain 'libero' in the path)")
     parser.add_argument("--student-checkpoint", default=None)
     parser.add_argument("--expert-checkpoint", default=None)
     parser.add_argument("--reward-model", default="jesbu1/robometer-4b-fft-libero")  # LIBERO-finetuned ckpt
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--expert-k", type=int, default=40, help="'fixed' exit mode: expert holds for this many steps")
     parser.add_argument("--expert-n-action-steps", type=int, default=5, help="action-chunking steps the expert executes")
+    parser.add_argument("--student-n-action-steps", type=int, default=None,
+                        help="override the student's replan interval (default: from its training config). "
+                             "pi0 inference is expensive, so raise this when using --student-type pi0.")
     parser.add_argument("--expert-exit-mode", type=str, default="fixed",
                         choices=["fixed", "takeover", "progress", "gate"],
                         help="when the expert hands back: fixed k steps | until episode end | progress recovered | gate no longer fires")
@@ -523,7 +578,8 @@ def main():
     # chunking and DINO keys match what the student was trained with
     pre_cfg = OmegaConf.load(os.path.join(args.student_dir, ".hydra", "config.yaml"))
     dino_image_keys = list(OmegaConf.select(pre_cfg, "env.dino_image_keys", default=[]) or [])
-    n_exec = int(OmegaConf.select(pre_cfg, "training.n_action_steps", default=10))
+    n_exec = int(args.student_n_action_steps
+                 or OmegaConf.select(pre_cfg, "training.n_action_steps", default=10))
 
     dinov2_model = dinov2_processor = None
     if dino_image_keys:
@@ -550,11 +606,18 @@ def main():
     )
     action_dim = int(env.single_action_space.shape[0])
 
-    student = load_actor(args.student_dir, device, args.student_checkpoint)
-    expert = load_actor(args.expert_dir, device, args.expert_checkpoint)
-    # Prefer the actor's own trained-with drop list (superset of the config's extra_keys_to_drop).
+    # --student-type pi0 is for control to check success for PI0 policy
+    if args.student_type == "pi0":
+        student = Pi0Actor(args.pi0_checkpoint, device=device)
+    else:
+        student = load_actor(args.student_dir, device, args.student_checkpoint)
+    if args.expert_type == "pi0":
+        expert = Pi0Actor(args.pi0_checkpoint, device=device)
+    else:
+        expert = load_actor(args.expert_dir, device, args.expert_checkpoint)
+
     remove_obs_keys = list(getattr(student, "remove_obs_keys", None)
-                           or OmegaConf.select(pre_cfg, "env.extra_keys_to_drop", default=[]) or [])     
+                           or OmegaConf.select(pre_cfg, "env.extra_keys_to_drop", default=[]) or [])
     scorer = RobometerScorer(model_path=args.reward_model, device=device)
     gate = RewardGate(
         short_window=args.short_window,
@@ -616,7 +679,9 @@ def main():
             meta=dict(
                 reward_model=args.reward_model,
                 student_dir=args.student_dir, student_checkpoint=args.student_checkpoint,
+                expert_type=args.expert_type,
                 expert_dir=args.expert_dir, expert_checkpoint=args.expert_checkpoint,
+                pi0_checkpoint=(args.pi0_checkpoint if args.expert_type == "pi0" else None),
                 method=args.method, short_window=args.short_window, long_window=args.long_window,
                 drop_threshold=args.drop_threshold, plateau_threshold=args.plateau_threshold,
                 min_drop_magnitude=args.min_drop_magnitude, smoothing=args.smoothing,
