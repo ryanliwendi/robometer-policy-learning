@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """Offline grid-search over RewardGate hyperparameters.
 
-The gate is a pure function of the progress trace, so we replay it over saved ungated
-student rollouts (scripts/gated_rollout_worker.py --warmup 999999) instead of paying
-Robometer GPU inference once per candidate config. CPU-only, seconds per hundred configs.
-
 What we want from a gate, operationally:
   * FIRE on failures -- and fire EARLY, while a correction is still worth making.
   * STAY SILENT on successes -- every fire on a healthy rollout hands control to the expert
@@ -74,11 +70,11 @@ def main():
 
     grid = dict(
         method=["spearman"],
-        short_window=[10, 20, 30],
+        short_window=[30, 50],  # 10, 20
         drop_threshold=[-0.7, -0.9],
-        min_drop_magnitude=[0.05, 0.1, 0.2, 0.3],
-        long_window=[60, 100],
-        plateau_threshold=[0.1, 0.3],
+        min_drop_magnitude=[0.1, 0.2], # 0.05, 0.3
+        long_window=[100, 120, 150],  # 60
+        plateau_threshold=[0.1], # 0.3
         smoothing=[0.0, 0.5],
     )
     keys = list(grid)
