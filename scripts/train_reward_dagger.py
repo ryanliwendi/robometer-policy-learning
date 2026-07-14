@@ -27,6 +27,11 @@ import os
 if "MUJOCO_GL" not in os.environ:
     os.environ["MUJOCO_GL"] = "egl"
 
+# A pi0 expert is JAX; Robometer, DINOv2 and the student are torch. JAX preallocates ~75% of the
+# GPU on first use, which starves torch and OOMs the reward model. Must precede any jax import.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.45")
+
 from datetime import datetime
 
 import numpy as np
@@ -50,7 +55,7 @@ from robometer_policy_learning.utils.reward_gate import RewardGate
 from robometer_policy_learning.utils.training_utils import save_checkpoint
 from robometer_policy_learning.loggers.wandb_logger import WandbLogger
 
-from gated_rollout_worker import GatedRolloutWorker, RobometerScorer, load_actor
+from gated_rollout_worker import GatedRolloutWorker, Pi0Actor, RobometerScorer, load_actor
 
 logger = get_logger()
 
@@ -89,9 +94,10 @@ def main(cfg: DictConfig):
     OmegaConf.set_struct(cfg, True)
     OmegaConf.resolve(cfg)
 
-    expert_dir = OmegaConf.select(cfg, "rdagger.expert_dir", default=None)
-    if not expert_dir:
-        raise ValueError("Set rdagger.expert_dir=<expert (DP) pretraining run dir>.")
+    expert_type = str(OmegaConf.select(cfg, "rdagger.expert_type", default="dp"))
+    pi0_checkpoint = str(OmegaConf.select(cfg, "rdagger.pi0_checkpoint",
+                         default=os.path.expanduser("~/.cache/openpi/openpi-assets/checkpoints/pi0_libero")))
+    expert_dir = OmegaConf.select(cfg, "rdagger.expert_dir", default=None)  # unused for expert_type=pi0
     expert_checkpoint = OmegaConf.select(cfg, "rdagger.expert_checkpoint", default=None)
     reward_model_path = OmegaConf.select(cfg, "rdagger.reward_model", default="jesbu1/robometer-4b-fft-libero")
     expert_k = int(OmegaConf.select(cfg, "rdagger.expert_k", default=40))
@@ -123,7 +129,13 @@ def main(cfg: DictConfig):
     )
 
     student = load_actor(load_dir, device, OmegaConf.select(cfg, "checkpoint", default=None), trainable=True)
-    expert = load_actor(expert_dir, device, expert_checkpoint)  # frozen EMA deployable; never trained
+
+    if expert_type == "pi0":
+        expert = Pi0Actor(pi0_checkpoint, device=device)
+    else:
+        if not expert_dir:
+            raise ValueError("Set rdagger.expert_dir=<expert run dir> for rdagger.expert_type=dp.")
+        expert = load_actor(expert_dir, device, expert_checkpoint)
 
     # ---- DINOv2 (both actors are DINO-mode; the eval env stack embeds frames online) ----
     dino_image_keys = list(OmegaConf.select(cfg, "env.dino_image_keys", default=[]) or [])
