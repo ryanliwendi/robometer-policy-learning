@@ -1,0 +1,75 @@
+defaults:
+  - algorithm@offline_algorithm: dp  # must match the student actor type 
+  - reward_model: null
+  - policy@policy: transformer
+
+debug: false
+
+load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-12/20-06-31  # Student policy dir
+checkpoint: 50000  # 64% success rate
+
+rdagger:
+  expert_type: pi0  # 88% success rate
+  pi0_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero
+  expert_dir: null        # unused when expert_type=pi0
+  expert_checkpoint: null
+
+  reward_model: jesbu1/robometer-4b-fft-libero  # LIBERO-finetuned ckpt
+
+  # Gating
+  method: spearman
+  short_window: 50
+  drop_threshold: -0.7
+  long_window: 200
+  plateau_threshold: 0.1
+  min_drop_magnitude: 0.1
+  smoothing: 0.0
+  warmup_steps: 15
+  score_every: 1
+
+  expert_exit_mode: takeover
+  expert_k: 40             # 'fixed' only
+  expert_n_action_steps: 10
+  recovery_delta: 0.2      # 'progress' only
+  min_expert_steps: 10
+  max_expert_steps: 100
+
+  # DAgger
+  num_iterations: 10
+  rollouts_per_iter: 5
+  train_steps_per_iter: 2000
+  use_offline: true         # mixing with the original demos
+
+  store_only_expert: false 
+  reweighting: iwr  
+
+  require_success: true
+  require_intervention: false  # keep clean student successes too; IWR handles the balance
+
+  save_interval: 1
+  online_buffer_capacity: 200000
+  seed: 0
+
+offline_algorithm:
+  use_weighted_bc: true
+
+# Algorithm used to continue training the student
+alg:
+  offline_alg_name: dp
+  online_alg_name: null
+
+# Eval
+eval:
+  eval_freq: 10000
+  eval_num_episodes: 25
+  eval_record_video: true
+  eval_on_first_step: false
+
+# Logging
+logging:
+  wandb_project: libero_rdagger
+  wandb_entity: liryan-usc
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "rdagger_dp_task1_pi0_iwr_takeover"
+  log_level: "INFO"
