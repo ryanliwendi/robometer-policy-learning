@@ -17,12 +17,12 @@ rdagger:
   # spearman/pearson -> correlation in [-1, 1]
   # naive            -> raw progress deltas in [0, 1]
   method: spearman
-  short_window: 30
+  short_window: 50
   drop_threshold: -0.7
-  long_window: 120 
+  long_window: 200 
   plateau_threshold: 0.1
   min_drop_magnitude: 0.1
-  smoothing: 0.5  # EMA weight on history, [0, 1); 0 = off. Damps the transient dips that
+  smoothing: 0.0  # EMA weight on history, [0, 1); 0 = off. Damps the transient dips that
                   # healthy rollouts show -- within a window, successes dip up to ~0.3 too,
                   # so depth alone does not separate; persistence does.
   warmup_steps: 15
@@ -30,7 +30,7 @@ rdagger:
 
   # Expert
   expert_k: 40  # steps the expert keeps control after a gate fire ('fixed' mode)
-  expert_n_action_steps: 5
+  expert_n_action_steps: 10
   expert_exit_mode: fixed  # fixed | takeover | progress | gate
   recovery_delta: 0.2      # 'progress': rise above takeover progress to hand back
   min_expert_steps: 5      # 'progress'/'gate': min hold before condition handback
