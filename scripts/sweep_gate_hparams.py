@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 """Offline grid-search over RewardGate hyperparameters.
 
-What we want from a gate, operationally:
-  * FIRE on failures -- and fire EARLY, while a correction is still worth making.
-  * STAY SILENT on successes -- every fire on a healthy rollout hands control to the expert
-    for no reason and pollutes the DAgger buffer.
-
-Note the traces are not gated, so this only measures the gate's first fire faithfully 
-
 Usage:
     uv run python scripts/sweep_gate_hparams.py [stats.json]
 """
