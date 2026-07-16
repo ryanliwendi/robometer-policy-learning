@@ -191,6 +191,12 @@ class ChunkedSequentialSampler(BaseSampler):
             next_obs=next_obs_seq,
             done=done_seq,
             truncated=truncated_seq,
+            # Mean of the per-step weights, NOT chunk[-1]'s: the chunk loss averages all steps'
+            # action errors equally, so a chunk straddling a student->expert handoff should carry
+            # the expert-fraction interpolation of the two weights. Inheriting the last step's
+            # weight would count a 19-student+1-expert window as fully expert (and vice versa),
+            # and would break IWR's 50/50 mass balance at every intervention boundary.
+            weight=float(np.mean([getattr(t, "weight", 1.0) for t in chunk])),
         )
 
 
