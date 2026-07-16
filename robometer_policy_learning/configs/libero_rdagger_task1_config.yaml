@@ -19,26 +19,27 @@ rdagger:
   # Gating
   method: spearman
   short_window: 50
-  drop_threshold: -0.7
-  long_window: 200
+  drop_threshold: -0.9
+  long_window: 250
   plateau_threshold: 0.1
   min_drop_magnitude: 0.1
   smoothing: 0.0
-  warmup_steps: 15
+  warmup_steps: 0
   score_every: 1
 
-  expert_exit_mode: takeover
+  expert_exit_mode: progress
   expert_k: 40             # 'fixed' only
   expert_n_action_steps: 10
   recovery_delta: 0.2      # 'progress' only
   min_expert_steps: 10
-  max_expert_steps: 100
+  max_expert_steps: 80
 
   # DAgger
   num_iterations: 10
   rollouts_per_iter: 5
   train_steps_per_iter: 2000
   use_offline: true         # mixing with the original demos
+  offline_sample_ratio: 0.25
 
   store_only_expert: false 
   reweighting: iwr  
