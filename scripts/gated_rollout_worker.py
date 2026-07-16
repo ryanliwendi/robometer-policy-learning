@@ -195,9 +195,6 @@ class Pi0Actor:
     uint8 images, 8-dim state, prompt) -- the DP actors just drop those keys via remove_obs_keys."""
 
     raw_obs = True  # take the unconverted numpy obs dict, not a device tensor
-
-    # Whitelist, not blacklist: pi0 takes ONLY these. The DINO embeddings the DP student runs on
-    # are meaningless to it, and their key names vary with env.dino_image_keys.
     obs_keys = ("observation/image", "observation/wrist_image", "observation/state", "prompt")
 
     def __init__(self, checkpoint_dir: str, device: str = "cuda"):
