@@ -95,8 +95,9 @@ def main(cfg: DictConfig):
     OmegaConf.resolve(cfg)
 
     expert_type = str(OmegaConf.select(cfg, "rdagger.expert_type", default="dp"))
-    pi0_checkpoint = str(OmegaConf.select(cfg, "rdagger.pi0_checkpoint",
-                         default=os.path.expanduser("~/.cache/openpi/openpi-assets/checkpoints/pi0_libero")))
+    pi0_checkpoint = os.path.expanduser(str(OmegaConf.select(
+        cfg, "rdagger.pi0_checkpoint",
+        default="~/.cache/openpi/openpi-assets/checkpoints/pi0_libero")))
     expert_dir = OmegaConf.select(cfg, "rdagger.expert_dir", default=None)  # unused for expert_type=pi0
     expert_checkpoint = OmegaConf.select(cfg, "rdagger.expert_checkpoint", default=None)
     reward_model_path = OmegaConf.select(cfg, "rdagger.reward_model", default="jesbu1/robometer-4b-fft-libero")
@@ -104,9 +105,9 @@ def main(cfg: DictConfig):
     expert_n_exec = int(OmegaConf.select(cfg, "rdagger.expert_n_action_steps", default=5))
     expert_exit_mode = str(OmegaConf.select(cfg, "rdagger.expert_exit_mode", default="fixed"))
     recovery_delta = float(OmegaConf.select(cfg, "rdagger.recovery_delta", default=0.2))
-    min_expert_steps = int(OmegaConf.select(cfg, "rdagger.min_expert_steps", default=5))
+    min_expert_steps = int(OmegaConf.select(cfg, "rdagger.min_expert_steps", default=10))
     max_expert_steps = int(OmegaConf.select(cfg, "rdagger.max_expert_steps", default=80))
-    warmup_steps = int(OmegaConf.select(cfg, "rdagger.warmup_steps", default=10))
+    warmup_steps = int(OmegaConf.select(cfg, "rdagger.warmup_steps", default=0))
     score_every = int(OmegaConf.select(cfg, "rdagger.score_every", default=1))
     num_iterations = int(OmegaConf.select(cfg, "rdagger.num_iterations", default=10))
     rollouts_per_iter = int(OmegaConf.select(cfg, "rdagger.rollouts_per_iter", default=5))
