@@ -203,7 +203,7 @@ class Pi0Actor:
     def __init__(self, checkpoint_dir: str, device: str = "cuda"):
         from robometer_policy_learning.utils.pi0_integration import load_pi0_policy
 
-        self.policy = load_pi0_policy(checkpoint_dir)
+        self.policy = load_pi0_policy(os.path.expanduser(str(checkpoint_dir)))
         self.training = False
         self.remove_obs_keys = []
 
