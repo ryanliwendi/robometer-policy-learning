@@ -77,6 +77,11 @@ class DPConfig(BaseAlgorithmConfig):
     obs_noise_std: float = 0.0
     action_noise_std: float = 0.0
 
+    # Per-sample weighting of the denoising loss, for HITL/DAgger reweighting schemes (IWR,
+    # SIRIUS) that upweight expert corrections over ordinary student data. Name kept identical
+    # to BCConfig so the reweighting utilities and configs work against either algorithm.
+    use_weighted_bc: bool = False
+
     # ----- Diagnostics -----
     # If > 0, every N updates run the (expensive) reverse diffusion sampler on the training
     # batch and log the resulting action MSE against the expert actions. 0 disables it.

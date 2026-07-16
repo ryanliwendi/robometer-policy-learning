@@ -364,6 +364,7 @@ class DP(BaseAlgorithm):
         self.batch_size = config.batch_size
         self.learning_starts = config.learning_starts
         self.prediction_type = config.prediction_type
+        self.use_weighted_bc = config.use_weighted_bc
 
         self.actor_optimizer = torch.optim.AdamW(
             self.online_actor.parameters(),
@@ -437,7 +438,15 @@ class DP(BaseAlgorithm):
             model_pred = self.online_actor.predict_noise(noisy_actions, timesteps, global_cond)
             target = noise if self.prediction_type == "epsilon" else expert_actions
 
-            loss = F.mse_loss(model_pred, target)
+            if self.use_weighted_bc:
+                weights = batch["weight"] if "weight" in batch else batch["reward"]
+                weights = torch.as_tensor(weights, device=model_pred.device, dtype=model_pred.dtype)
+                weights = weights.reshape(-1)
+                per_sample = F.mse_loss(model_pred, target, reduction="none")
+                per_sample = per_sample.reshape(per_sample.shape[0], -1).mean(dim=1)  # (B,)
+                loss = (per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
+            else:
+                loss = F.mse_loss(model_pred, target)
 
             self.actor_optimizer.zero_grad()
             loss.backward()
