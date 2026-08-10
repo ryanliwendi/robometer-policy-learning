@@ -643,7 +643,7 @@ def compute_sirius_weights(
     return {"counts": counts, "ratios": ratios, "weights": weights}
 
 
-def compute_iwr_weights(online_buffer) -> Dict[str, Any]:
+def compute_iwr_weights(online_buffer, target_intv: float = 0.5) -> Dict[str, Any]:
     """IWR (Intervention Weighted Regression) reweighting: balance corrections vs autonomy.
 
     Reference: Mandlekar et al., "Human-in-the-Loop Imitation Learning using Remote Teleoperation".
@@ -651,10 +651,11 @@ def compute_iwr_weights(online_buffer) -> Dict[str, Any]:
     Each sample is labelled by who was in control:
       * ``intervention`` (D_I): human corrections (intervention label 1),
       * ``robot``        (D_R): the policy acting autonomously (everything else).
-    IWR makes the two groups contribute equally during BC even when corrections are rare::
+    ``target_intv`` is the fraction of the total gradient mass assigned to corrections
+    (0.5 = canonical IWR, equal contribution; higher concentrates learning on corrections)::
 
-        w_intervention = 0.5 / (num_i / (num_i + num_r))
-        w_robot        = 0.5 / (num_r / (num_i + num_r))
+        w_intervention = target_intv / (num_i / (num_i + num_r))
+        w_robot        = (1 - target_intv) / (num_r / (num_i + num_r))
 
     Operates on online HITL data only (no offline demos). Weights are assigned in place per
     online sample and surface as ``batch['weight']`` for weighted BC. Returns counts/weights.
@@ -675,8 +676,10 @@ def compute_iwr_weights(online_buffer) -> Dict[str, Any]:
         logger.warning("IWR reweighting: dataset is empty; skipping.")
         return {"counts": {"intervention": 0, "robot": 0}, "weights": {}}
 
-    w_intervention = 0.5 / (num_i / total) if num_i > 0 else 0.0
-    w_robot = 0.5 / (num_r / total) if num_r > 0 else 0.0
+    if not 0.0 < target_intv < 1.0:
+        raise ValueError(f"target_intv must be in (0, 1), got {target_intv}")
+    w_intervention = target_intv / (num_i / total) if num_i > 0 else 0.0
+    w_robot = (1.0 - target_intv) / (num_r / total) if num_r > 0 else 0.0
 
     for t, is_intv in labeled:
         t.weight = float(w_intervention if is_intv else w_robot)

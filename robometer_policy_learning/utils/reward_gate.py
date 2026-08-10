@@ -64,11 +64,10 @@ class RewardGate:
             raise ValueError("Unknown gating method; expected 'naive', 'pearson', or 'spearman'")
 
     def update(self, progress_value: float) -> bool:
-        """Ingest one causal progress value. Return True if either trigger fires (intervene now)."""
+        """Ingest one causal progress value. Return True if either trigger fires."""
         self._ema = progress_value if self._ema is None else self.smoothing * self._ema + (1 - self.smoothing) * progress_value
         self.history.append(self._ema)
 
-        # Only checks triggers once we have enough history
         if len(self.history) < self.short_window:
             return False
         
@@ -94,8 +93,8 @@ class RewardGate:
         return fired
 
     def _check_drop(self) -> bool:
-        """Correlation gate: progress is trending down over the short window AND (optionally)
-        the fall is large enough."""
+        """Correlation gate: progress is trending down over the short window,
+        and the fall is large enough."""
         recent = list(self.history)[-self.short_window:]
         corr = self._corr[self.method](recent)
         if math.isnan(corr):
@@ -104,7 +103,7 @@ class RewardGate:
             return False
         if self.min_drop_magnitude > 0:
             if (max(recent) - recent[-1]) < self.min_drop_magnitude:
-                return False  # trend is down, but the actual fall is noise-sized -> ignore
+                return False
         return True
 
     def _check_plateau(self) -> bool:
