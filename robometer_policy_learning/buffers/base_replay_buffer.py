@@ -885,6 +885,23 @@ class BaseReplayBuffer(abc.ABC):
 
         return transition
 
+    def collate_transitions(self, transitions, device: str = None, dtype=None) -> Dict[str, Any]:
+        """Collate an explicit list of transitions, applying exactly what ``sample()`` applies.
+
+        ``sample()`` chooses its own transitions via the sampler. This lets a caller choose them
+        instead -- needed by ThriftyDAgger's per-member bootstrap resample."""
+        sampled = [t for t in transitions if t is not None]
+        if not sampled:
+            return {}
+        if self.post_transforms:
+            _batched = batch_transitions(sampled)
+            sampled = unbatch_transitions(apply_transforms_batched(_batched, self.post_transforms))
+        transition = self._batch_transitions(sampled)
+        if transition:
+            transition = self._normalize_action_batch(transition)
+            transition = self._convert_batch_to_tensors(transition, device, dtype)
+        return transition
+
     def _normalize_action_batch(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """Map ``batch['action']`` from [min_action, max_action] to [-1, 1] (no-op if unset).
 

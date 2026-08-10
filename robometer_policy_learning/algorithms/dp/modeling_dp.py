@@ -398,6 +398,7 @@ class DP(BaseAlgorithm):
         expert_action_means = []
         sample_mse_errors = []
         unnormalized_sample_mse_errors = []
+        group_losses = {"expert": [], "demo": [], "student": []}
 
         gradient_steps = self.config.num_updates_per_train_step
 
@@ -445,6 +446,19 @@ class DP(BaseAlgorithm):
                 per_sample = F.mse_loss(model_pred, target, reduction="none")
                 per_sample = per_sample.reshape(per_sample.shape[0], -1).mean(dim=1)  # (B,)
                 loss = (per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
+                # Denoising loss split by data group, inferred from the IWR/SIRIUS weights
+                # (expert corrections are upweighted >1, offline demos sit at exactly 1.0,
+                # the student's own rollouts are downweighted <1). Answers the question the
+                # aggregate loss hides: CAN the student fit the expert's action distribution,
+                # or does loss_expert stay high while loss_student/loss_demo shrink?
+                with torch.no_grad():
+                    for gname, gmask in (
+                        ("expert", weights > 1.05),
+                        ("demo", (weights >= 0.95) & (weights <= 1.05)),
+                        ("student", weights < 0.95),
+                    ):
+                        if gmask.any():
+                            group_losses[gname].append(per_sample[gmask].mean().item())
             else:
                 loss = F.mse_loss(model_pred, target)
 
@@ -488,6 +502,9 @@ class DP(BaseAlgorithm):
         if sample_mse_errors:
             metrics_dict["sample_mse_error"] = float(np.mean(sample_mse_errors))
             metrics_dict["unnormalized_sample_mse_error"] = float(np.mean(unnormalized_sample_mse_errors))
+        for gname, vals in group_losses.items():
+            if vals:
+                metrics_dict[f"loss_{gname}"] = float(np.mean(vals))
 
         if self.logger is not None:
             self.logger.log(metrics_dict, step=self.step_counter, prefix=logging_prefix)

@@ -1,0 +1,105 @@
+defaults:
+  - algorithm@offline_algorithm: dp  # must match the student actor type
+  - reward_model: null
+  - policy@policy: transformer
+
+debug: false
+
+# HG-DAgger BASELINE arm for task 1. Everything except the gate is held
+# identical to libero_rdagger_task1_config.yaml (same student checkpoint, same pi0 expert, same
+# one-way takeover, same expert-only training recipe), so any difference in the resulting policy is
+# attributable to the gating rule alone.
+#
+# LIVE backend. Identical to libero_hgdagger_task1_config.yaml except hg_backend and the
+# live-only knobs below -- so the two are a clean within-arm comparison of WHEN the human is asked.
+#
+# The gate here is a PERSON watching in REAL TIME. Each episode streams to a browser; the operator
+# presses SPACE the moment they would step in and pi0 drives to the end. Unlike `replay` there is
+# no second pass and no undo: the decision carries a genuine reaction delay, which is the point --
+# replay's no-time-pressure decision biases latency optimistically.
+#
+# ⚠️ THIS RUN NEEDS A HUMAN WATCHING FOR ITS ENTIRE DURATION.
+#   * no X display needed -- frames are served as MJPEG (see OperatorServer in human_gate.py)
+#   * forward the port, then open http://localhost:8420
+#       - VS Code: PORTS panel -> Forward a Port -> 8420 (no password), or
+#       - ssh -L 8420:localhost:8420 liryan@snoopy1   (note the explicit user)
+#   * SPACE / TAKE OVER = intervene now.  r / START EPISODE = begin the next episode.
+#   * `--pty` is NOT required here (nothing reads stdin), but the job must stay attached.
+#   * num_iterations x rollouts_per_iter is the number of KEPT episodes (100 below). Episodes
+#     where the rescue fails still cost the operator a full watch. Dial rollouts_per_iter down for
+#     a pilot; keep it matched to the other arms for the paper run.
+#
+# Latency caveat: hg_pace_hz holds the loop to a fixed wall-clock rate so reaction time is not a
+# machine-speed artefact. Measured at ~270 ms/step (pi0 inference bound), the loop is SLOWER than
+# 20 Hz on its own, so the pacer will not bind -- live episodes run slower than real time. Report
+# the pace and the observed step rate alongside any latency number.
+#
+# Human-effort accounting: HG-DAgger is charged the FULL episode length (the operator monitors
+# everything), not just the expert steps -- see human_gate.human_effort_steps. The robot-gated arms
+# are charged only their expert steps. Reporting both on the same axis is the point of the plot.
+#
+# Example usage:
+# srun --gres=shard:8 --mem=48G --time=12:00:00 --pty \
+#  uv run python scripts/train_reward_dagger.py \
+#    --config-name libero_hgdagger_task1_live_config \
+#   rdagger.num_iterations=3 rdagger.rollouts_per_iter=5
+
+
+load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-12/20-06-31
+checkpoint: 50000 
+
+rdagger:
+  gate_type: hgdagger
+  hg_backend: live  # operator watches in real time and presses SPACE; 'replay' = the two-pass loop
+
+  # 'live' only -- see OperatorServer in human_gate.py. No X display is used: frames are served
+  # as MJPEG and the takeover comes back as an HTTP POST.
+  hg_port: 8420        # forward it: VS Code PORTS panel, or ssh -L 8420:localhost:8420 liryan@snoopy1
+  hg_pace_hz: 20.0     # hold the rollout to real time so reaction latency is not a machine-speed artefact
+
+  expert_type: pi0
+  pi0_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero
+  expert_dir: null
+  expert_checkpoint: null
+
+  reward_model: null
+
+  expert_n_action_steps: 5
+
+  # Identical to the Robometer and Diff-DAgger arms.
+  num_iterations: 10
+  rollouts_per_iter: 10
+  train_steps_per_iter: 2000
+  use_offline: true
+  offline_sample_ratio: 0.25
+
+  store_only_expert: true
+  reweighting: null
+
+  require_success: true
+  require_intervention: true
+
+  save_interval: 1
+  online_buffer_capacity: 200000
+  seed: 0
+
+offline_algorithm:
+  use_weighted_bc: false
+
+alg:
+  offline_alg_name: dp
+  online_alg_name: null
+
+eval:
+  eval_freq: 2000
+  eval_num_episodes: 20
+  eval_record_video: true
+  eval_on_first_step: false
+
+logging:
+  wandb_project: libero_rdagger
+  wandb_entity: liryan-usc
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "hgdagger_live_dp_task1_baseline"
+  log_level: "INFO"

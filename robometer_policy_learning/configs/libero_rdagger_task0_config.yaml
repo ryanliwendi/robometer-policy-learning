@@ -1,0 +1,72 @@
+defaults:
+  - algorithm@offline_algorithm: dp
+  - reward_model: null
+  - policy@policy: transformer
+
+debug: true  # record collection episodes + per-intervention Robometer progress plots
+
+load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-23/22-08-45  # task-0 student
+checkpoint: 50000  # ~56% success (wide headroom under pi0's 88%)
+
+# env/training/model/policy adopted from <load_dir>/.hydra (task_id=0, n_act=10). This run dir is
+# clean (single job, no collision).
+
+rdagger:
+  expert_type: pi0
+  pi0_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero
+  expert_dir: null
+  expert_checkpoint: null
+
+  reward_model: jesbu1/robometer-4b-fft-libero
+
+  # Gate: long_window = 0.9 x L_succ. Task-0 successful trajectories (demos) mean 290 steps
+  # (median 282) -> lw=261. Largest window of any task so far (longest horizon).
+  method: spearman
+  short_window: 50
+  drop_threshold: -0.9
+  long_window: 261
+  plateau_threshold: 0.1
+  min_drop_magnitude: 0.1
+  smoothing: 0.0
+  score_every: 1
+
+  expert_n_action_steps: 10
+
+  # DAgger -- winning expert-only recipe (offline demos + expert intervention segments only):
+  num_iterations: 10
+  rollouts_per_iter: 10
+  train_steps_per_iter: 2000
+  use_offline: true
+  offline_sample_ratio: 0.25
+
+  store_only_expert: true
+  reweighting: null
+  iwr_target_intv: 0.8
+
+  require_success: true
+  require_intervention: true
+
+  save_interval: 1
+  online_buffer_capacity: 200000
+  seed: 0
+
+offline_algorithm:
+  use_weighted_bc: false
+
+alg:
+  offline_alg_name: dp
+  online_alg_name: null
+
+eval:
+  eval_freq: 10000
+  eval_num_episodes: 25
+  eval_record_video: true
+  eval_on_first_step: true
+
+logging:
+  wandb_project: libero_rdagger
+  wandb_entity: liryan-usc
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "rdagger_dp_task0_expert_only"
+  log_level: "INFO"

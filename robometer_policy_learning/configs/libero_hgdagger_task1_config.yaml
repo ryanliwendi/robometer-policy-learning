@@ -1,0 +1,87 @@
+defaults:
+  - algorithm@offline_algorithm: dp  # must match the student actor type
+  - reward_model: null
+  - policy@policy: transformer
+
+debug: false
+
+# HG-DAgger BASELINE arm for task 1. Everything except the gate is held
+# identical to libero_rdagger_task1_config.yaml (same student checkpoint, same pi0 expert, same
+# one-way takeover, same expert-only training recipe), so any difference in the resulting policy is
+# attributable to the gating rule alone.
+#
+# The gate here is a PERSON. With hg_backend=replay each episode is rolled out student-solo, the
+# operator watches the recording (step index burned into every frame) and answers "intervene? y/n"
+# and at which step; the same episode is then re-run with pi0 taking over there.
+#
+# ⚠️ THIS RUN NEEDS A HUMAN AT A TERMINAL FOR ITS ENTIRE DURATION.
+#   * launch it with `srun --pty` -- it blocks on input(); a batch job dies at the first prompt
+#   * num_iterations x rollouts_per_iter is the number of KEPT episodes (100 below). Declines and
+#     failed rescues do not count toward it but still cost operator time, so the real number of
+#     videos to watch is higher -- in a 10-episode pilot it was 10 watched for 2 kept.
+#   Dial rollouts_per_iter down for a pilot; keep it matched to the other arms for the paper run.
+#
+# Human-effort accounting: HG-DAgger is charged the FULL episode length (the operator monitors
+# everything), not just the expert steps -- see human_gate.human_effort_steps. The robot-gated arms
+# are charged only their expert steps. Reporting both on the same axis is the point of the plot.
+# 
+# Example usage: 
+# srun --gres=shard:8 --mem=48G --time=12:00:00 --pty \
+#  uv run python scripts/train_reward_dagger.py \
+#    --config-name libero_hgdagger_task1_config \
+#   rdagger.num_iterations=3 rdagger.rollouts_per_iter=5
+
+
+load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-12/20-06-31
+checkpoint: 50000 
+
+rdagger:
+  gate_type: hgdagger
+  hg_backend: replay  # 'live' = real-time spacebar, needs a display; 'replay' = the two-pass loop
+
+  expert_type: pi0
+  pi0_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero
+  expert_dir: null
+  expert_checkpoint: null
+
+  reward_model: null
+
+  expert_n_action_steps: 5
+
+  # Identical to the Robometer and Diff-DAgger arms.
+  num_iterations: 10
+  rollouts_per_iter: 10
+  train_steps_per_iter: 2000
+  use_offline: true
+  offline_sample_ratio: 0.25
+
+  store_only_expert: true
+  reweighting: null
+
+  require_success: true
+  require_intervention: true
+
+  save_interval: 1
+  online_buffer_capacity: 200000
+  seed: 0
+
+offline_algorithm:
+  use_weighted_bc: false
+
+alg:
+  offline_alg_name: dp
+  online_alg_name: null
+
+eval:
+  eval_freq: 10000
+  eval_num_episodes: 25
+  eval_record_video: true
+  eval_on_first_step: true
+
+logging:
+  wandb_project: libero_rdagger
+  wandb_entity: liryan-usc
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "hgdagger_dp_task1_baseline"
+  log_level: "INFO"
