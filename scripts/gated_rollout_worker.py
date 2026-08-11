@@ -55,6 +55,19 @@ def _success_from_info(info) -> bool:
     return False
 
 
+def plot_episode_trace(gate, plot_progress: bool, stats: dict, save_path: str, title: str):
+    """Plot progress plot for any kind of gate."""
+    try:
+        if plot_progress:
+            from robometer_policy_learning.utils.robometer_gate import plot_progress_trace
+
+            plot_progress_trace(stats, save_path, title=title)
+        elif hasattr(gate, "plot_trace"):
+            gate.plot_trace(stats, save_path, title=title)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"trace plot failed for {save_path}: {e}")
+
+
 def dump_episode_stats(episodes, save_path: str, meta: dict | None = None):
     """Write per-episode score traces + success labels to JSON.
 
@@ -156,6 +169,7 @@ class GatedRolloutWorker:
         device,
         action_dim: int,
         *,
+        q_buffer=None,
         lowdim_stats: dict | None = None,
         remove_obs_keys = None,
         frame_key: str = "observation/image",
@@ -174,6 +188,10 @@ class GatedRolloutWorker:
         self.scorer = scorer
         self.gate = gate
         self.online_buffer = online_buffer
+        # ThriftyDAgger keeps a second store for Q_risk holding EVERY executed transition (robot
+        # actions included), while the BC store keeps only the supervision stream. Left as None,
+        # the two roles collapse onto `online_buffer`.
+        self.q_buffer = q_buffer
         self.device = device
         self.action_dim = int(action_dim)
         self.lowdim_stats = lowdim_stats or {}
@@ -266,7 +284,6 @@ class GatedRolloutWorker:
 
         self.scorer.reset(task=str(obs.get("prompt", "")))
         self.gate.reset()
-        self.scorer.observe(obs, self.frame_key)
 
         student_st = {"chunk": None, "pos": 0}
         expert_st = {"chunk": None, "pos": 0}
@@ -274,21 +291,58 @@ class GatedRolloutWorker:
         seg_step = 0   # step index within the expert segment
         steps, expert_steps, num_interventions = 0, 0, 0
         success, done = False, False
-        pending = []
+        pending, pending_q = [], []
         score_trace, gate_fires, gate_reasons = [], [], []
         video_frames, video_labels = [], []
         last_score = 0.0
 
         while not done:
             cur = self._prep_obs(obs)
+            self.scorer.observe(obs, self.frame_key)
+            scored_now = steps % self.score_every == 0
 
             if expert_active:
                 action = self._policy_action(self.expert, obs, expert_st, self.expert_n_action_steps)
                 mode, label = "EXPERT", INTERVENTION_LABEL
                 expert_steps += 1
+                # Keep the diagnostic trace running after takeover, but never call gate.update:
+                # the online threshold pool must hold robot-mode scores only.
+                if scored_now:
+                    last_score, _aux = self.scorer.score()
             else:
-                action = self._policy_action(self.student, obs, student_st, self.student_n_action_steps)
+                # Propose the student's action FIRST, score that exact state-action pair, and
+                # either execute it or replace it with the expert's action at the same state.
+                # Scoring after env.step would judge an action the student will not execute (it
+                # is mid-chunk) and could fire the gate on a terminal state.
+                student_action = self._policy_action(
+                    self.student, obs, student_st, self.student_n_action_steps)
+                action = student_action
                 mode, label = "STUDENT", ROLLOUT_LABEL
+
+                if scored_now:
+                    if hasattr(self.scorer, "score_action"):
+                        last_score, _aux = self.scorer.score_action(student_action)
+                    else:
+                        last_score, _aux = self.scorer.score()
+
+                if scored_now and self.gate.update(last_score):
+                    gate_fires.append(steps)
+                    gate_reasons.append(self.gate.last_trigger)  # "drop" | "plateau" | "novelty" ...
+                    num_interventions += 1
+                    expert_active = True
+                    expert_st["chunk"] = None
+                    action = self._policy_action(
+                        self.expert, obs, expert_st, self.expert_n_action_steps)
+                    mode, label = "EXPERT", INTERVENTION_LABEL
+                    expert_steps += 1
+                    # `last_cdf` is Diff-DAgger's CDF(loss); other gates leave it unset.
+                    cdf = getattr(self.gate, "last_cdf", None)
+                    logger.info(f"  [gate] fired at step {steps} (score={_fmt_score(last_score)}"
+                                f"{'' if cdf is None else f', cdf={cdf:.4f}'}, "
+                                f"trigger={self.gate.last_trigger}) -> expert takeover for the "
+                                f"rest of the episode")
+
+            score_trace.append(last_score)
 
             next_b, rew, term, trunc, info = self.env.step(
                 np.asarray(action, dtype=np.float32).reshape(1, self.action_dim)
@@ -296,45 +350,33 @@ class GatedRolloutWorker:
             next_obs = _extract0(next_b)
             terminated, truncated = bool(_scalar(term)), bool(_scalar(trunc))
             done = terminated or truncated
-            if _success_from_info(info):
+            transition_success = _success_from_info(info)
+            if transition_success:
                 success = True
 
-            self.scorer.observe(next_obs, self.frame_key)
-            scored_now = steps % self.score_every == 0
-            if scored_now:
-                last_score, _aux = self.scorer.score()
-            score_trace.append(last_score)
-
-            if not expert_active and scored_now and self.gate.update(last_score):
-                gate_fires.append(steps)
-                gate_reasons.append(self.gate.last_trigger)  # "drop" | "plateau"
-                num_interventions += 1
-                expert_active = True
-                expert_st["chunk"] = None
-                logger.info(f"  [gate] fired at step {steps} (score={_fmt_score(last_score)}, "
-                            f"trigger={self.gate.last_trigger}) -> expert takeover for the rest "
-                            f"of the episode")
-
-            # Buffer episode
+            transition = dict(
+                obs=cur,
+                action=np.asarray(action, dtype=np.float32),
+                reward=float(_scalar(rew)),
+                next_obs=self._prep_obs(next_obs),
+                done=float(terminated),
+                truncated=float(truncated),
+                episode_id=episode_id,
+                step_in_episode=steps,
+                info={"intervention": label, "is_success": bool(transition_success)},
+            )
+            # Q_risk's store takes every executed transition; the BC store takes only the
+            # selected supervision stream.
+            if store and self.q_buffer is not None:
+                pending_q.append(dict(transition, info=dict(transition["info"])))
             if store and self.online_buffer is not None and (not self.store_only_expert or label == INTERVENTION_LABEL):
                 if self.store_only_expert:
                     ep_store, step_store = f"{episode_id}_e", seg_step
                     seg_step += 1
                 else:
                     ep_store, step_store = episode_id, steps
-                pending.append(
-                    dict(
-                        obs=cur,
-                        action=np.asarray(action, dtype=np.float32),
-                        reward=float(_scalar(rew)),
-                        next_obs=self._prep_obs(next_obs),
-                        done=float(terminated),
-                        truncated=float(truncated),
-                        episode_id=ep_store,
-                        step_in_episode=step_store,
-                        info={"intervention": label},
-                    )
-                )
+                pending.append(dict(transition, episode_id=ep_store, step_in_episode=step_store,
+                                    info=dict(transition["info"])))
 
             if self.video_dir:
                 video_frames.append(next_obs[self.frame_key])
@@ -344,7 +386,7 @@ class GatedRolloutWorker:
             steps += 1
 
         # Flush the episode to the buffer if condition satisfied
-        stored = 0
+        stored, q_stored = 0, 0
         if store and self.online_buffer is not None and pending:
             n_intv = sum(1 for t in pending if t["info"]["intervention"] == INTERVENTION_LABEL)
             if (success or not require_success) and (n_intv > 0 or not require_intervention):
@@ -353,21 +395,27 @@ class GatedRolloutWorker:
                     t["info"]["episode_num_interventions"] = n_intv
                     self.online_buffer.add(**t)
                 stored = len(pending)
+        # Unconditional, unlike the BC store: the reference writes to `qbuffer` inline as it
+        # collects, and failures are exactly the negative signal Q_risk is fit on. Dropping
+        # rejected episodes here would leave the critic with successes only.
+        if store and self.q_buffer is not None and pending_q:
+            for t in pending_q:
+                t["info"]["episode_len"] = len(pending_q)
+                t["info"]["episode_num_interventions"] = num_interventions
+                self.q_buffer.add(**t)
+            q_stored = len(pending_q)
 
         if self.video_dir:
             self._write_video(video_frames, video_labels, episode_id)
-            # Save progress curve for rdagger episodes that had an expert takeover
-            if num_interventions > 0 and self.plot_progress:
-                try:
-                    from robometer_policy_learning.utils.robometer_gate import plot_progress_trace
-                    plot_progress_trace(
-                        dict(progress_trace=score_trace, gate_fires=gate_fires,
-                             gate_reasons=gate_reasons, success=success,
-                             num_interventions=num_interventions),
-                        os.path.join(self.video_dir, f"gated_{episode_id}_progress.png"),
-                        title=f"{episode_id}  success={success}  interventions={num_interventions}")
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"progress-plot failed for {episode_id}: {e}")
+            # Save the gating-signal curve for rdagger episodes that had an expert takeover
+            if num_interventions > 0:
+                plot_episode_trace(
+                    self.gate, self.plot_progress,
+                    dict(progress_trace=score_trace, gate_fires=gate_fires,
+                         gate_reasons=gate_reasons, success=success,
+                         num_interventions=num_interventions),
+                    os.path.join(self.video_dir, f"gated_{episode_id}_progress.png"),
+                    f"{episode_id}  success={success}  interventions={num_interventions}")
 
         if was_training:
             self.student.train()
@@ -378,6 +426,7 @@ class GatedRolloutWorker:
             num_interventions=num_interventions,
             success=success,
             stored=stored,
+            q_stored=q_stored,
             gate_fires=gate_fires,
             gate_reasons=gate_reasons,
             score_trace=score_trace,
@@ -455,12 +504,20 @@ def main():
                         help="'live' only: hold the rollout to this wall-clock rate so the "
                              "operator sees real time, not a fast-forward. 0 = as fast as possible")
     parser.add_argument("--dd-threshold", type=float, default=None,
-                        help="Diff-DAgger alpha-quantile threshold on the training-loss distribution")
+                        help="Diff-DAgger threshold on the diffusion loss. Omit to calibrate it "
+                             "here from the student's own training demos (the reference's "
+                             "get_stats_from_dataset), which is what the DAgger loop does.")
+    parser.add_argument("--dd-alpha", type=float, default=0.99,
+                        help="quantile of the training-loss CDF used as the threshold")
+    parser.add_argument("--dd-calib-samples", type=int, default=1024,
+                        help="datapoints scored to build that CDF")
     parser.add_argument("--dd-patience", type=int, default=1,
                         help="fire once this many of the last --dd-patience-window steps exceed the threshold")
     parser.add_argument("--dd-patience-window", type=int, default=None,
                         help="defaults to --dd-patience, which reproduces the paper's K-consecutive rule")
-    parser.add_argument("--dd-batch-multiplier", type=int, default=1)
+    parser.add_argument("--dd-batch-multiplier", type=int, default=5,
+                        help="noise samples per scored state = num_train_timesteps * this "
+                             "(the reference's 16 * 32 = 512; our T is 100, so 5 matches it)")
     parser.add_argument("--dd-num-per-batch", type=int, default=1)
     parser.add_argument("--video-dir", default="gated_videos")
     parser.add_argument("--stats-json-dir", default="gated_videos/episode_stats.json",
@@ -470,6 +527,9 @@ def main():
     
     if args.expert_type == "dp" and not args.expert_dir:
         parser.error("--expert-dir is required for --expert-type dp")
+    if args.gate_type == "diffdagger" and args.student_type != "dp":
+        parser.error("--gate-type diffdagger scores the STUDENT's own diffusion loss, so the "
+                     "student must be a diffusion policy (--student-type dp)")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -534,11 +594,42 @@ def main():
             student, remove_obs_keys=remove_obs_keys, device=device,
             batch_multiplier=args.dd_batch_multiplier, num_per_batch=args.dd_num_per_batch,
         )
-        if args.dd_threshold is None:
-            parser.error("--dd-threshold is required for --gate-type diffdagger "
-                         "(calibrate it with scripts/calibrate_diffdagger.py)")
-        gate = QuantileGate(threshold=args.dd_threshold, patience=args.dd_patience,
-                            patience_window=args.dd_patience_window)
+        gate = QuantileGate(patience=args.dd_patience, patience_window=args.dd_patience_window,
+                            alpha=args.dd_alpha)
+        if args.dd_threshold is not None:
+            gate.threshold = float(args.dd_threshold)
+        else:
+            # No explicit threshold: reproduce get_stats_from_dataset here, over the same demos
+            # the student was pretrained on. The DAgger loop recalibrates against its live
+            # training buffer instead, which additionally contains the collected corrections.
+            from robometer_policy_learning.buffers.h5_replay_buffer import H5ReplayBuffer
+            from robometer_policy_learning.buffers.samplers import ChunkedSequentialSampler, RandomSampler
+
+            chunk_size = OmegaConf.select(pre_cfg, "training.chunk_size", default=None)
+            calib_sampler = (
+                RandomSampler() if chunk_size is None else
+                ChunkedSequentialSampler(chunk_size=int(chunk_size), gamma=0.99,
+                                         obs_as_sequence=False))
+            asp = env.single_action_space
+            finite = np.all(np.isfinite(asp.low)) and np.all(np.isfinite(asp.high))
+            calib_buffer = H5ReplayBuffer(
+                h5_paths=[pre_cfg.env.h5_dataset_path],
+                sampler=calib_sampler,
+                remove_obs_keys=list(remove_obs_keys),
+                dinov2_model=dinov2_model,
+                dinov2_processor=dinov2_processor,
+                dino_embedding_keys=dino_image_keys,
+                min_action=np.asarray(asp.low, np.float32) if finite else None,
+                max_action=np.asarray(asp.high, np.float32) if finite else None,
+                normalize_lowdim_obs=bool(OmegaConf.select(
+                    pre_cfg, "training.normalize_lowdim_obs", default=False)),
+            )
+            losses = scorer.inner.calibrate_from_buffer(
+                calib_buffer, num_samples=args.dd_calib_samples)
+            info = gate.recalibrate(losses)
+            logger.info(f"Diff-DAgger calibration on {pre_cfg.env.h5_dataset_path}: "
+                        f"n={info['n']} loss mean={info['loss_mean']:.6f} "
+                        f"max={info['loss_max']:.6f}")
         logger.info(f"Diff-DAgger gate: {gate.describe()}")
     elif args.gate_type == "hgdagger":
         # A human decides when to intervene; the expert still performs the correction.
@@ -603,13 +694,13 @@ def main():
             f"interventions={stats['num_interventions']} (at steps {stats['gate_fires']}) "
             f"expert_steps={stats['expert_steps']}"
         )
-        if args.video_dir and worker.plot_progress:
-            from robometer_policy_learning.utils.robometer_gate import plot_progress_trace
-
-            plot_progress_trace(
+        if args.video_dir:
+            plot_episode_trace(
+                gate, worker.plot_progress,
                 dict(stats, progress_trace=stats["score_trace"]),
                 os.path.join(args.video_dir, f"progress_watch_{ep}.png"),
-                title=f"episode {ep}: success={stats['success']}, interventions={stats['num_interventions']}",
+                f"episode {ep}: success={stats['success']}, "
+                f"interventions={stats['num_interventions']}",
             )
         # Re-dump every episode: a 50-episode job is long, don't lose it all to a late crash.
         dump_episode_stats(
@@ -618,8 +709,10 @@ def main():
             meta=dict(
                 # `progress_trace` holds whatever signal the gate consumed; gate_type says which.
                 gate_type=args.gate_type,
-                dd_threshold=args.dd_threshold, dd_patience=args.dd_patience,
-                dd_patience_window=args.dd_patience_window,
+                dd_threshold=(gate.threshold if args.gate_type == "diffdagger" else None),
+                dd_alpha=(args.dd_alpha if args.gate_type == "diffdagger" else None),
+                dd_patience=args.dd_patience, dd_patience_window=args.dd_patience_window,
+                dd_batch_multiplier=args.dd_batch_multiplier,
                 reward_model=(args.reward_model if args.gate_type == "robometer" else None),
                 student_dir=args.student_dir, student_checkpoint=args.student_checkpoint,
                 expert_type=args.expert_type,

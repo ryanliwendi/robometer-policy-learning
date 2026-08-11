@@ -129,13 +129,21 @@ def main(cfg: DictConfig):
     dd_alpha = float(OmegaConf.select(cfg, "rdagger.dd_alpha", default=0.99))
     dd_patience = int(OmegaConf.select(cfg, "rdagger.dd_patience", default=1))
     dd_patience_window = OmegaConf.select(cfg, "rdagger.dd_patience_window", default=None)
-    dd_calib_samples = int(OmegaConf.select(cfg, "rdagger.dd_calib_samples", default=256))
+    dd_calib_samples = int(OmegaConf.select(cfg, "rdagger.dd_calib_samples", default=1024))
+    # Noise samples per scored state = num_train_timesteps * batch_multiplier * num_per_batch.
+    # The reference runs 16 * 32 * 1 = 512; our scheduler has 100 train timesteps, so
+    # batch_multiplier=5 matches its effective sample count.
+    dd_batch_multiplier = int(OmegaConf.select(cfg, "rdagger.dd_batch_multiplier", default=5))
+    dd_num_per_batch = int(OmegaConf.select(cfg, "rdagger.dd_num_per_batch", default=1))
     # ThriftyDAgger: alpha_h is the target intervention rate; thresholds are its (1-alpha_h) quantiles.
     thrifty_alpha_h = float(OmegaConf.select(cfg, "rdagger.thrifty_alpha_h", default=0.01))
     thrifty_num_nets = int(OmegaConf.select(cfg, "rdagger.thrifty_num_nets", default=5))
     thrifty_train_steps = int(OmegaConf.select(cfg, "rdagger.thrifty_train_steps", default=200))
     thrifty_lr = float(OmegaConf.select(cfg, "rdagger.thrifty_lr", default=1e-3))
     thrifty_gamma = float(OmegaConf.select(cfg, "rdagger.thrifty_gamma", default=0.9999))
+    # The reference gives Q_risk 5x the BC ensemble's gradient steps (grad_steps * 5 per epoch).
+    thrifty_q_steps_multiplier = int(OmegaConf.select(
+        cfg, "rdagger.thrifty_q_steps_multiplier", default=5))
     # HG-DAgger: 'live' needs a display; 'replay' asks the operator after each solo rollout.
     hg_backend = str(OmegaConf.select(cfg, "rdagger.hg_backend", default="live"))
     gate_kwargs = dict(
@@ -255,19 +263,24 @@ def main(cfg: DictConfig):
     # ---- Scorer + gate + gated worker ----
     dd_scorer = None
     refresh_gate = None
+    q_online_buffer = None   # ThriftyDAgger only: Q_risk's own replay of executed transitions
     if gate_type == "diffdagger":
         # Diff-DAgger baseline: the gating signal is the student's own diffusion loss. No
         # Robometer is loaded. The threshold is set below from the training-data loss
         # distribution, and recalibrated after every retrain (see the iteration loop).
-        from robometer_policy_learning.utils.baseline_gates import (
-            DiffDaggerScorer, QuantileGate, quantile_threshold)
+        from robometer_policy_learning.utils.baseline_gates import DiffDaggerScorer, QuantileGate
 
         remove_keys = list(getattr(algo.actor, "remove_obs_keys", None)
                            or OmegaConf.select(cfg, "env.extra_keys_to_drop", default=[]) or [])
-        scorer = DiffDaggerScorer(algo.actor, remove_obs_keys=remove_keys, device=device)
+        # algo.actor is the EMA network. The reference scores with EMA weights too: its
+        # DiffDAggerTrainingEndCallback copies the EMA into the live model before recalibrating,
+        # and normalize_obs/get_naction both run off `ema_model`.
+        scorer = DiffDaggerScorer(algo.actor, remove_obs_keys=remove_keys, device=device,
+                                  batch_multiplier=dd_batch_multiplier,
+                                  num_per_batch=dd_num_per_batch)
         dd_scorer = scorer
-        gate = QuantileGate(threshold=float("inf"), patience=dd_patience,
-                            patience_window=dd_patience_window)
+        gate = QuantileGate(patience=dd_patience, patience_window=dd_patience_window,
+                            alpha=dd_alpha)
 
         def _refresh_gate(tag: str):
             """alpha-quantile of the diffusion loss over the current training distribution."""
@@ -275,11 +288,11 @@ def main(cfg: DictConfig):
             if len(losses) == 0:
                 logger.warning(f"[diffdagger:{tag}] no calibration samples; threshold unchanged")
                 return None
-            thr = quantile_threshold(losses, dd_alpha)
-            gate.threshold = thr
-            logger.info(f"[diffdagger:{tag}] threshold={thr:.6f} (alpha={dd_alpha}, "
-                        f"n={len(losses)}, loss mean={losses.mean():.6f} max={losses.max():.6f})")
-            return dict(threshold=thr, loss_mean=float(losses.mean()))
+            info = gate.recalibrate(losses)
+            logger.info(f"[diffdagger:{tag}] threshold={info['threshold']:.6f} (alpha={dd_alpha}, "
+                        f"n={info['n']}, loss mean={info['loss_mean']:.6f} "
+                        f"max={info['loss_max']:.6f})")
+            return info
 
         refresh_gate = _refresh_gate
 
@@ -301,7 +314,18 @@ def main(cfg: DictConfig):
         q_opt = torch.optim.Adam(
             list(ac.q1.parameters()) + list(ac.q2.parameters()), lr=thrifty_lr)
 
-        scorer = ThriftyScorer(algo, ac, remove_obs_keys=remove_keys, device=device)
+        # Q online buffer stores the transitions of additional rollouts after each iteration to train qrisk
+        q_online_buffer = ReplayBuffer(
+            capacity=int(OmegaConf.select(cfg, "rdagger.online_buffer_capacity", default=200000)),
+            remove_obs_keys=list(remove_obs_keys),
+            sampler=sampler,
+            min_action=action_min,
+            max_action=action_max,
+        )
+        q_stores = [offline_buffer, q_online_buffer] if use_offline else [q_online_buffer]
+
+        scorer = ThriftyScorer(algo, ac, remove_obs_keys=remove_keys, lowdim_stats=lowdim_stats,
+                               action_min=action_min, action_max=action_max, device=device)
         gate = ThriftyGate()
 
         _thrifty_iter = {"n": 0}
@@ -314,19 +338,25 @@ def main(cfg: DictConfig):
                 ens_opt_fn=lambda params: torch.optim.Adam(params, lr=thrifty_lr),
                 q_opt=q_opt, grad_steps=steps, gamma=thrifty_gamma,
                 num_nets=thrifty_num_nets, feat_dim=feat_dim, act_dim=action_dim, device=device,
-                seed=collect_seed + 1000 * it_n)
+                seed=collect_seed + 1000 * it_n, q_buffer=q_stores,
+                q_steps_multiplier=thrifty_q_steps_multiplier)  # More grad steps training q than policies
             _thrifty_iter["n"] = it_n + 1
             nov, saf = collect_thrifty_scores(algo, ac, device=device)
             if len(nov) == 0:
                 logger.warning(f"[thrifty:{tag}] no calibration samples; thresholds unchanged")
                 return None
-            gate.recalibrate(nov, saf, thrifty_alpha_h)
+            # Without a goal-reaching transition the critic is fit entirely to zero targets, so
+            # its quantile is a noise threshold that would fire at exactly alpha_h. Pin beta_h at
+            # -inf instead and gate on novelty alone until positives exist.
+            gate.recalibrate(nov, saf, thrifty_alpha_h, risk_enabled=losses["n_positive"] > 0)
             if losses["n_positive"] == 0:
-                logger.warning(f"[thrifty:{tag}] buffer holds NO goal-reaching transitions; "
-                               f"the risk gate is inactive this iteration")
-            logger.info(f"[thrifty:{tag}] steps={steps} n_trans={losses['n_transitions']} "
+                logger.warning(f"[thrifty:{tag}] Q replay holds NO goal-reaching transitions; "
+                               f"the risk gate is disabled this iteration (beta_h=-inf)")
+            logger.info(f"[thrifty:{tag}] steps={steps} n_bc={losses['n_bc_transitions']} "
+                        f"n_q={losses['n_transitions']} "
                         f"ens_loss={losses['ensemble_loss']:.5f} "
-                        f"q_loss={losses['qrisk_loss']:.5f} n_pos={losses['n_positive']} | "
+                        f"q_loss={losses['qrisk_loss']:.5f} n_pos={losses['n_positive']} "
+                        f"dp_targets={losses['n_dp_target_samples']} | "
                         f"delta_h={gate.delta_h:.5f} beta_h={gate.beta_h:.5f} "
                         f"(novelty med={np.median(nov):.5f}, safety med={np.median(saf):.5f})")
             return dict(ensemble_loss=losses["ensemble_loss"], qrisk_loss=losses["qrisk_loss"],
@@ -363,6 +393,7 @@ def main(cfg: DictConfig):
         scorer=scorer,
         gate=gate,
         online_buffer=online_buffer,
+        q_buffer=q_online_buffer,
         device=device,
         action_dim=action_dim,
         lowdim_stats=lowdim_stats,
@@ -450,6 +481,7 @@ def main(cfg: DictConfig):
                     "episodes_attempted": attempt,
                     "episodes_declined": declined,
                     "online_buffer_size": len(online_buffer),
+                    "q_buffer_size": len(q_online_buffer) if q_online_buffer is not None else 0,
                     "iteration": it + 1,
                 },
                 step=algo.step_counter,
