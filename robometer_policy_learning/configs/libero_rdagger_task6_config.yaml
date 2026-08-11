@@ -1,0 +1,75 @@
+defaults:
+  - algorithm@offline_algorithm: dp
+  - reward_model: null
+  - policy@policy: transformer
+
+debug: true  # record collection episodes + per-intervention Robometer progress plots
+
+load_dir: /scr/liryan/robometer_policy_learning/outputs/task6_student_clean  # CLEAN task-6 dir
+checkpoint: 50000
+
+# NOTE: env/training/model/policy are adopted from <load_dir>/.hydra/config.yaml at startup.
+# The clean dir was rebuilt because the original run (2026-07-21/18-50-52) collided with the
+# offline-control job and its .hydra config got overwritten with task_id=1. task_id=6, n_act=10.
+
+rdagger:
+  expert_type: pi0
+  pi0_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero
+  expert_dir: null
+  expert_checkpoint: null
+
+  reward_model: jesbu1/robometer-4b-fft-libero
+
+  # Gate: long_window = 0.9 x L_succ. Task-6 successful trajectories (demos) average 250 steps
+  # (median 246, range 203-342), so lw=225. (~200 steps / lw180 would be 0.72*L_succ, in the
+  # region where the sweep showed FPR starting to climb -- 225 is the tuned value.)
+  method: spearman
+  short_window: 50
+  drop_threshold: -0.9
+  long_window: 225
+  plateau_threshold: 0.1
+  min_drop_magnitude: 0.1
+  smoothing: 0.0
+  score_every: 1
+
+  expert_n_action_steps: 10
+
+  # DAgger -- the WINNING expert-only recipe from task 1 (59% -> ~90%):
+  # offline demos + expert intervention segments only, no student rollouts.
+  num_iterations: 10
+  rollouts_per_iter: 10
+  train_steps_per_iter: 2000
+  use_offline: true
+  offline_sample_ratio: 0.25
+
+  store_only_expert: true     # drop student-rollout transitions entirely
+  reweighting: null           # interventions carry uniform weight 1
+  iwr_target_intv: 0.8        # unused when reweighting=null
+
+  require_success: true
+  require_intervention: true  # keep only successful episodes that contain a takeover
+
+  save_interval: 1
+  online_buffer_capacity: 200000
+  seed: 0
+
+offline_algorithm:
+  use_weighted_bc: false
+
+alg:
+  offline_alg_name: dp
+  online_alg_name: null
+
+eval:
+  eval_freq: 10000
+  eval_num_episodes: 25
+  eval_record_video: true
+  eval_on_first_step: true   # measure the loaded task-6 student in-harness before training
+
+logging:
+  wandb_project: libero_rdagger
+  wandb_entity: liryan-usc
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "rdagger_dp_task6_expert_only"
+  log_level: "INFO"

@@ -1,0 +1,86 @@
+defaults:
+  - algorithm@offline_algorithm: dp  # must match the student actor type
+  - reward_model: null
+  - policy@policy: transformer
+
+debug: false
+
+load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-14/21-35-36  # task-8 DP student
+checkpoint: 5000
+
+# NOTE: do NOT add env/training/model/policy sections here -- train_reward_dagger.py overwrites
+# all four wholesale from <load_dir>/.hydra/config.yaml at startup, so anything written here is
+# silently ignored (and this run's own .hydra snapshot will NOT show the runtime values).
+# This student: task_id=8 (both moka pots), chunk_size=20, n_action_steps=10.
+
+rdagger:
+  expert_type: pi0
+  pi0_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero
+  expert_dir: null        # unused when expert_type=pi0
+  expert_checkpoint: null
+
+  reward_model: jesbu1/robometer-4b-fft-libero  # LIBERO-finetuned ckpt
+
+  # Gating -- task-1 tuned windows (spearman sw50/lw250), carried over UNVALIDATED: task 8 is
+  # also two-stage (pot 1 -> pot 2), and the task-1 retune's recorded prediction is that two-stage
+  # tasks need windows longer than the inter-stage transit. The t8_baseline job collects the traces
+  # to test this offline; if the replay shows bad transfer, retune and restart this run.
+  method: spearman
+  short_window: 50
+  drop_threshold: -0.9
+  long_window: 250
+  plateau_threshold: 0.1
+  min_drop_magnitude: 0.1
+  smoothing: 0.0
+  score_every: 1
+
+  expert_n_action_steps: 10
+
+  # DAgger
+  num_iterations: 20
+  rollouts_per_iter: 5
+  train_steps_per_iter: 2000
+  # NO offline mixing: train purely on the gated online buffer. require_success=true means every
+  # stored episode is a full successful trajectory anyway, so the online buffer self-anchors the
+  # student's competence while IWR splits the gradient 50/50 between expert corrections and the
+  # student's own successes -- the demos' anti-forgetting role is covered without spending gradient
+  # re-fitting 49 demos the student already memorized. (use_offline=false skips the H5 load
+  # entirely; equivalent to offline_sample_ratio=0.0 but faster to start.)
+  use_offline: false
+  offline_sample_ratio: null
+
+  store_only_expert: false
+  reweighting: iwr
+
+  require_success: true
+  require_intervention: false  # keep clean student successes too; IWR handles the balance
+
+  save_interval: 1
+  online_buffer_capacity: 200000
+  seed: 0
+
+offline_algorithm:
+  use_weighted_bc: false
+
+# Algorithm used to continue training the student
+alg:
+  offline_alg_name: dp
+  online_alg_name: null
+
+# Eval
+eval:
+  eval_freq: 10000
+  eval_num_episodes: 10   # per-iteration curve only (SE ~16%); judge via the paired 50-seed
+                          # worker eval of the final checkpoint against gated_videos/t8_baseline
+  eval_record_video: true
+  eval_on_first_step: true  # measure the loaded ckpt-5000 student IN THIS harness before training
+                            # (the missing-baseline lesson from task 1)
+
+# Logging
+logging:
+  wandb_project: libero_rdagger
+  wandb_entity: liryan-usc
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "rdagger_dp_task8_pi0_iwr_progress"
+  log_level: "INFO"

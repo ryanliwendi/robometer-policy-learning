@@ -1,0 +1,85 @@
+defaults:
+  - algorithm@offline_algorithm: dp  # must match the student actor type
+  - reward_model: null
+  - policy@policy: transformer
+
+debug: false
+
+# Diff-DAgger BASELINE arm for task 6. Everything except the gate is held identical to
+# libero_rdagger_task6_config.yaml (same student checkpoint, same pi0 expert, same takeover exit,
+# same expert-only training recipe), so any difference in the resulting policy is attributable to
+# the gating rule alone.
+#
+# The gate here is the student's OWN diffusion loss at its own action, thresholded at the
+# alpha-quantile of the training-data loss distribution and recalibrated after every retrain.
+# No Robometer is loaded.  Paper: arXiv:2410.14868, Algorithm 1 + Table IV.
+
+load_dir: /scr/liryan/robometer_policy_learning/outputs/task6_student_clean  # CLEAN task-6 dir
+checkpoint: 50000
+
+rdagger:
+  gate_type: diffdagger
+
+  expert_type: pi0
+  pi0_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero
+  expert_dir: null
+  expert_checkpoint: null
+
+  reward_model: null  # unused: Diff-DAgger gates on the student, not on Robometer
+
+  # Diff-DAgger gate. alpha is the quantile of the training-loss CDF; patience/patience_window
+  # implement the released code's M-of-N rule (equal values = the paper's K-consecutive rule).
+  # alpha 0.99 and K 2 are the paper's Table IV values.
+  dd_alpha: 0.99
+  dd_patience: 2
+  dd_patience_window: 2
+  # Datapoints scored to build the training-loss CDF each recalibration. The reference sweeps its
+  # whole dataset 16x; 2048 is where the 0.99-quantile stops moving between refits here.
+  dd_calib_samples: 2048
+  # Noise samples per scored state = num_train_timesteps (100) * batch_multiplier * num_per_batch.
+  # The reference uses 16 * 32 * 1 = 512 (Table IV, N_b), so 5 * 100 matches it.
+  dd_batch_multiplier: 5
+  dd_num_per_batch: 1
+
+  # Expert completes the episode, per Diff-DAgger's protocol (and our winning recipe).
+  # 10, matching the rdagger task-6 arm.
+  expert_n_action_steps: 10
+
+  # Identical to the Robometer arm.
+  num_iterations: 5
+  rollouts_per_iter: 10
+  train_steps_per_iter: 2000
+  use_offline: true
+  offline_sample_ratio: 0.25
+
+  store_only_expert: true
+  reweighting: null
+  iwr_target_intv: 0.8
+
+  require_success: true
+  require_intervention: true
+
+  save_interval: 1
+  online_buffer_capacity: 200000
+  seed: 0
+
+offline_algorithm:
+  use_weighted_bc: false
+
+alg:
+  offline_alg_name: dp
+  online_alg_name: null
+
+eval:
+  eval_freq: 10000
+  eval_num_episodes: 25
+  eval_record_video: true
+  eval_on_first_step: true
+
+logging:
+  wandb_project: libero_rdagger
+  wandb_entity: liryan-usc
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "diffdagger_dp_task6_baseline"
+  log_level: "INFO"

@@ -1,0 +1,74 @@
+defaults:
+  - algorithm@offline_algorithm: dp  # must match the student actor type
+  - reward_model: null
+  - policy@policy: transformer
+
+debug: false
+
+load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-15/04-14-16  # task-2 DP student
+checkpoint: 5000  # ~76% success (eval #10; ckpt 1500/~64% was never saved)
+
+# NOTE: do NOT add env/training/model/policy sections here -- train_reward_dagger.py overwrites
+# all four wholesale from <load_dir>/.hydra/config.yaml at startup, so anything written here is
+# silently ignored. This student: task_id=2 (stove + moka pot), chunk_size=20, n_action_steps=10.
+
+rdagger:
+  expert_type: pi0
+  pi0_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero
+  expert_dir: null
+  expert_checkpoint: null
+
+  reward_model: jesbu1/robometer-4b-fft-libero
+
+  # Gate: validated on t2_baseline traces (100 eps) -- lw250 gives 10/10 recall, 0/90 false fires
+  # on this exact task. (Same config as task 1; lw350 is the cross-task universal but lw250 fires
+  # ~60 steps earlier and is zero-FP on task 2 anyway.)
+  method: spearman
+  short_window: 50
+  drop_threshold: -0.9
+  long_window: 250
+  plateau_threshold: 0.1
+  min_drop_magnitude: 0.1
+  smoothing: 0.0
+  score_every: 1
+
+  expert_n_action_steps: 10
+
+  # DAgger
+  num_iterations: 10
+  rollouts_per_iter: 5
+  train_steps_per_iter: 2000
+  use_offline: true
+  offline_sample_ratio: 0.25
+
+  store_only_expert: false
+  reweighting: iwr
+  iwr_target_intv: 0.8
+
+  require_success: true
+  require_intervention: false
+
+  save_interval: 1
+  online_buffer_capacity: 200000
+  seed: 0
+
+offline_algorithm:
+  use_weighted_bc: false
+
+alg:
+  offline_alg_name: dp
+  online_alg_name: null
+
+eval:
+  eval_freq: 10000
+  eval_num_episodes: 10
+  eval_record_video: true
+  eval_on_first_step: true  # measure the loaded ckpt-5000 student in-harness before training
+
+logging:
+  wandb_project: libero_rdagger
+  wandb_entity: liryan-usc
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "rdagger_dp_task2_pi0_iwr_takeover"
+  log_level: "INFO"

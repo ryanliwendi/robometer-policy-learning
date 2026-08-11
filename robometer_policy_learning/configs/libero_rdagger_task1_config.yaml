@@ -24,35 +24,37 @@ rdagger:
   plateau_threshold: 0.1
   min_drop_magnitude: 0.1
   smoothing: 0.0
-  warmup_steps: 0
   score_every: 1
 
-  expert_exit_mode: progress
-  expert_k: 40             # 'fixed' only
-  expert_n_action_steps: 10
-  recovery_delta: 0.2      # 'progress' only
-  min_expert_steps: 10
-  max_expert_steps: 80
+  expert_n_action_steps: 5
 
   # DAgger
   num_iterations: 10
-  rollouts_per_iter: 5
+  rollouts_per_iter: 10
   train_steps_per_iter: 2000
   use_offline: true         # mixing with the original demos
   offline_sample_ratio: 0.25
 
-  store_only_expert: false 
-  reweighting: iwr  
+  # Expert-only training recipe, held IDENTICAL across all four task-1 arms (rdagger, diffdagger,
+  # thriftydagger, hgdagger) so a policy difference is attributable to the GATE alone. Only the
+  # gate-selected corrections train the policy; no clean student successes, no IWR reweighting.
+  # (Was store_only_expert=false + reweighting=iwr; that made rdagger the odd one out and made
+  # cross-arm comparison contestable. HG-DAgger cannot keep clean successes at all -- an episode
+  # is kept only when the human intervened AND the rescue succeeded -- so expert-only is the one
+  # recipe all four arms can actually run.)
+  store_only_expert: true
+  reweighting: null
+  iwr_target_intv: 0.8      # inert while reweighting=null
 
   require_success: true
-  require_intervention: false  # keep clean student successes too; IWR handles the balance
+  require_intervention: true
 
   save_interval: 1
   online_buffer_capacity: 200000
   seed: 0
 
 offline_algorithm:
-  use_weighted_bc: true
+  use_weighted_bc: false
 
 # Algorithm used to continue training the student
 alg:
@@ -64,7 +66,7 @@ eval:
   eval_freq: 10000
   eval_num_episodes: 25
   eval_record_video: true
-  eval_on_first_step: false
+  eval_on_first_step: true
 
 # Logging
 logging:
@@ -72,5 +74,5 @@ logging:
   wandb_entity: liryan-usc
   wandb_offline: false
   wandb_log_dir_base: logs/wandb
-  wandb_name: "rdagger_dp_task1_pi0_iwr_takeover"
+  wandb_name: "rdagger_dp_task1_pi0_expertonly_takeover"
   log_level: "INFO"

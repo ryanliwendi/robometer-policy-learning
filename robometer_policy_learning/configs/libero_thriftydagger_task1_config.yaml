@@ -15,8 +15,8 @@ debug: false
 # (1 - P(reach goal)). Both are retrained and both thresholds re-derived every iteration.
 # No Robometer is loaded.
 
-load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-23/22-08-45
-checkpoint: 50000
+load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-12/20-06-31
+checkpoint: 50000  # same 64%-success student the Robometer arm starts from
 
 rdagger:
   gate_type: thrifty
@@ -86,5 +86,5 @@ logging:
   wandb_entity: liryan-usc
   wandb_offline: false
   wandb_log_dir_base: logs/wandb
-  wandb_name: "thriftydagger_dp_task0_baseline"
+  wandb_name: "thriftydagger_dp_task1_baseline"
   log_level: "INFO"

@@ -25,16 +25,10 @@ rdagger:
   smoothing: 0.0  # EMA weight on history, [0, 1); 0 = off. Damps the transient dips that
                   # healthy rollouts show -- within a window, successes dip up to ~0.3 too,
                   # so depth alone does not separate; persistence does.
-  warmup_steps: 15
   score_every: 1
 
   # Expert
-  expert_k: 40  # steps the expert keeps control after a gate fire ('fixed' mode)
   expert_n_action_steps: 10
-  expert_exit_mode: fixed  # fixed | takeover | progress | gate
-  recovery_delta: 0.2      # 'progress': rise above takeover progress to hand back
-  min_expert_steps: 5      # 'progress'/'gate': min hold before condition handback
-  max_expert_steps: 80     # 'progress'/'gate': hard cap (stuck-expert guardrail)
 
   # DAgger
   num_iterations: 10
