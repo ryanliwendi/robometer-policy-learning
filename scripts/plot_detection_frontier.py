@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""§2.2 figure: balanced accuracy vs average detection time, per task, per detector family.
+
+Same axes as the SAFE failure-detection plots. Each family's threshold grid is reduced to its
+Pareto front and subsampled to ~12 points, so a curve is "the best this family can do", not a
+tangle of every config. The dashed vertical rule marks the mean successful-episode length: to its
+right, an episode running that long is already anomalous and a stopwatch starts to work, so only
+the part of a curve LEFT of the rule is detection rather than waiting. Under `--truncate min` the
+rule collapses onto the horizon by construction and is omitted.
+
+Two data sources, selected by `--data-dir`:
+
+  outputs/gate_frontier_n200   `gate_frontier.py` over the n=200 DP corpora. RewardGate only --
+                               those corpora carry no baseline signals. The default.
+  outputs/thrifty_frontier     `thrifty_alpha_frontier.py` over the `sigq_*` traces, which hold
+                               RewardGate's progress AND ThriftyDAgger's novelty / Q-risk on the
+                               SAME rollouts. Smaller (n~50) but it is the only source where the
+                               Thrifty curve can honestly be drawn in the same axes.
+
+Usage:
+    uv run python scripts/plot_detection_frontier.py
+    uv run python scripts/plot_detection_frontier.py --data-dir outputs/thrifty_frontier \
+        --panels sigq_t0:"Task 0" sigq_t1:"Task 1" --out detection_frontier_thrifty.png
+"""
+
+import argparse
+import json
+import os
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+
+DEFAULT_PANELS = ["t1_dp:Task 1", "t0_dp:Task 0", "t5_dp:Task 5", "t8_dp:Task 8"]
+NPTS = 12
+
+# categorical slots 1-3 (all-pairs validated) for the three gate variants; a warm 4th for the
+# ThriftyDAgger arm; neutrals for the trivial baselines, which should read as background.
+STYLE = {
+    "gate":         dict(label="Ours: drop + plateau", color="#2a78d6", lw=2.6, ls="-",
+                         marker="o", ms=6.5, z=6, alpha=1.0),
+    "drop_only":    dict(label="Drop only (ablation)", color="#eb6834", lw=1.9, ls="--",
+                         marker="s", ms=5.0, z=5, alpha=0.95),
+    "plateau_only": dict(label="Plateau only (ablation)", color="#1baf7a", lw=1.9, ls="--",
+                         marker="^", ms=5.5, z=5, alpha=0.95),
+    "thrifty":      dict(label="ThriftyDAgger (novelty + Q-risk)", color="#9b4dd6", lw=2.2,
+                         ls="-", marker="P", ms=6.0, z=6, alpha=1.0),
+    "thrifty_nov":  dict(label="Thrifty novelty only (ablation)", color="#c48ae8", lw=1.7,
+                         ls="--", marker="X", ms=5.5, z=5, alpha=0.95),
+    "thrifty_risk": dict(label="Thrifty Q-risk only (ablation)", color="#d6b3ee", lw=1.5,
+                         ls=":", marker="*", ms=6.5, z=4, alpha=0.95),
+    "absolute":     dict(label="Absolute threshold", color="#8a8985", lw=1.5, ls="-",
+                         marker="D", ms=4.0, z=3, alpha=0.9),
+    "timeout":      dict(label="Timeout / periodic", color="#52514e", lw=1.5, ls=":",
+                         marker="v", ms=4.5, z=3, alpha=0.9),
+}
+ORDER = ["gate", "drop_only", "plateau_only", "thrifty", "thrifty_nov", "thrifty_risk",
+         "absolute", "timeout"]
+INK, INK2, GRID = "#0b0b0b", "#52514e", "#e3e2df"
+
+# `thrifty_alpha_frontier.py` rows carry (method, family, variant); map them onto plot families.
+# The variant is the DEPLOYED ensemble budget (`thrifty_train_steps: 200` in the arm configs) --
+# not the best of the three, which would be a per-task choice made on the eval data.
+THRIFTY_FAMILY = {"union": "thrifty", "novelty": "thrifty_nov", "risk": "thrifty_risk"}
+
+
+def select(rows, fam, protocol, variant):
+    """Rows belonging to one plot family, under one evaluation protocol."""
+    out = []
+    for r in rows:
+        if r.get("protocol", "insample") != protocol:
+            continue
+        if r.get("method") == "thrifty":
+            if THRIFTY_FAMILY.get(r["family"]) == fam and r.get("variant") == variant:
+                out.append(r)
+        elif r["family"] == fam:
+            out.append(r)
+    return out
+
+
+def front(rows):
+    pts = [(r["balacc"], r["avg_tdet"]) for r in rows
+           if np.isfinite(r.get("balacc", np.nan))]
+    pts.sort(key=lambda p: (p[1], -p[0]))
+    out, best = [], -np.inf
+    for b, t in pts:
+        if b > best + 1e-12:
+            best = b
+            out.append((b, t))
+    return out
+
+
+def thin(pts, n=NPTS):
+    """Keep the endpoints, evenly sample the middle."""
+    if len(pts) <= n:
+        return pts
+    idx = sorted(set(np.linspace(0, len(pts) - 1, n).round().astype(int)))
+    return [pts[i] for i in idx]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data-dir", default=os.environ.get("GATE_FRONT_DIR",
+                                                         "outputs/gate_frontier_n200"))
+    ap.add_argument("--panels", nargs="+", default=DEFAULT_PANELS,
+                    help='"tag:Title" per panel, in reading order')
+    ap.add_argument("--protocol", choices=["insample", "cv"], default="insample",
+                    help="insample matches the RewardGate-only figure; cv reads the "
+                         "cross-validated rows `thrifty_alpha_frontier.py` also writes")
+    ap.add_argument("--thrifty-variant", default="s200",
+                    help="ensemble training budget to plot; s200 is what the arm configs deploy")
+    ap.add_argument("--out", default="detection_frontier.png")
+    args = ap.parse_args()
+
+    panels = [(p.split(":", 1)[0], p.split(":", 1)[1]) for p in args.panels]
+    ncol = 2 if len(panels) > 1 else 1
+    nrow = int(np.ceil(len(panels) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.6 * ncol, 3.8 * nrow), squeeze=False)
+    drawn = set()
+
+    for ax, (tag, title) in zip(axes.ravel(), panels):
+        blob = json.load(open(os.path.join(args.data_dir, f"{tag}.json")))
+        rows, H = blob["rows"], blob["horizon"]
+        nS, nF = blob["n_success"], blob["n_failure"]
+
+        # Only meaningful when episode length still carries class information.
+        x_succ = blob["l_succ"] / H
+        if x_succ < 0.98:
+            drawn.add("_lsucc")
+            ax.axvline(x_succ, color="#4a3aa7", lw=1.5, ls=(0, (5, 4)), zorder=2, alpha=0.85)
+            ax.annotate("mean success\nlength", (x_succ, 0.515), textcoords="offset points",
+                        xytext=(5, 0), ha="left", va="bottom", fontsize=7.8, color="#4a3aa7")
+
+        for fam in ORDER:
+            sub = select(rows, fam, args.protocol, args.thrifty_variant)
+            if not sub and fam in ("absolute", "timeout"):
+                sub = select(rows, fam, "insample", args.thrifty_variant)   # never cross-validated
+            pts = thin(front(sub))
+            if not pts:
+                continue
+            drawn.add(fam)
+            s = STYLE[fam]
+            ax.plot([p[1] for p in pts], [p[0] for p in pts], color=s["color"], lw=s["lw"],
+                    ls=s["ls"], marker=s["marker"], ms=s["ms"], alpha=s["alpha"],
+                    zorder=s["z"], mec="white", mew=0.9, clip_on=True)
+
+        ax.set_title(f"{title}   ({nS} success / {nF} failure)", fontsize=11.5, color=INK,
+                     loc="left", pad=8)
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.48, 1.03)
+        ax.grid(True, color=GRID, lw=0.8)
+        ax.set_axisbelow(True)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        for sp in ("left", "bottom"):
+            ax.spines[sp].set_color(GRID)
+        ax.tick_params(colors=INK2, labelsize=9)
+
+    for ax in axes.ravel()[len(panels):]:
+        ax.set_visible(False)
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Balanced accuracy", fontsize=10, color=INK2)
+    for ax in axes[nrow - 1, :]:
+        ax.set_xlabel("Average detection time (normalized)", fontsize=10, color=INK2)
+
+    handles = [plt.Line2D([], [], color=STYLE[f]["color"], lw=STYLE[f]["lw"], ls=STYLE[f]["ls"],
+                          marker=STYLE[f]["marker"], ms=STYLE[f]["ms"], mec="white", mew=0.9,
+                          label=STYLE[f]["label"]) for f in ORDER if f in drawn]
+    if "_lsucc" in drawn:
+        handles.append(plt.Line2D([], [], color="#4a3aa7", lw=1.5, ls=(0, (5, 4)),
+                                  label="Mean successful-episode length"))
+    fig.legend(handles=handles, loc="lower center", ncol=3, frameon=False, fontsize=9.5,
+               bbox_to_anchor=(0.5, -0.005), labelcolor=INK2, handlelength=2.6,
+               columnspacing=2.0)
+    fig.suptitle("Failure detection: earlier is better at equal accuracy",
+                 fontsize=13.5, color=INK, x=0.008, ha="left", y=0.995)
+    fig.tight_layout(rect=(0, 0.02 + 0.032 * len(handles) / ncol, 1, 0.96))
+    out = args.out if os.path.isabs(args.out) else os.path.join(args.data_dir, args.out)
+    fig.savefig(out, dpi=200, facecolor="white", bbox_inches="tight")
+    print(f"-> {out}")
+
+
+if __name__ == "__main__":
+    main()
