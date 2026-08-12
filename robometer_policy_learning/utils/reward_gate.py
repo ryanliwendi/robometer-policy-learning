@@ -1,9 +1,11 @@
-"""Robot-gated intervention trigger: fires on a sharp progress drop or a long plateau
-in the Robometer progress signal, for reward-DAgger."""
+"""The Reward DAgger intervention gate."""
 
 import math
+import sys
 from collections import deque
+from typing import List, Optional
 
+import numpy as np
 from scipy.stats import spearmanr
 from scipy.stats import pearsonr
 
@@ -27,8 +29,7 @@ def _compute_pearson(values) -> float:
 
 
 class RewardGate:
-    """Consumes the causal progress series (one value per step) and decides when the
-    expert should take over. Stateful; call reset() after an intervention."""
+    """Takes a scalar progress and decides when the expert should take over,"""
 
     def __init__(self,
         short_window=5,
@@ -87,8 +88,6 @@ class RewardGate:
                 should_plateau = False
 
         fired = should_drop or should_plateau
-        # Record which trigger fired (drop takes priority when both fire -- it's the sharper,
-        # short-window signal). Read by callers after update() returns True.
         self.last_trigger = ("drop" if should_drop else "plateau") if fired else None
         return fired
 
@@ -115,7 +114,7 @@ class RewardGate:
         return corr < self.plateau_threshold
 
     def _check_drop_naive(self) -> bool:
-        """Fire if progress just dropped sharply from a recent peak."""
+        """Fire if progress dropped sharply from a recent peak."""
         recent = list(self.history)[-self.short_window:]
         peak = max(recent)
         current = recent[-1]
@@ -134,33 +133,86 @@ class RewardGate:
         return fired
     
     def reset(self):
-        """Call after an intervention to clear history (don't re-fire on old data)"""
+        """Call after an intervention to clear history."""
         self.history.clear()
         self._ema = None
 
+    def plot_trace(self, stats, save_path: str, title: Optional[str] = None):
+        plot_progress_trace(stats, save_path, title=title)
 
-if __name__ == "__main__":
-    def run(label, trace, **kwargs):
-        gate = RewardGate(**kwargs)
-        fires = [gate.update(p) for p in trace]
-        first = next((i for i, f in enumerate(fires) if f), None)
-        print(f"    {label:34s} -> {'no fire' if first is None else f'fires @ step {first}'}")
 
-    rising  = [0.20, 0.28, 0.35, 0.42, 0.50, 0.58, 0.66, 0.74, 0.82, 0.90, 0.95] 
-    regress = [0.20, 0.40, 0.60, 0.75, 0.82, 0.70, 0.55, 0.40, 0.25, 0.15, 0.10] 
-    flat    = [0.50] * 11                                                         
-    spike   = [0.20, 0.30, 0.40, 0.50, 0.60, 0.30, 0.70, 0.80, 0.90, 0.95, 0.98]
+_ROBOMETER_SCRIPTS = "/scr/liryan/robometer_policy_learning/robometer/scripts"
 
-    corr = dict(short_window=5, long_window=10, drop_threshold=-0.5, plateau_threshold=0.3)
-    for method in ("spearman", "pearson"):
-        print(f"[{method}]  drop<{corr['drop_threshold']} over {corr['short_window']}, "
-              f"plateau<{corr['plateau_threshold']} over {corr['long_window']}")
-        run("rising  (expect: no fire)", rising,  method=method, **corr)
-        run("regress (expect: drop)",    regress, method=method, **corr)
-        run("flat    (expect: plateau)", flat,    method=method, **corr)
 
-    print("[naive]  single down-spike glitch, drop>=0.15 over 5")
-    naive = dict(short_window=5, long_window=10, drop_threshold=0.15, plateau_threshold=0.05, method="naive")
-    run("smoothing=0.0 (expect: false fire)", spike, smoothing=0.0, **naive)
-    run("smoothing=0.7 (expect: suppressed)", spike, smoothing=0.7, **naive)
+class RobometerScorer:
+    def __init__(self, model_path: str, device: str, max_frames=None):
+        if _ROBOMETER_SCRIPTS not in sys.path:
+            sys.path.insert(0, _ROBOMETER_SCRIPTS)
+        from example_libero_robometer_wrapper import _RewardModelInferenceMixin
 
+        self._model = _RewardModelInferenceMixin(
+            model_path=model_path, device=device, max_frames=max_frames)
+        self.task = ""
+        self.frames: List[np.ndarray] = []
+        self.episode_id = 0
+
+    def reset(self, task: str = ""):
+        self.task = str(task)
+        self.frames = []
+        self.episode_id += 1
+
+    def append(self, frame: np.ndarray):
+        self.frames.append(np.asarray(frame))
+
+    def observe(self, obs, frame_key: str = "agentview_image"):
+        self.append(obs[frame_key])
+
+    def score(self):
+        """Score the current causal history. Returns (progress, success_prob)."""
+        raw = dict(
+            frames=np.stack(self.frames, axis=0),
+            task=self.task,
+            id=self.episode_id,
+            metadata=dict(subsequence_length=len(self.frames)),
+            video_embeddings=None,
+            text_embedding=None,
+        )
+        rewards, success_probs = self._model._compute_rewards_batch([raw])
+        return float(rewards[0]), float(success_probs[0])
+
+
+def plot_progress_trace(stats, save_path: str, title: Optional[str] = None):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    progress = stats["progress_trace"]
+    fires: List[int] = stats["gate_fires"]
+    reasons = stats["gate_reasons"]  # "drop" | "plateau"
+    steps = len(progress)
+    trigger_color = {"drop": "#d62728", "plateau": "#ff7f0e"}
+
+    fig, ax = plt.subplots(figsize=(11, 4))
+    ax.plot(range(steps), progress, color="#1f77b4", lw=1.5, zorder=2)
+
+    for f, reason in zip(fires, reasons):
+        c = trigger_color.get(reason, "#7f7f7f")
+        ax.axvspan(f, steps - 1, color=c, alpha=0.08, zorder=1)
+        ax.axvline(f, color=c, lw=1.5, zorder=3)
+        ax.annotate(f"{reason or '?'}\n@{f}", xy=(f, 1.0), xytext=(2, -2),
+                    textcoords="offset points", ha="left", va="top", fontsize=7, color=c)
+
+    ax.set_xlabel("environment step")
+    ax.set_ylabel("Robometer progress")
+    ax.set_ylim(-0.02, 1.08)
+    ax.set_title(title or f"success={stats['success']}  interventions={stats['num_interventions']}")
+    ax.legend(handles=[
+        Line2D([0], [0], color="#1f77b4", lw=1.5, label="progress"),
+        Line2D([0], [0], color="#d62728", lw=1.5, label="drop takeover"),
+        Line2D([0], [0], color="#ff7f0e", lw=1.5, label="plateau takeover"),
+    ], loc="lower right", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=120)
+    plt.close(fig)
