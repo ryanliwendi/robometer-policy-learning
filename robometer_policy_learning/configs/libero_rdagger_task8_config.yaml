@@ -8,7 +8,7 @@ debug: false
 load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-14/21-35-36  # task-8 DP student
 checkpoint: 5000
 
-# NOTE: do NOT add env/training/model/policy sections here -- train_reward_dagger.py overwrites
+# NOTE: do NOT add env/training/model/policy sections here -- train_dagger.py overwrites
 # all four wholesale from <load_dir>/.hydra/config.yaml at startup, so anything written here is
 # silently ignored (and this run's own .hydra snapshot will NOT show the runtime values).
 # This student: task_id=8 (both moka pots), chunk_size=20, n_action_steps=10.

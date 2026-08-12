@@ -40,7 +40,7 @@ debug: false
 #
 # Example usage:
 # srun --gres=shard:8 --mem=48G --time=12:00:00 --pty \
-#  uv run python scripts/train_reward_dagger.py \
+#  uv run python scripts/train_dagger.py \
 #    --config-name libero_hgdagger_task1_live_config \
 #   rdagger.num_iterations=3 rdagger.rollouts_per_iter=5
 
