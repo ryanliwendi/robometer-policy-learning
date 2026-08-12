@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
-"""Gated rollouts.
+"""Gated rollouts: the student drives, a gate decides when to hand control to the expert.
 
-Standalone usage:
-    srun --gres=shard:8 --mem=32G --time=2:00:00 \
+Nothing is trained here; this is the watch-only. It runs N episodes and
+writes a video, a signal-vs-threshold plot, and the score trace for each episode into one JSON. 
+
+Example usages: 
+    # Robometer gate, pi0 expert, 20 episodes
+    srun --gres=gpu:1 --mem=40G --time=4:00:00 \
       uv run python scripts/gated_rollout_worker.py \
-        --student-dir outputs/<dp_run> --expert-dir outputs/<dp_run> \
-        --episodes 3 --video-dir gated_videos
+        --student-dir outputs/<dp_run> --gate-type robometer --episodes 20 \
+        --video-dir gated_videos/rm_t1 \
+        --stats-json-dir gated_videos/rm_t1/episode_stats.json
+
+    # Diff-DAgger gate, and a DP expert instead of pi0
+    ... --gate-type diffdagger --expert-type dp --expert-dir outputs/<dp_run>
 """
 
 import os
