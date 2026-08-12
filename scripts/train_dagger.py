@@ -33,6 +33,8 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.45")
 
 from datetime import datetime
 
+import random
+
 import numpy as np
 import torch
 from hydra import main as hydra_main
@@ -80,7 +82,7 @@ def main(cfg: DictConfig):
         prefix="offline",
     )
 
-    # ---- Adopt env / training / model / policy from the student's pretraining run ----
+    # Adopt env / training / model / policy from the student's pretraining run
     load_dir = OmegaConf.select(cfg, "load_dir", default=None)
     if not load_dir:
         raise ValueError("Set load_dir=<student pretraining run dir>.")
@@ -152,6 +154,12 @@ def main(cfg: DictConfig):
         smoothing=float(OmegaConf.select(cfg, "rdagger.smoothing", default=0.0)),
     )
 
+    collect_seed = int(OmegaConf.select(cfg, "rdagger.seed", default=0))
+    random.seed(collect_seed)
+    np.random.seed(collect_seed)
+    torch.manual_seed(collect_seed)
+    torch.cuda.manual_seed_all(collect_seed)
+
     student = load_actor(load_dir, device, OmegaConf.select(cfg, "checkpoint", default=None), trainable=True)
 
     if expert_type == "pi0":
@@ -190,7 +198,7 @@ def main(cfg: DictConfig):
         dinov2_processor=dinov2_processor,
         device=device,
         dino_image_keys=dino_image_keys,
-        seed=int(OmegaConf.select(cfg, "rdagger.seed", default=0)),
+        seed=collect_seed,
     )
     action_dim = int(collect_env.single_action_space.shape[0])
 
@@ -256,7 +264,7 @@ def main(cfg: DictConfig):
     if reweighting in ("sirius", "iwr") and not OmegaConf.select(cfg, "offline_algorithm.use_weighted_bc", default=False):
         logger.warning(f"rdagger.reweighting={reweighting} needs offline_algorithm.use_weighted_bc=true to take effect.")
 
-    # ---- Scorer + gate + gated worker ----
+    # Scorer, Gate
     dd_scorer = None  # DiffDAgger's scorer, calculates diffusion loss
     # Note: Thrifty DAgger recalibrates every episode but retrains every iteration
     refresh_gate = None # DiffDAgger and ThriftyDAgger; recalibrate the gate's threshold/retrain detectors
@@ -386,7 +394,6 @@ def main(cfg: DictConfig):
     debug = bool(OmegaConf.select(cfg, "debug", default=False))
     # Videos are required for HG-DAgger 'replay' so the operator can pick the takeover step off a recording of each solo rollout.
     interactive = (gate_type == "hgdagger" and hg_backend == "replay")
-    collect_seed = int(OmegaConf.select(cfg, "rdagger.seed", default=0))
     worker = GatedRolloutWorker(
         env=collect_env,
         student=algo.actor,
@@ -404,7 +411,6 @@ def main(cfg: DictConfig):
         score_every=score_every,
         store_only_expert=store_only_expert,
         video_dir=os.path.join(output_dir, "gated_videos") if (debug or interactive) else None,
-        plot_progress=(gate_type == "robometer"),
     )
 
     # Separate chunked env for evaluation
@@ -418,7 +424,9 @@ def main(cfg: DictConfig):
         dinov2_processor=dinov2_processor,
         device=device,
         dino_image_keys=dino_image_keys,
-        seed=None,
+        # Not None: make_env reads None as "pick a random seed", which would evaluate every
+        # run on a different episode set. Offset so eval episodes are not the collection ones.
+        seed=collect_seed + 10_000,
     )
     eval_worker = EvaluationWorker(
         eval_env=eval_env,
