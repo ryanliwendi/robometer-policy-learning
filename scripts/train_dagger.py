@@ -1,33 +1,24 @@
 #!/usr/bin/env python3
-"""The interactive-imitation DAgger loop.
+"""The interactive imitation learning loop.
 
-`rdagger.gate_type` selects which gate decides when to intervene, and everything else is shared.
-so a difference in the resulting policy is attributable to the gate alone:
+`rdagger.gate_type` selects which gate decides when to intervene. Gates include:
 
-    robometer   Robometer progress + the drop/plateau rule (robometer_gate.py)
+    robometer   Robometer progress + the drop/plateau rule (reward_gate.py)
     thrifty     ThriftyDAgger: ensemble novelty and Q-risk (thrifty_gate.py)
     hgdagger    a human decides, live or via a replay loop (human_gate.py)
-    diffdagger  Diff-DAgger: the student's own diffusion loss + a quantile (baseline_gates.py)
+    diffdagger  Diff-DAgger: the student's own diffusion loss (diffdagger_gate.py)
 
-The `rdagger.*` config namespace is shared by every arm.
-
-Starting from a pretrained STUDENT (load_dir) and a frozen EXPERT (rdagger.expert_dir, or pi0),
-each iteration:
-  1. collects gated rollouts with GatedRolloutWorker until rollouts_per_iter episodes are KEPT.
-     Every stored step is labelled intervention=1 (expert correction) or 0 (student). Takeover is
-     one-way: once the gate fires the expert drives to the end of the episode;
+Starting from a pretrained student and a frozen expert, each iteration:
+  1. collects gated rollouts with GatedRolloutWorker until target episodes/transitions are kept;
+     within episodes, expert takes over once gate fires without transferring control back';     
   2. trains behavior cloning for rdagger.train_steps_per_iter steps on the online buffer,
-     optionally mixed with the offline demos (MixedReplayBuffer);
-  3. refreshes the gate if it needs it -- Diff-DAgger and ThriftyDAgger recalibrate against the
-     retrained policy, Robometer and HG-DAgger have nothing to fit;
-  4. evaluates autonomously and checkpoints;
-then repeats.
+     optionally mixed with the offline demos with a fixed ratio (MixedReplayBuffer);
+  3. refreshes the gate if it needs it -- DiffDAgger and ThriftyDAgger recalibrate thresholds or
+     retrains detectors;
+  4. evaluates the autonomous policy performance and checkpoints;
 
 Example usage:
-    uv run python scripts/train_reward_dagger.py --config-name libero_rdagger_task1_config
-
-HG-DAgger needs an operator for the whole run: `replay` prompts on a TTY (use `srun --pty`),
-`live` serves a browser UI on rdagger.hg_port.
+    uv run python scripts/train_dagger.py --config-name libero_rdagger_task1_config
 """
 
 import os
@@ -59,7 +50,6 @@ from robometer_policy_learning.buffers.samplers import ChunkedSequentialSampler,
 from robometer_policy_learning.rollouts.evaluation_worker import EvaluationWorker
 from robometer_policy_learning.utils.env_utils import make_env
 from robometer_policy_learning.utils.hitl_utils_publish import compute_iwr_weights, compute_sirius_weights
-from robometer_policy_learning.utils.reward_gate import RewardGate
 from robometer_policy_learning.utils.training_utils import save_checkpoint
 from robometer_policy_learning.loggers.wandb_logger import WandbLogger
 
@@ -102,43 +92,49 @@ def main(cfg: DictConfig):
     OmegaConf.set_struct(cfg, True)
     OmegaConf.resolve(cfg)
 
-    expert_type = str(OmegaConf.select(cfg, "rdagger.expert_type", default="dp"))
+    expert_type = str(OmegaConf.select(cfg, "rdagger.expert_type", default="pi0")) # other option: dp
     pi0_checkpoint = os.path.expanduser(str(OmegaConf.select(
         cfg, "rdagger.pi0_checkpoint",
         default="~/.cache/openpi/openpi-assets/checkpoints/pi0_libero")))
     expert_dir = OmegaConf.select(cfg, "rdagger.expert_dir", default=None)  # unused for expert_type=pi0
-    expert_checkpoint = OmegaConf.select(cfg, "rdagger.expert_checkpoint", default=None)
+    expert_checkpoint = OmegaConf.select(cfg, "rdagger.expert_checkpoint", default=None) # unused for expert_type=pi0
     reward_model_path = OmegaConf.select(cfg, "rdagger.reward_model", default="jesbu1/robometer-4b-fft-libero")
     expert_n_exec = int(OmegaConf.select(cfg, "rdagger.expert_n_action_steps", default=5))
     score_every = int(OmegaConf.select(cfg, "rdagger.score_every", default=1))
     num_iterations = int(OmegaConf.select(cfg, "rdagger.num_iterations", default=10))
     rollouts_per_iter = int(OmegaConf.select(cfg, "rdagger.rollouts_per_iter", default=5))
+    # Option to count transitions instead of count episodes for each rdagger iter;
+    # rollouts_per_iter is ignored if this is defined
+    expert_transitions_per_iter = OmegaConf.select(
+        cfg, "rdagger.expert_transitions_per_iter", default=None)
+    expert_transitions_per_iter = (None if expert_transitions_per_iter is None
+                                   else int(expert_transitions_per_iter))
     train_steps_per_iter = int(OmegaConf.select(cfg, "rdagger.train_steps_per_iter", default=2000))
     use_offline = bool(OmegaConf.select(cfg, "rdagger.use_offline", default=True))
     offline_ratio = OmegaConf.select(cfg, "rdagger.offline_sample_ratio", default=None)
-    store_only_expert = bool(OmegaConf.select(cfg, "rdagger.store_only_expert", default=False))
-    require_intervention = bool(OmegaConf.select(cfg, "rdagger.require_intervention", default=False))
-    require_success = bool(OmegaConf.select(cfg, "rdagger.require_success", default=False))
-    reweighting = OmegaConf.select(cfg, "rdagger.reweighting", default=None)
+    # Only expert's steps go into the training buffer
+    store_only_expert = bool(OmegaConf.select(cfg, "rdagger.store_only_expert", default=True))
+    # Store episode if there's an intervention / episode resulted in success
+    require_intervention = bool(OmegaConf.select(cfg, "rdagger.require_intervention", default=True))
+    require_success = bool(OmegaConf.select(cfg, "rdagger.require_success", default=True))
+    reweighting = OmegaConf.select(cfg, "rdagger.reweighting", default=None) # iwr, sirius
     # Fraction of total gradient mass IWR assigns to expert corrections (0.5 = canonical IWR).
     # Higher means more gradient is given to optimize expert interventions
     iwr_target_intv = float(OmegaConf.select(cfg, "rdagger.iwr_target_intv", default=0.5))
     save_interval = int(OmegaConf.select(cfg, "rdagger.save_interval", default=1))
-    # Baseline comparison arms: only the GATE changes -- same student, expert, loop and recipe.
     gate_type = str(OmegaConf.select(cfg, "rdagger.gate_type", default="robometer"))
     dd_alpha = float(OmegaConf.select(cfg, "rdagger.dd_alpha", default=0.99))
-    dd_patience = int(OmegaConf.select(cfg, "rdagger.dd_patience", default=1))
+    # DiffDAgger gate fires if dd_patience steps out of the last dd_patience_window_steps are above threshold
+    dd_patience = int(OmegaConf.select(cfg, "rdagger.dd_patience", default=2))
     dd_patience_window = OmegaConf.select(cfg, "rdagger.dd_patience_window", default=None)
-    dd_calib_samples = int(OmegaConf.select(cfg, "rdagger.dd_calib_samples", default=1024))
+    dd_calib_samples = int(OmegaConf.select(cfg, "rdagger.dd_calib_samples", default=1024)) # Samples from buffer used to recalibrate threshold
     # Noise samples per scored state = num_train_timesteps * batch_multiplier * num_per_batch.
-    # The reference runs 16 * 32 * 1 = 512; our scheduler has 100 train timesteps, so
-    # batch_multiplier=5 matches its effective sample count.
     dd_batch_multiplier = int(OmegaConf.select(cfg, "rdagger.dd_batch_multiplier", default=5))
     dd_num_per_batch = int(OmegaConf.select(cfg, "rdagger.dd_num_per_batch", default=1))
     # ThriftyDAgger: alpha_h is the target intervention rate; thresholds are its (1-alpha_h) quantiles.
     thrifty_alpha_h = float(OmegaConf.select(cfg, "rdagger.thrifty_alpha_h", default=0.01))
-    thrifty_num_nets = int(OmegaConf.select(cfg, "rdagger.thrifty_num_nets", default=5))
-    thrifty_train_steps = int(OmegaConf.select(cfg, "rdagger.thrifty_train_steps", default=200))
+    thrifty_num_nets = int(OmegaConf.select(cfg, "rdagger.thrifty_num_nets", default=5)) # ensemble policy nets
+    thrifty_train_steps = int(OmegaConf.select(cfg, "rdagger.thrifty_train_steps", default=200)) # train steps for policy ensemble & qrisk
     thrifty_lr = float(OmegaConf.select(cfg, "rdagger.thrifty_lr", default=1e-3))
     thrifty_gamma = float(OmegaConf.select(cfg, "rdagger.thrifty_gamma", default=0.9999))
     # The reference gives Q_risk 5x the BC ensemble's gradient steps (grad_steps * 5 per epoch).
@@ -177,7 +173,7 @@ def main(cfg: DictConfig):
         dinov2_model = AutoModel.from_pretrained(model_id).to(device).eval()
         dinov2_processor = AutoImageProcessor.from_pretrained(model_id)
 
-    chunk_size = OmegaConf.select(cfg, "training.chunk_size", default=None)
+    chunk_size = OmegaConf.select(cfg, "training.chunk_size", default=None)  # action chunking
     n_exec = int(OmegaConf.select(cfg, "training.n_action_steps", default=1) or 1)
     normalize_lowdim = bool(OmegaConf.select(cfg, "training.normalize_lowdim_obs", default=False))
     env_name = f"{cfg.env.env_name}/{cfg.env.task_id}"
@@ -198,7 +194,7 @@ def main(cfg: DictConfig):
     )
     action_dim = int(collect_env.single_action_space.shape[0])
 
-    # Action normalization bounds (buffers map stored env-space actions to [-1, 1] at sample time).
+    # DP policy emits normalized actions, but not pi0
     asp = collect_env.single_action_space
     if np.all(np.isfinite(asp.low)) and np.all(np.isfinite(asp.high)):
         action_min, action_max = np.asarray(asp.low, np.float32), np.asarray(asp.high, np.float32)
@@ -208,7 +204,7 @@ def main(cfg: DictConfig):
     if chunk_size is None:
         sampler = RandomSampler()
     else:
-        gamma = OmegaConf.select(cfg, "offline_algorithm.gamma", default=0.99)
+        gamma = OmegaConf.select(cfg, "offline_algorithm.gamma", default=0.9999)
         sampler = ChunkedSequentialSampler(chunk_size=int(chunk_size), obs_as_sequence=False, gamma=gamma)
 
     lowdim_stats = {}
@@ -261,20 +257,15 @@ def main(cfg: DictConfig):
         logger.warning(f"rdagger.reweighting={reweighting} needs offline_algorithm.use_weighted_bc=true to take effect.")
 
     # ---- Scorer + gate + gated worker ----
-    dd_scorer = None
-    refresh_gate = None
-    q_online_buffer = None   # ThriftyDAgger only: Q_risk's own replay of executed transitions
+    dd_scorer = None  # DiffDAgger's scorer, calculates diffusion loss
+    # Note: Thrifty DAgger recalibrates every episode but retrains every iteration
+    refresh_gate = None # DiffDAgger and ThriftyDAgger; recalibrate the gate's threshold/retrain detectors
+    q_online_buffer = None   # ThriftyDAgger's Q replay buffer stores student transtions as well
     if gate_type == "diffdagger":
-        # Diff-DAgger baseline: the gating signal is the student's own diffusion loss. No
-        # Robometer is loaded. The threshold is set below from the training-data loss
-        # distribution, and recalibrated after every retrain (see the iteration loop).
-        from robometer_policy_learning.utils.baseline_gates import DiffDaggerScorer, QuantileGate
+        from robometer_policy_learning.utils.diffdagger_gate import DiffDaggerScorer, QuantileGate
 
         remove_keys = list(getattr(algo.actor, "remove_obs_keys", None)
                            or OmegaConf.select(cfg, "env.extra_keys_to_drop", default=[]) or [])
-        # algo.actor is the EMA network. The reference scores with EMA weights too: its
-        # DiffDAggerTrainingEndCallback copies the EMA into the live model before recalibrating,
-        # and normalize_obs/get_naction both run off `ema_model`.
         scorer = DiffDaggerScorer(algo.actor, remove_obs_keys=remove_keys, device=device,
                                   batch_multiplier=dd_batch_multiplier,
                                   num_per_batch=dd_num_per_batch)
@@ -282,19 +273,31 @@ def main(cfg: DictConfig):
         gate = QuantileGate(patience=dd_patience, patience_window=dd_patience_window,
                             alpha=dd_alpha)
 
-        def _refresh_gate(tag: str):
-            """alpha-quantile of the diffusion loss over the current training distribution."""
-            losses = dd_scorer.inner.calibrate_from_algo(algo, num_samples=dd_calib_samples)
+        def _refresh_diff(tag: str):
+            """alpha-quantile of the diffusion loss over the current training distribution.
+            Threshold is calibrated on expert steps and offline demos, not student steps."""
+            buf = getattr(algo, "buffer", None)
+            restore = getattr(buf, "sample_ratio", None) if hasattr(buf, "set_sample_ratio") else None
+            if hasattr(buf, "set_sample_ratio"):
+                buf.set_sample_ratio(None)  # when calibrating thresholds, sample uniformly from offline+online buffer
+            try:
+                losses = dd_scorer.inner.calibrate_from_algo(algo, num_samples=dd_calib_samples)
+            finally:
+                if hasattr(buf, "set_sample_ratio"):
+                    buf.set_sample_ratio(restore)
             if len(losses) == 0:
                 logger.warning(f"[diffdagger:{tag}] no calibration samples; threshold unchanged")
                 return None
             info = gate.recalibrate(losses)
+            mix = ""
+            if hasattr(buf, "buffer_1") and hasattr(buf, "buffer_2"):
+                mix = f", calib mix offline={len(buf.buffer_1)} online={len(buf.buffer_2)}"
             logger.info(f"[diffdagger:{tag}] threshold={info['threshold']:.6f} (alpha={dd_alpha}, "
                         f"n={info['n']}, loss mean={info['loss_mean']:.6f} "
-                        f"max={info['loss_max']:.6f})")
+                        f"max={info['loss_max']:.6f}{mix})")
             return info
 
-        refresh_gate = _refresh_gate
+        refresh_gate = _refresh_diff
 
     elif gate_type == "thrifty":
         import copy as _copy
@@ -305,16 +308,16 @@ def main(cfg: DictConfig):
 
         remove_keys = list(getattr(algo.actor, "remove_obs_keys", None)
                            or OmegaConf.select(cfg, "env.extra_keys_to_drop", default=[]) or [])
+        # size of the observation vector; 768 dim in our case, created by concatenating DINO embedding(1536->384) and observation/state(8->384)
         feat_dim = int(algo.actor.global_cond_dim)
-        # Ensemble: 5 MLP actors + twin Q critics, plus a frozen target copy.
-        ac = build_ensemble(feat_dim, action_dim, device, num_nets=thrifty_num_nets)
+        ac = build_ensemble(feat_dim, action_dim, device, num_nets=thrifty_num_nets) # 5 MLP actors + twin Q critics
         ac_targ = _copy.deepcopy(ac)
         for p in ac_targ.parameters():
             p.requires_grad = False
         q_opt = torch.optim.Adam(
             list(ac.q1.parameters()) + list(ac.q2.parameters()), lr=thrifty_lr)
 
-        # Q online buffer stores the transitions of additional rollouts after each iteration to train qrisk
+        # Q online buffer additionally stores student rollouts to train qrisk
         q_online_buffer = ReplayBuffer(
             capacity=int(OmegaConf.select(cfg, "rdagger.online_buffer_capacity", default=200000)),
             remove_obs_keys=list(remove_obs_keys),
@@ -345,12 +348,10 @@ def main(cfg: DictConfig):
             if len(nov) == 0:
                 logger.warning(f"[thrifty:{tag}] no calibration samples; thresholds unchanged")
                 return None
-            # Without a goal-reaching transition the critic is fit entirely to zero targets, so
-            # its quantile is a noise threshold that would fire at exactly alpha_h. Pin beta_h at
-            # -inf instead and gate on novelty alone until positives exist.
+        
             gate.recalibrate(nov, saf, thrifty_alpha_h, risk_enabled=losses["n_positive"] > 0)
             if losses["n_positive"] == 0:
-                logger.warning(f"[thrifty:{tag}] Q replay holds NO goal-reaching transitions; "
+                logger.warning(f"[thrifty:{tag}] Q replay holds no goal-reaching transitions; "
                                f"the risk gate is disabled this iteration (beta_h=-inf)")
             logger.info(f"[thrifty:{tag}] steps={steps} n_bc={losses['n_bc_transitions']} "
                         f"n_q={losses['n_transitions']} "
@@ -377,7 +378,7 @@ def main(cfg: DictConfig):
         logger.info(f"HG-DAgger gate: backend={hg_backend} (needs an operator at a terminal)")
 
     else:
-        from robometer_policy_learning.utils.robometer_gate import RobometerScorer
+        from robometer_policy_learning.utils.reward_gate import RobometerScorer, RewardGate
 
         scorer = RobometerScorer(model_path=reward_model_path, device=device)
         gate = RewardGate(**gate_kwargs)
@@ -406,7 +407,7 @@ def main(cfg: DictConfig):
         plot_progress=(gate_type == "robometer"),
     )
 
-    # ---- Separate chunked env for evaluation ----
+    # Separate chunked env for evaluation
     _, eval_env = make_env(
         env_name=env_name,
         num_envs=1,
@@ -428,7 +429,7 @@ def main(cfg: DictConfig):
         lowdim_obs_stats=lowdim_stats,
     )
 
-    # ---- DAgger loop ----
+    # DAgger loop
     try:
         if bool(OmegaConf.select(cfg, "eval.eval_on_first_step", default=True)):
             logger.info("Evaluating the initial student before any correction...")
@@ -441,13 +442,23 @@ def main(cfg: DictConfig):
             logger.info(f"===== DAgger iteration {it + 1}/{num_iterations} =====")
 
             ep_stats, num_kept, attempt, declined = [], 0, 0, 0
+            stored_this_iter = 0   # transitions stored
             if gate_type == "thrifty":
                 gate.clear_online()   # fresh estimate pool for risk & novelty every iteration
-            while num_kept < rollouts_per_iter:
+
+            def _budget_left():
+                if expert_transitions_per_iter is not None:
+                    return stored_this_iter < expert_transitions_per_iter
+                return num_kept < rollouts_per_iter
+
+            def _progress():
+                if expert_transitions_per_iter is not None:
+                    return f"{stored_this_iter}/{expert_transitions_per_iter} expert transitions"
+                return f"kept {num_kept}/{rollouts_per_iter}"
+
+            while _budget_left():
                 tag = f"it{it}_r{attempt}"
-                if interactive:
-                    # Two passes: solo rollout -> ask the operator -> re-run with the takeover.
-                    # The seed must be unique per episode but stable, so a re-run reproduces it.
+                if interactive:  # HG DAgger replay mode
                     rec = collect_interactive_episode(
                         worker, scorer, tag, collect_seed + 1000 * it + attempt, store=True)
                     stats, kept = rec["stats"], rec["kept"]
@@ -457,18 +468,19 @@ def main(cfg: DictConfig):
                         tag, store=True, 
                         require_success=require_success, require_intervention=require_intervention,
                     )
-                    kept = stats["stored"] > 0
+                    kept = stats["stored"] > 0  # stats["stored"] stores the number of kept transitions
                 attempt += 1
                 num_kept += int(kept)
                 if gate_type == "thrifty" and gate.recalibrate_online(thrifty_alpha_h):
                     logger.info(f"  [thrifty] refit on {len(gate.online_novelty)} online scores: "
                                 f"delta_h={gate.delta_h:.5f} beta_h={gate.beta_h:.5f}")
-                if stats is None:            # operator declined; there is no episode to log
-                    logger.info(f"  kept {num_kept}/{rollouts_per_iter} (attempt {attempt}, declined)")
+                if stats is None: # Applies only to interactive mode (HG DAgger replay); operator did not intervene
+                    logger.info(f"  {_progress()} (attempt {attempt}, declined)")
                     continue
+                stored_this_iter += int(stats["stored"])
                 ep_stats.append(stats)
                 logger.info(
-                    f"  kept {num_kept}/{rollouts_per_iter} (attempt {attempt}, "
+                    f"  {_progress()} (attempt {attempt}, "
                     f"success={stats['success']}, interventions={stats['num_interventions']}, "
                     f"stored={stats['stored']})"
                 )
@@ -480,6 +492,8 @@ def main(cfg: DictConfig):
                     "expert_step_fraction": float(np.mean([s["expert_steps"] / max(s["steps"], 1) for s in ep_stats])) if ep_stats else 0.0,
                     "episodes_attempted": attempt,
                     "episodes_declined": declined,
+                    "expert_transitions": stored_this_iter,
+                    "env_transitions": int(sum(s["steps"] for s in ep_stats if s["stored"] > 0)), # effort for HG-DAgger
                     "online_buffer_size": len(online_buffer),
                     "q_buffer_size": len(q_online_buffer) if q_online_buffer is not None else 0,
                     "iteration": it + 1,
@@ -492,7 +506,7 @@ def main(cfg: DictConfig):
                 logger.warning("Online buffer empty; skipping training this iteration.")
                 continue
 
-            # --- Class reweighting ---
+            # Class reweighting
             if reweighting == "sirius":
                 stats = compute_sirius_weights(online_buffer, offline_buffer if use_offline else None)
                 wandb_logger.log({f"weight_{k}": v for k, v in stats.get("weights", {}).items()},
@@ -502,21 +516,17 @@ def main(cfg: DictConfig):
                 wandb_logger.log({f"weight_{k}": v for k, v in stats.get("weights", {}).items()},
                                  step=algo.step_counter, prefix="iwr")
 
-            # --- Train the student (weighted BC on mixed offline + gated online data) ---
+            # Training
             for i in tqdm(range(train_steps_per_iter), desc="Training", unit="step"):
                 algo.train_step(logging_prefix="train")
-                if cfg.eval.eval_freq and (i + 1) % cfg.eval.eval_freq == 0:
-                    wandb_logger.log(eval_worker.run(algo.actor), step=algo.step_counter, prefix="eval")
 
-            # --- Recalibrate the Diff-DAgger threshold against the retrained policy ---
-            # The policy just changed, so its training-loss distribution shifted; a stale
-            # threshold would drift toward firing on states it has already learned.
+            # Recalibrate threshold/retrain detectors for DiffDAgger/Thrifty DAgger
             if refresh_gate is not None:
                 info = refresh_gate(f"it{it + 1}")
                 if info:
                     wandb_logger.log(info, step=algo.step_counter, prefix=gate_type)
 
-            # --- End-of-iteration eval + checkpoint ---
+            # Eval, checkpointing; evals for cfg.eval.eval_num_episodes episodes
             wandb_logger.log(eval_worker.run(algo.actor), step=algo.step_counter, prefix="eval")
             if (it + 1) % save_interval == 0:
                 save_checkpoint(algo, save_dir, it + 1)
