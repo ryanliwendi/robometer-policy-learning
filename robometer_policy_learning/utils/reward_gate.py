@@ -28,6 +28,28 @@ def _compute_pearson(values) -> float:
     return float(res)
 
 
+class NeverGate:
+    """No gating; used for testing student rollout accuracy."""
+
+    def __init__(self, inner=None):
+        self.inner = inner
+        self.history = deque(maxlen=1)
+        self.short_window = getattr(inner, "short_window", 1)
+        self.last_trigger = None
+
+    def update(self, value) -> bool:
+        return False
+
+    def reset(self):
+        self.history.clear()
+        if self.inner is not None:
+            self.inner.reset()
+
+    def plot_trace(self, stats, save_path: str, title: Optional[str] = None):
+        if self.inner is not None:
+            self.inner.plot_trace(stats, save_path, title=title)
+
+
 class RewardGate:
     """Takes a scalar progress and decides when the expert should take over,"""
 

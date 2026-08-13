@@ -470,6 +470,9 @@ def main():
     parser.add_argument("--gate-type",
                         choices=["robometer", "diffdagger", "thrifty", "hgdagger"],
                         default="robometer")
+    parser.add_argument("--ungated", action="store_true",
+                        help="build the gate and score every step, but never hand over: the "
+                             "student runs solo and no expert is loaded.")
     parser.add_argument("--hg-backend", choices=["live", "replay"], default="replay",
                         help="'live' renders frames as the episode runs and polls the keyboard for "
                              "SPACE (needs a display); 'replay' rolls the episode out solo, then "
@@ -506,7 +509,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     
-    if args.expert_type == "dp" and not args.expert_dir:
+    if args.expert_type == "dp" and not args.expert_dir and not args.ungated:
         parser.error("--expert-dir is required for --expert-type dp")
     if args.gate_type == "diffdagger" and args.student_type != "dp":
         parser.error("--gate-type diffdagger must have a diffusion policy for the student")
@@ -555,7 +558,10 @@ def main():
         student = Pi0Actor(args.pi0_checkpoint, device=device)
     else:
         student = load_actor(args.student_dir, device, args.student_checkpoint)
-    if args.expert_type == "pi0":
+    if args.ungated:
+        expert = student
+        logger.info("--ungated; no expert loaded.")
+    elif args.expert_type == "pi0":
         expert = Pi0Actor(args.pi0_checkpoint, device=device)
     else:
         expert = load_actor(args.expert_dir, device, args.expert_checkpoint)
@@ -686,6 +692,12 @@ def main():
             min_drop_magnitude=args.min_drop_magnitude,
         )
 
+    base_gate = gate  # the configured gate, whether or not it is allowed to fire
+    if args.ungated:
+        from robometer_policy_learning.utils.reward_gate import NeverGate
+
+        gate = NeverGate(base_gate)  # keeps the configured gate for its trace plot only
+
     if bool(OmegaConf.select(pre_cfg, "training.normalize_lowdim_obs", default=False)):
         lowdim_stats = build_offline_algo()[0].buffer.lowdim_obs_stats
     else:
@@ -732,8 +744,9 @@ def main():
             args.stats_json_dir,
             meta=dict(
                 gate_type=args.gate_type,
-                thrifty=(gate.describe() if args.gate_type == "thrifty" else None),  # thrifty's fitted thresholds
-                dd_threshold=(gate.threshold if args.gate_type == "diffdagger" else None),
+                ungated=args.ungated,  # True = the gate was recorded but never allowed to fire
+                thrifty=(base_gate.describe() if args.gate_type == "thrifty" else None),  # thrifty's fitted thresholds
+                dd_threshold=(base_gate.threshold if args.gate_type == "diffdagger" else None),
                 dd_alpha=(args.dd_alpha if args.gate_type == "diffdagger" else None),
                 dd_patience=args.dd_patience, dd_patience_window=args.dd_patience_window,
                 dd_batch_multiplier=args.dd_batch_multiplier,
