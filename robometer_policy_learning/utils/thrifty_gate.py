@@ -1,4 +1,12 @@
-"""ThriftyDAgger baseline"""
+"""ThriftyDAgger baseline.
+
+Differences from the original implementation: 
+    * Uses takeover mode instead of handing control back to the student. Retunes threshold 
+      alpha (0.01 -> 0.001) to reduce frequency of expert interventions and adapt to the takeover mode.
+    * Ensemble trained with MLP on top of a frozen backbone, since policies take raw images
+      instead of low-dim states; DP drives actions while the ensemble is only used to detect novelty.
+      The ensembles are retrained every iteration, and the DP policy is fine-tuned.
+"""
 
 import copy
 import os
@@ -13,10 +21,10 @@ _VENDORED = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "baselines")
 if _VENDORED not in sys.path:
     sys.path.insert(0, _VENDORED)
-from vendored.thrifty_core import Ensemble  # noqa: E402  (authors' verbatim networks)
+from vendored.thrifty_core import Ensemble  # noqa: E402
 
-POLYAK = 0.995
-POS_FRACTION = 0.1
+POLYAK = 0.995  # Between bahavior and target q-networks
+POS_FRACTION = 0.1  # Fraction of samples for q-risk training with success labels
 
 
 class _Space:
@@ -41,7 +49,7 @@ def compute_loss_q(ac: Ensemble, ac_targ: Ensemble, obs, act, obs2, next_act, re
                    gamma: float):
     """Bellman loss for the twin Q critics.
 
-    The action used at the next state comes from the diffusion policy, not from the ensemble,
+    next_act should come from the diffusion policy, not from the ensemble,
     because the diffusion policy is what actually drives the robot.
     """
     q1, q2 = ac.q1(obs, act), ac.q2(obs, act)
@@ -77,22 +85,21 @@ def _buffer_parts(buf) -> List[Any]:
 
 
 def _part_batch(part, idx: np.ndarray, device):
-    """Fetches a batch by explicit row indices"""
+    """Fetches a batch by explicit indices"""
     if hasattr(part, "batch_from_indices"):
         return part.batch_from_indices(np.asarray(idx), device=device)
     return part.collate_transitions(part.transitions_from_indices(idx), device=device)
 
 
 def _cat_batches(batches: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Concatenate per-store batches along the batch axis (obs/next_obs are nested dicts)."""
+    """Concatenate one batch per buffer (offline demos, online rollouts) into a single batch."""
     batches = [b for b in batches if b]
     if not batches:
         return {}
     if len(batches) == 1:
         return batches[0]
     out: Dict[str, Any] = {}
-    # Only keys present in EVERY store can be concatenated. The offline H5 demos carry extra obs
-    # keys (e.g. ee_pos) that the online buffer never records; the encoder does not use them.
+    # Keep only the keys that both buffers have
     common = set(batches[0])
     for b in batches[1:]:
         common &= set(b)
@@ -134,13 +141,7 @@ class _IndexSpace:
         return _cat_batches(out)
 
     def row_indices(self, idx) -> np.ndarray:
-        """Reorder ``idx`` to match the row order :meth:`batch` actually hands back.
-
-        ``batch`` fetches one buffer at a time and glues the results together, so rows come back
-        grouped by buffer rather than in the order you asked for. Anything you line up next to a
-        batch -- success labels, the cached next-actions -- has to be reordered the same way, or
-        it ends up attached to the wrong rows.
-        """
+        """Returns the indices of each transition :meth:``batch`` sends back."""
         idx = np.asarray(idx)
         out = []
         for k in range(len(self.parts)):
@@ -149,7 +150,7 @@ class _IndexSpace:
         return np.concatenate(out) if out else np.empty(0, dtype=np.int64)
 
     def success_values(self, idx) -> np.ndarray:
-        """Goal-reaching labels aligned with :meth:`batch`'s rows (the reference's ``rew``)."""
+        """Success labels aligned with :meth:`batch`'s rows."""
         idx = np.asarray(idx)
         out = []
         for k, part in enumerate(self.parts):
@@ -160,15 +161,19 @@ class _IndexSpace:
         return np.asarray(out, dtype=np.float32)
 
     def positive_indices(self) -> np.ndarray:
-        """Global indices of goal-reaching transitions, via each store's episode boundaries."""
+        """Find every transition that reached the goal.
+
+        Only the last step of an episode can be a success, so we ask each buffer where its
+        episodes end and check just those steps instead of scanning everything.
+        """
         pos = []
         for k, part in enumerate(self.parts):
             lo = int(self.offsets[k])
             try:
-                bounds = part.get_episode_boundaries() or {}
-            except Exception:  # noqa: BLE001 -- store without boundary support
+                bounds = part.get_episode_boundaries() or {}  # returns a dict of {episode_id: (start_idx, end_idx)}
+            except Exception:  # noqa: BLE001
                 continue
-            # get_episode_boundaries returns (start, end) with end INCLUSIVE.
+            # get_episode_boundaries returns (start, end) with end inclusive
             ends = np.asarray(sorted({int(e) for (_s, e) in bounds.values()}), dtype=np.int64)
             ends = ends[(ends >= 0) & (ends < self.sizes[k])]
             if ends.size == 0:
@@ -180,7 +185,7 @@ class _IndexSpace:
 
 
 def _success_flag(t) -> float:
-    """The reference's reward: ``int(env._check_success())``, 1 only on goal-reaching steps."""
+    """The reference's reward, 1 only on goal-reaching steps."""
     if t is None:
         return 0.0
     info = getattr(t, "info", None)
@@ -188,33 +193,24 @@ def _success_flag(t) -> float:
         for key in ("is_success", "success"):
             if key in info:
                 return 1.0 if bool(np.asarray(info[key]).reshape(-1)[0]) else 0.0
-    # Offline demos carry no success field; their terminal transition is goal-reaching and the
-    # env terminates on success, so `done` is the right fallback for those stores.
-    return 1.0 if float(np.asarray(t.done).reshape(-1)[0]) > 0 else 0.0
-
-
-def _positive_indices(transitions) -> np.ndarray:
-    """Positions in `transitions` that reached the goal."""
-    return np.asarray([i for i, t in enumerate(transitions) if _success_flag(t) > 0],
-                      dtype=np.int64)
-
+    return 1.0 if float(np.asarray(t.done).reshape(-1)[0]) > 0 else 0.0  # fallback: use t.done
 
 def q_batch_indices(n: int, batch_size: int, pos_fraction: float,
                     rng: np.random.Generator, pos_pool: np.ndarray,
                     neg_pool: Optional[np.ndarray] = None) -> np.ndarray:
     """LIBERO success is sparse, so uniform sampling shows the critic almost no positives and it
-    learns to predict ~0 everywhere. Forcing 10% positives per batch keeps the critic informative.
+    learns to predict ~0 everywhere. Forcing ```POS_FRACTION``` positives per batch keeps the critic informative.
     """
     if n == 0:
         return np.empty(0, dtype=np.int64)
     pool = np.unique(np.asarray(pos_pool, dtype=np.int64))
 
-    want_pos = min(batch_size, max(1, int(batch_size * pos_fraction))) if len(pool) else 0
+    want_pos = min(batch_size, max(1, int(batch_size * pos_fraction))) if len(pool) else 0  # At least 1 positive sample
     if neg_pool is None:
-        neg_pool = np.setdiff1d(np.arange(n, dtype=np.int64), pool, assume_unique=False)
+        neg_pool = np.setdiff1d(np.arange(n, dtype=np.int64), pool, assume_unique=False)  # All indexes that are not positive
     neg_pool = np.asarray(neg_pool, dtype=np.int64)
     want_neg = batch_size - want_pos
-    if want_neg and len(neg_pool) == 0:      # degenerate all-positive store
+    if want_neg and len(neg_pool) == 0:      # every transition is a success, nothing else to draw
         want_pos, want_neg = batch_size, 0
     neg = rng.choice(neg_pool, size=want_neg, replace=True) if want_neg else np.empty(0, np.int64)
     if want_pos == 0:
@@ -226,7 +222,7 @@ class _NextActionCache:
     """Stores the DP policy's actions for the critic update's target calculation.
     
     Ensures that each transitions ``next_obs`` is passed through the DP policy
-    at most 1 per refresh.
+    at most once per refresh.
     """
 
     def __init__(self, algo, n: int, act_dim: int, device):
@@ -240,8 +236,6 @@ class _NextActionCache:
         miss = ~self.have[rows]
         if miss.any():
             sel = torch.as_tensor(np.flatnonzero(miss), device=self.device)
-            # Only the batched numeric keys are sliceable; anything else (a prompt string, say)
-            # is not something the DP's featurizer consumes.
             sub = {k: torch.as_tensor(v).to(self.device)[sel]
                    for k, v in next_obs.items()
                    if torch.is_tensor(v) or isinstance(v, np.ndarray) and v.dtype != object}
@@ -304,7 +298,7 @@ def train_thrifty_models(algo, ac: Ensemble, ac_targ: Ensemble, ens_opt_fn, q_op
     n_pos = int(len(pos_pool))
     neg_pool = np.setdiff1d(np.arange(n_t, dtype=np.int64), pos_pool, assume_unique=True)
     # With no goal-reaching transition every Bellman target is 0 and the critic's scale carries no
-    # information; the caller disables the risk gate rather than calibrate on that noise.
+    # information; the caller disables the risk gate in this case.
     q_steps = int(grad_steps * max(1, int(q_steps_multiplier))) if n_pos > 0 else 0
     next_actions = _NextActionCache(algo, n_t, act_dim, device)
     for step in range(q_steps):
@@ -414,8 +408,7 @@ class ThriftyGate:
 
 
     def recalibrate_online(self, target_rate: float, min_samples: int = 25) -> bool:
-        # Refit after every episode from this iteration's robot-mode scores, over the reference's
-        # `if len(estimates) > 25` guard.
+        # Refit after every episode from this iteration's scores
         if len(self.online_novelty) <= min_samples:
             return False
         self.recalibrate(np.asarray(self.online_novelty), np.asarray(self.online_safety),
