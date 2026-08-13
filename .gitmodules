@@ -7,3 +7,9 @@
 [submodule "robometer"]
 	path = robometer
 	url = git@github.com:robometer/robometer.git
+[submodule "baselines/DiffDAgger"]
+	path = baselines/DiffDAgger
+	url = https://github.com/sean1295/DiffDAgger.git
+[submodule "baselines/thriftydagger"]
+	path = baselines/thriftydagger
+	url = https://github.com/ryanhoque/thriftydagger.git
