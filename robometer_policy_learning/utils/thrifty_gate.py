@@ -1,4 +1,4 @@
-"""ThriftyDAgger baseline (Hoque et al., CoRL 2021), using the authors' own networks."""
+"""ThriftyDAgger baseline"""
 
 import copy
 import os
@@ -20,7 +20,7 @@ POS_FRACTION = 0.1
 
 
 class _Space:
-    """Replacement for gym Space"""
+    """Replacement for gym Space."""
     def __init__(self, dim: int, high: float = 1.0):
         self.shape = (int(dim),)
         self.high = np.full((int(dim),), float(high), dtype=np.float32)
@@ -39,8 +39,11 @@ def compute_loss_pi(ac: Ensemble, obs, act, i: int):
 
 def compute_loss_q(ac: Ensemble, ac_targ: Ensemble, obs, act, obs2, next_act, rew, done,
                    gamma: float):
-    """Here for the target we used the diffusion policy's action instead of the ensemble's
-    action since this is what's eventually executed."""
+    """Bellman loss for the twin Q critics.
+
+    The action used at the next state comes from the diffusion policy, not from the ensemble,
+    because the diffusion policy is what actually drives the robot.
+    """
     q1, q2 = ac.q1(obs, act), ac.q2(obs, act)
     with torch.no_grad():
         backup = rew + gamma * (1 - done) * torch.min(
@@ -61,12 +64,11 @@ def _encode_batch(algo, obs):
 
 
 def bootstrap_indices(n: int, rng: np.random.Generator) -> np.ndarray:
-    """Sampling with replacement to create distinct buffers that train each ensemble policy."""
+    """Draw n row numbers with replacement."""
     return rng.integers(0, n, size=n) if n else np.empty(0, dtype=np.int64)
 
 
 def _buffer_parts(buf) -> List[Any]:
-    """For breaking down the MixedReplayBuffer (or an explicit list of stores)."""
     if isinstance(buf, (list, tuple)):
         return [p for b in buf if b is not None for p in _buffer_parts(b)]
     if hasattr(buf, "buffer_1") and hasattr(buf, "buffer_2"):
@@ -111,11 +113,8 @@ def _cat_batches(batches: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 class _IndexSpace:
-    """A single index space over every store in the buffer.
-
-    The reference bootstraps over one ``replay_buffer`` holding the offline demos
-    as well as the expert corrections.
-    """
+    """Makes several separate buffers behave like one long list of transitions. Index 0 is 
+    the first row of the first buffer, and the numbering continues straight into the next buffer, and so on."""
 
     def __init__(self, buf, device):
         self.parts = _buffer_parts(buf)
@@ -135,10 +134,12 @@ class _IndexSpace:
         return _cat_batches(out)
 
     def row_indices(self, idx) -> np.ndarray:
-        """``idx`` reordered to the part-grouped row order :meth:`batch` returns.
+        """Reorder ``idx`` to match the row order :meth:`batch` actually hands back.
 
-        Anything aligned with a batch (success labels, the cached next-actions) must be gathered
-        in this order, not the caller's.
+        ``batch`` fetches one buffer at a time and glues the results together, so rows come back
+        grouped by buffer rather than in the order you asked for. Anything you line up next to a
+        batch -- success labels, the cached next-actions -- has to be reordered the same way, or
+        it ends up attached to the wrong rows.
         """
         idx = np.asarray(idx)
         out = []
@@ -259,16 +260,12 @@ def train_thrifty_models(algo, ac: Ensemble, ac_targ: Ensemble, ens_opt_fn, q_op
                          retrain_from_scratch: bool = True, num_nets: int = 5,
                          feat_dim: int = 0, act_dim: int = 0, device=None, seed: int = 0,
                          q_buffer=None, q_steps_multiplier: int = 5):
-    """Build a new ensemble and learn new policies and critics from scratch.
-
-    ``replay_buffer`` (demos + expert corrections) trains the BC ensemble, 
-    and ``qbuffer`` (demos + every executed transition, robot actions included) 
-    trains Q_risk.
-    """
+    """Fit the ensemble policies and the Q critics from scratch."""
     ens_losses, q_losses = [], []
     rng = np.random.default_rng(seed)
     bs = algo.batch_size
-    # Index spaces are built once per refresh; the stores stay lazy.
+    # Built once per refresh. Nothing is loaded here: the index space only records how many rows
+    # each buffer has, and pulls the actual transitions when a batch asks for them.
     bc_space = _IndexSpace(algo.buffer, device)
     risk_space = _IndexSpace(q_buffer if q_buffer is not None else algo.buffer, device)
     n_bc, n_t = bc_space.total, risk_space.total
@@ -428,6 +425,55 @@ class ThriftyGate:
     def describe(self) -> Dict[str, Any]:
         return dict(gate="thrifty", delta_h=self.delta_h, beta_h=self.beta_h,
                     risk_enabled=self.risk_enabled)
+
+    def plot_trace(self, stats: Dict[str, Any], save_path: str, title: Optional[str] = None):
+        """Plots novelty and qrisk for an episode."""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        trace = stats["progress_trace"]
+        pairs = [t if isinstance(t, (tuple, list)) else (t, float("nan")) for t in trace]
+        novelty = [float(p[0]) for p in pairs]
+        safety = [float(p[1]) if len(p) > 1 else float("nan") for p in pairs]
+        steps = len(pairs)
+
+        show_safety = self.risk_enabled and np.isfinite(self.beta_h)
+        n_panels = 2 if show_safety else 1
+        fig, axes = plt.subplots(n_panels, 1, figsize=(11, 3.2 * n_panels), sharex=True,
+                                 squeeze=False)
+        axes = axes[:, 0]
+
+        axes[0].plot(range(steps), novelty, color="#1f77b4", lw=1.5, zorder=2, label="novelty")
+        if np.isfinite(self.delta_h):
+            axes[0].axhline(self.delta_h, color="#2ca02c", lw=1.2, ls="--", zorder=3,
+                            label=f"delta_h={self.delta_h:.4g}")
+        axes[0].set_ylabel("ensemble novelty")
+        axes[0].legend(loc="upper left", fontsize=8)
+
+        if show_safety:
+            axes[1].plot(range(steps), safety, color="#9467bd", lw=1.5, zorder=2, label="safety")
+            axes[1].axhline(self.beta_h, color="#2ca02c", lw=1.2, ls="--", zorder=3,
+                            label=f"beta_h={self.beta_h:.4g}")
+            axes[1].set_ylabel("Q-risk safety")
+            axes[1].legend(loc="upper left", fontsize=8)
+
+        trigger_color = {"novelty": "#1f77b4", "risk": "#9467bd"}
+        for f, reason in zip(stats["gate_fires"], stats["gate_reasons"]):
+            c = trigger_color.get(reason, "#d62728")
+            for ax in axes:
+                ax.axvspan(f, steps - 1, color=c, alpha=0.08, zorder=1)
+                ax.axvline(f, color=c, lw=1.5, zorder=4)
+            axes[0].annotate(f"{reason or '?'}\n@{f}", xy=(f, max(novelty, default=1.0)),
+                             xytext=(2, -2), textcoords="offset points", ha="left", va="top",
+                             fontsize=7, color=c)
+
+        axes[-1].set_xlabel("environment step")
+        axes[0].set_title(title or f"success={stats['success']}  "
+                                   f"interventions={stats['num_interventions']}")
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=120)
+        plt.close(fig)
 
 
 class ThriftyScorer:
