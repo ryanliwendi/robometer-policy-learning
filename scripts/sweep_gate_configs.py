@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Try thousands of gate settings on already-recorded episodes and find the best ones.
+"""Try gate configs on prerecorded offline episodes and store them. Gates include robometer 
+and baselines (timeout, absolute thres).
 
-Every rollout run saves the Robometer progress curve for each episode. This script replays the
-gate over those saved curves, so we can test a huge grid of settings in minutes instead of
-re-running the robot.
-
-Each setting gets two scores:
+Each config gets two scores:
   - accuracy: does it fire on the failures and stay quiet on the successes (balanced accuracy)
-  - speed: how early it fires, as a fraction of the episode length
+  - latency: how early it fires, as a fraction of the episode length
 
 Usage:
     uv run python scripts/sweep_gate_configs.py <episode_stat_dir> \
@@ -39,17 +36,17 @@ def _avg_ranks(W: np.ndarray) -> np.ndarray:
     order = np.argsort(W, axis=1, kind="stable")
     Ws = np.take_along_axis(W, order, axis=1)
 
-    neq = np.empty((n, w), dtype=bool)          # True where a new run of equal values starts
+    neq = np.empty((n, w), dtype=bool)  # True where a new run of equal values starts
     neq[:, 0] = True
     neq[:, 1:] = Ws[:, 1:] != Ws[:, :-1]
-    last = np.empty((n, w), dtype=bool)         # True where a run of equal values ends
+    last = np.empty((n, w), dtype=bool)  # True where a run of equal values ends
     last[:, -1] = True
     last[:, :-1] = neq[:, 1:]
 
     ar = np.arange(w)
     grp_start = np.maximum.accumulate(np.where(neq, ar, -1), axis=1)
     grp_end = np.minimum.accumulate(np.where(last, ar, w)[:, ::-1], axis=1)[:, ::-1]
-    avg_sorted = (grp_start + grp_end) / 2.0    # everyone in a run gets the run's middle position
+    avg_sorted = (grp_start + grp_end) / 2.0   # everyone in a run gets the run's middle position
 
     ranks = np.empty((n, w), dtype=np.float64)
     np.put_along_axis(ranks, order, avg_sorted, axis=1)
@@ -116,7 +113,7 @@ def drop_first_fires(v: np.ndarray, sws, dthrs, mags) -> dict:
     for sw in sws:
         corr = rolling_spearman(v, sw)
         mag_arr = rolling_dropmag(v, sw)
-        valid = ~np.isnan(corr)                      # a flat or too-short window is not a drop
+        valid = ~np.isnan(corr)  # a flat or too-short window is not a drop
         for dthr in dthrs:
             below = valid & (corr < dthr)
             for m in mags:
@@ -132,7 +129,7 @@ def plateau_first_fires(v: np.ndarray, lws, pthrs) -> dict:
         corr = rolling_spearman(v, lw)
         isnan = np.isnan(corr)
         ready = np.zeros(len(v), dtype=bool)
-        ready[lw - 1:] = True                        # can't call a plateau without a full window
+        ready[lw - 1:] = True   # can't call a plateau without a full window
         for p in pthrs:
             mask = ready & (isnan | (corr < p))
             out[(lw, p)] = _first_true(mask)
@@ -158,17 +155,6 @@ def metrics_from_fires(fire_s: np.ndarray, fire_f: np.ndarray, horizon: int) -> 
         medfire=medfire,
         n_caught=int(caught.sum()),
     )
-
-
-def pareto(rows, ykey="balacc", xkey="avg_tdet"):
-    """Keep only the settings that nothing else beats on both scores at once (higher y, lower x)."""
-    order = sorted(range(len(rows)), key=lambda i: (rows[i][xkey], -rows[i][ykey]))
-    front, best = [], -np.inf
-    for i in order:
-        if rows[i][ykey] > best + 1e-12:
-            best = rows[i][ykey]
-            front.append(rows[i])
-    return front
 
 
 def main():
