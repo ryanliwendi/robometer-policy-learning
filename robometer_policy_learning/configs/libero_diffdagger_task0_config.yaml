@@ -14,7 +14,7 @@ debug: false
 # alpha-quantile of the training-data loss distribution and recalibrated after every retrain.
 # No Robometer is loaded.  Paper: arXiv:2410.14868, Algorithm 1 + Table IV.
 
-load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-23/22-08-45  # task-0 student
+load_dir: /scr/liryan/robometer_policy_learning/outputs/task0_dp_50k/22-08-45  # task-0 student
 checkpoint: 50000  # ~56% success (wide headroom under pi0's 88%)
 
 rdagger:

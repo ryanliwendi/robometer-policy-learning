@@ -5,10 +5,12 @@ defaults:
 
 debug: false
 
-load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-12/20-06-31  # Student policy dir
+load_dir: /scr/liryan/robometer_policy_learning/outputs/task1_dp_50k/20-06-31  # Student policy dir
 checkpoint: 50000  # 64% success rate
 
 rdagger:
+  gate_type: robometer
+
   expert_type: pi0  # 88% success rate
   pi0_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero
   expert_dir: null        # unused when expert_type=pi0
@@ -18,11 +20,11 @@ rdagger:
 
   # Gating
   method: spearman
-  short_window: 50
-  drop_threshold: -0.9
-  long_window: 250
-  plateau_threshold: 0.1
-  min_drop_magnitude: 0.1
+  short_window: 100
+  drop_threshold: -0.7
+  min_drop_magnitude: 0.2
+  long_window: 275
+  plateau_threshold: 0.0
   smoothing: 0.0
   score_every: 1
 
@@ -30,18 +32,11 @@ rdagger:
 
   # DAgger
   num_iterations: 10
-  rollouts_per_iter: 10
+  expert_transitions_per_iter: 1500
   train_steps_per_iter: 2000
   use_offline: true         # mixing with the original demos
   offline_sample_ratio: 0.25
 
-  # Expert-only training recipe, held IDENTICAL across all four task-1 arms (rdagger, diffdagger,
-  # thriftydagger, hgdagger) so a policy difference is attributable to the GATE alone. Only the
-  # gate-selected corrections train the policy; no clean student successes, no IWR reweighting.
-  # (Was store_only_expert=false + reweighting=iwr; that made rdagger the odd one out and made
-  # cross-arm comparison contestable. HG-DAgger cannot keep clean successes at all -- an episode
-  # is kept only when the human intervened AND the rescue succeeded -- so expert-only is the one
-  # recipe all four arms can actually run.)
   store_only_expert: true
   reweighting: null
   iwr_target_intv: 0.8      # inert while reweighting=null
@@ -63,8 +58,7 @@ alg:
 
 # Eval
 eval:
-  eval_freq: 10000
-  eval_num_episodes: 25
+  eval_num_episodes: 50
   eval_record_video: true
   eval_on_first_step: true
 
@@ -74,5 +68,5 @@ logging:
   wandb_entity: liryan-usc
   wandb_offline: false
   wandb_log_dir_base: logs/wandb
-  wandb_name: "rdagger_dp_task1_pi0_expertonly_takeover"
+  wandb_name: "rdagger_dp_task1_rdagger"
   log_level: "INFO"

@@ -14,7 +14,7 @@ debug: false
 # alpha-quantile of the training-data loss distribution and recalibrated after every retrain.
 # No Robometer is loaded.
 
-load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-12/20-06-31
+load_dir: /scr/liryan/robometer_policy_learning/outputs/task1_dp_50k/20-06-31
 checkpoint: 50000  # same 64%-success student the Robometer arm starts from
 
 rdagger:
@@ -45,11 +45,8 @@ rdagger:
   expert_n_action_steps: 5
 
   # Identical to the Robometer arm.
-  num_iterations: 5
-  rollouts_per_iter: 10
-  # Budget the iteration by expert transitions instead of episodes -- the axis that makes
-  # two gates comparable at equal human effort. Set to an int to override rollouts_per_iter.
-  expert_transitions_per_iter: null
+  num_iterations: 10
+  expert_transitions_per_iter: 1500
   train_steps_per_iter: 2000
   use_offline: true
   offline_sample_ratio: 0.25
@@ -73,8 +70,7 @@ alg:
   online_alg_name: null
 
 eval:
-  eval_freq: 10000
-  eval_num_episodes: 25
+  eval_num_episodes: 50
   eval_record_video: true
   eval_on_first_step: true
 

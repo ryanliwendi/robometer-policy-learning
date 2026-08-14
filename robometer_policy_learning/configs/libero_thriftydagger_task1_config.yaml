@@ -15,7 +15,7 @@ debug: false
 # (1 - P(reach goal)). Both are retrained and both thresholds re-derived every iteration.
 # No Robometer is loaded.
 
-load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-12/20-06-31
+load_dir: /scr/liryan/robometer_policy_learning/outputs/task1_dp_50k/20-06-31
 checkpoint: 50000  # same 64%-success student the Robometer arm starts from
 
 rdagger:
@@ -28,16 +28,6 @@ rdagger:
 
   reward_model: null  # unused: Diff-DAgger gates on the student, not on Robometer
 
-  # ThriftyDAgger gate. alpha_h is the target intervention RATE: thresholds are set to the
-  # (1 - alpha_h)-quantiles of novelty and risk over buffer states, recomputed each iteration.
-  # The paper uses 0.01 for peg insertion.
-  # Target intervention rate. NOTE: this is a per-STEP hazard, and the authors assume the human
-  # hands control back after a few steps so the budget is spent per-step. Under our one-way
-  # takeover a single fire costs the rest of the episode, so the episode-level gating rate is
-  # 1-(1-alpha_h)^episode_len. At the authors' 0.01 over ~250-step episodes that is ~92% of
-  # episodes gated (measured: 89-90%), firing at median step 46-77 -- before the student's own
-  # failures appear, so the expert data is near-initial-state demos rather than corrections.
-  # 0.001 puts the EPISODE-level rate near 25%, matching the rdagger arm's 24-26%.
   thrifty_alpha_h: 0.001
   thrifty_num_nets: 5
   thrifty_train_steps: 200
@@ -52,10 +42,7 @@ rdagger:
 
   # Identical to the Robometer arm.
   num_iterations: 10
-  rollouts_per_iter: 10
-  # Budget the iteration by expert transitions instead of episodes -- the axis that makes
-  # two gates comparable at equal human effort. Set to an int to override rollouts_per_iter.
-  expert_transitions_per_iter: null
+  expert_transitions_per_iter: 1500
   train_steps_per_iter: 2000
   use_offline: true
   offline_sample_ratio: 0.25
@@ -79,8 +66,7 @@ alg:
   online_alg_name: null
 
 eval:
-  eval_freq: 10000
-  eval_num_episodes: 25
+  eval_num_episodes: 50
   eval_record_video: true
   eval_on_first_step: true
 

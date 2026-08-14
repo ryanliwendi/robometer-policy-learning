@@ -45,7 +45,7 @@ debug: false
 #   rdagger.num_iterations=3 rdagger.rollouts_per_iter=5
 
 
-load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-12/20-06-31
+load_dir: /scr/liryan/robometer_policy_learning/outputs/task1_dp_50k/20-06-31
 checkpoint: 50000 
 
 rdagger:

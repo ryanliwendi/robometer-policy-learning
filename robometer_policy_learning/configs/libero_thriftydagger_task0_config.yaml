@@ -15,7 +15,7 @@ debug: false
 # (1 - P(reach goal)). Both are retrained and both thresholds re-derived every iteration.
 # No Robometer is loaded.
 
-load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-23/22-08-45
+load_dir: /scr/liryan/robometer_policy_learning/outputs/task0_dp_50k/22-08-45
 checkpoint: 50000
 
 rdagger:

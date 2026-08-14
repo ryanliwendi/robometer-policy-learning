@@ -5,7 +5,7 @@ defaults:
 
 debug: true  # record collection episodes + per-intervention Robometer progress plots
 
-load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-23/22-08-45  # task-0 student
+load_dir: /scr/liryan/robometer_policy_learning/outputs/task0_dp_50k/22-08-45  # task-0 student
 checkpoint: 50000  # ~56% success (wide headroom under pi0's 88%)
 
 # env/training/model/policy adopted from <load_dir>/.hydra (task_id=0, n_act=10). This run dir is
