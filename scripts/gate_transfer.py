@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """Evaluation: does a gate config tuned on one task still work on another task?
 
-There are two separate modes here:
+Two modes, both scored by the same number: the LATENCY PENALTY at matched balanced accuracy. A
+transferred config's detection time is divided by the detection time of the fastest native config
+that is at least as accurate.
 
-  no flags   Runs the source's whole frontier (~50 configs) on the target. Prints the median
-             latency penalty. `--slack` is unused.
-  --best     Runs ONE config per task, picked by `best_config` under `--slack`, on all four tasks.
-             Prints TPR, TNR, balacc, tdet, medfire.
+  --mode 1   Tune on ONE task, test on the other three. 
+  --mode 2   Tune on THREE tasks jointly, test on the fourth.
 
-Penalty is measured at matched balanced accuracy: a transferred config's detection time against
-the fastest native config that is at least as accurate.
+Both modes need a delta: how much balanced accuracy the chosen config may give up against the best
+config on the tuning task(s). Each mode is run at several deltas and the one with the lowest mean
+penalty is reported in full.
 
 Usage:
-    uv run python scripts/gate_transfer.py                     # whole-frontier transfer, 4x4
-    uv run python scripts/gate_transfer.py --pair t1 t8        # every config, one pair
-    uv run python scripts/gate_transfer.py --best --slack 0.015  # one config per task, 4x4
+    uv run python scripts/gate_transfer.py     # both modes, default deltas
+    uv run python scripts/gate_transfer.py --mode 2
+    uv run python scripts/gate_transfer.py --mode 1 --deltas 0 0.01 0.02
 """
 
 import argparse
@@ -32,9 +33,11 @@ CORPORA = {
     "t1": "gated_videos/n200_t1_dp/episode_stats.json",
     "t5": "gated_videos/n200_t5_dp/episode_stats.json",
     "t8": "gated_videos/n200_t8_dp/episode_stats.json",
+    "t4": "gated_videos/n200_t4/episode_stats.json",  # only used by --extra
 }
 TASKS = ["t0", "t1", "t5", "t8"]
 FRONT_DIR = os.environ.get("GATE_FRONT_DIR", "outputs/gate_frontier_n200")
+DELTAS = [0.0, 0.01, 0.02, 0.03, 0.05]  # balanced accuracy `slack` levels when picking a config
 
 
 class Corpus:
@@ -112,6 +115,49 @@ def load_front(tag):
     return front
 
 
+def native_at(front, balacc):
+    """Detection time of the fastest config on `front` that is at least as accurate as `balacc`."""
+    ok = [r["avg_tdet"] for r in front if r["balacc"] >= balacc - 1e-9]
+    return min(ok) if ok else float("nan")
+
+
+def cfg_key(r):
+    """The six numbers that identify a config, used to match the same config across tasks."""
+    return (r.get("smoothing") or 0.0, r.get("sw"), r.get("dthr"),
+            r.get("mag"), r.get("lw"), r.get("pthr"))
+
+
+_ROWS = {}
+
+
+def load_rows(tag, family="gate"):
+    """All swept configs for one task, as a dict of config -> its measured numbers on that task."""
+    if (tag, family) not in _ROWS:
+        blob = json.load(open(os.path.join(FRONT_DIR, f"{tag}_dp.json")))
+        _ROWS[(tag, family)] = {cfg_key(r): r for r in blob["rows"]
+                                if r["family"] == family and np.isfinite(r.get("balacc", np.nan))}
+    return _ROWS[(tag, family)]
+
+
+def joint_best_config(tags, family="gate", slack=0.0):
+    """One config that stays within `slack` of the best balanced accuracy on every task in `tags`.
+
+    Among the configs that pass on all of them, take the one with the lowest mean detection time.
+    Returns None when no single config passes on all tasks (happens at slack 0).
+    """
+    tabs = [load_rows(t, family) for t in tags]
+    tops = [max(r["balacc"] for r in tab.values()) for tab in tabs]
+    keys = set(tabs[0])
+    for tab in tabs[1:]:
+        keys &= set(tab)
+    ok = [k for k in keys
+          if all(tab[k]["balacc"] >= top - slack - 1e-9 for tab, top in zip(tabs, tops))]
+    if not ok:
+        return None
+    best = min(ok, key=lambda k: float(np.mean([tab[k]["avg_tdet"] for tab in tabs])))
+    return tabs[0][best]
+
+
 def best_config(tag, family="gate", slack=0.0):
     """The config on the pareto frontier, with balanced accuracy being `slack` away from the best
     balanced accuracy.
@@ -131,12 +177,11 @@ def best_config(tag, family="gate", slack=0.0):
 
 
 def best_config_matrix(corpora, slack=0.0):
-    """Build the 4x4 table: each task's chosen best config (under slack) run on all four tasks.
+    """MODE 1 table: each task's chosen best config (under slack) run on all four tasks.
 
     Each row carries two comparisons:
-      * against the target's OWN shipped config -- what you lose by not retuning
-      * `penalty`, against the fastest native config that is at least as accurate as what the
-        transferred config actually reached.
+      * against the target's own config with the same pre-transfer BA level; measures both drop in BA and latency
+      * `penalty`, against the fastest native config with the same post-transfer BA level
     """
     fronts = {t: load_front(t) for t in TASKS}
     rows = []
@@ -147,8 +192,7 @@ def best_config_matrix(corpora, slack=0.0):
             tgt = corpora[t]
             m = tgt.evaluate(cfg)
             own = best_config(t, slack=slack)
-            ok = [r["avg_tdet"] for r in fronts[t] if r["balacc"] >= m["balacc"] - 1e-9]
-            nat = min(ok) if ok else float("nan")
+            nat = native_at(fronts[t], m["balacc"])
             rows.append(dict(
                 source=s, target=t, cfg=cfg_str(cfg), lw=cfg.get("lw"),
                 tpr=m["recall"], tnr=1.0 - m["fpr"], balacc=m["balacc"],
@@ -158,6 +202,120 @@ def best_config_matrix(corpora, slack=0.0):
                 own_tdet=own["avg_tdet"], own_medfire=own.get("medfire", float("nan")),
             ))
     return rows
+
+
+def holdout_matrix(corpora, slack=0.0):
+    """MODE 2 table: tune on three tasks jointly, test on the fourth. One row per held-out task."""
+    fronts = {t: load_front(t) for t in TASKS}
+    rows = []
+    for t in TASKS:
+        calib = [x for x in TASKS if x != t]
+        cfg_row = joint_best_config(calib, slack=slack)
+        if cfg_row is None:
+            rows.append(dict(target=t, calib=calib, cfg=None, penalty=float("nan")))
+            continue
+        cfg = as_cfg(cfg_row)
+        m = corpora[t].evaluate(cfg)
+        nat = native_at(fronts[t], m["balacc"])
+        own = best_config(t, slack=slack)
+        # How far the config fell below each tuning task's best balanced accuracy. All of these are
+        # <= slack by construction; printing them shows how much of the budget was actually spent.
+        tabs = {c: load_rows(c) for c in calib}
+        gaps = {c: max(r["balacc"] for r in tabs[c].values()) - tabs[c][cfg_key(cfg_row)]["balacc"]
+                for c in calib}
+        rows.append(dict(
+            target=t, calib=calib, cfg=cfg_str(cfg), lw=cfg.get("lw"),
+            tpr=m["recall"], tnr=1.0 - m["fpr"], balacc=m["balacc"],
+            avg_tdet=m["avg_tdet"], medfire=m["medfire"],
+            penalty=100 * (m["avg_tdet"] / nat - 1), native_at_balacc=nat,
+            calib_gap=max(gaps.values()),
+            own_balacc=own["balacc"], own_tdet=own["avg_tdet"],
+        ))
+    return rows
+
+
+def external_matrix(corpora, tag, slack=0.0):
+    """Test on a task that took no part in tuning, and no part in choosing delta.
+
+    Two things are run on `tag`: the config tuned jointly on all four tasks in TASKS, and the four
+    leave-one-out configs from mode 2. The first is the one you would actually ship; the other four
+    show how much the answer moves when the tuning set changes.
+    """
+    front = load_front(tag)
+    own = best_config(tag, slack=slack)
+    cands = [("all 4", joint_best_config(TASKS, slack=slack))]
+    for t in TASKS:
+        cands.append((f"all but {t}", joint_best_config([x for x in TASKS if x != t], slack=slack)))
+    rows = []
+    for name, cfg_row in cands:
+        if cfg_row is None:
+            rows.append(dict(tuned_on=name, target=tag, cfg=None, penalty=float("nan")))
+            continue
+        cfg = as_cfg(cfg_row)
+        m = corpora[tag].evaluate(cfg)
+        nat = native_at(front, m["balacc"])
+        rows.append(dict(
+            tuned_on=name, target=tag, cfg=cfg_str(cfg), lw=cfg.get("lw"),
+            tpr=m["recall"], tnr=1.0 - m["fpr"], balacc=m["balacc"],
+            avg_tdet=m["avg_tdet"], medfire=m["medfire"],
+            penalty=100 * (m["avg_tdet"] / nat - 1), native_at_balacc=nat,
+            own_balacc=own["balacc"], own_tdet=own["avg_tdet"],
+        ))
+    return rows
+
+
+def print_external_matrix(rows, tag, label):
+    """Prints the --extra table: several tuning sets, all tested on the same unseen task."""
+    print(f"\n=== transfer onto {tag} (never tuned on, never used to pick delta), {label} ===")
+    hdr = (f"  {'tuned on':<12}{'TPR':>7}{'TNR':>7}{'balacc':>8}{'tdet':>7}{'medfire':>9}"
+           f"{'native':>8}{'pen%':>7}   config")
+    print(hdr); print("  " + "-" * (len(hdr) - 2))
+    for r in rows:
+        if r["cfg"] is None:
+            print(f"  {r['tuned_on']:<12}   no config stays within slack on every tuning task")
+            continue
+        mf = f"{r['medfire']:.0f}" if np.isfinite(r["medfire"]) else "-"
+        print(f"  {r['tuned_on']:<12}{r['tpr']:>7.3f}{r['tnr']:>7.3f}{r['balacc']:>8.3f}"
+              f"{r['avg_tdet']:>7.3f}{mf:>9}{r['native_at_balacc']:>8.3f}{r['penalty']:>7.1f}"
+              f"   {r['cfg']}")
+    got = [r for r in rows if np.isfinite(r["penalty"])]
+    if got:
+        print(f"\n  {tag} retuned on itself: balacc {got[0]['own_balacc']:.3f}  "
+              f"tdet {got[0]['own_tdet']:.3f}")
+        d_ba = np.mean([r["balacc"] - r["own_balacc"] for r in got])
+        d_td = np.mean([r["avg_tdet"] - r["own_tdet"] for r in got])
+        d_td_pct = 100 * np.mean([r["avg_tdet"] / r["own_tdet"] - 1 for r in got])
+        print(f"  COST OF NOT RETUNING: balacc {d_ba:+.3f}   tdet {d_td:+.3f} ({d_td_pct:+.0f}%)")
+        pens = [r["penalty"] for r in got]
+        print(f"  LATENCY PENALTY AT MATCHED BALACC: mean {np.mean(pens):+.1f}%  "
+              f"median {np.median(pens):+.1f}%  worst {max(pens):+.1f}%")
+
+
+def print_holdout_matrix(rows, label):
+    """Prints the mode 2 table: one row per held-out task."""
+    print(f"\n=== leave-one-task-out transfer, {label} ===")
+    hdr = (f"  {'held out':<10}{'TPR':>7}{'TNR':>7}{'balacc':>8}{'tdet':>7}{'medfire':>9}"
+           f"{'native':>8}{'pen%':>7}{'gap':>7}   config (tuned on the other 3)")
+    print(hdr); print("  " + "-" * (len(hdr) - 2))
+    for r in rows:
+        if r["cfg"] is None:
+            print(f"  {r['target']:<10}   no config stays within slack on all of "
+                  f"{', '.join(r['calib'])}")
+            continue
+        mf = f"{r['medfire']:.0f}" if np.isfinite(r["medfire"]) else "-"
+        print(f"  {r['target']:<10}{r['tpr']:>7.3f}{r['tnr']:>7.3f}{r['balacc']:>8.3f}"
+              f"{r['avg_tdet']:>7.3f}{mf:>9}{r['native_at_balacc']:>8.3f}{r['penalty']:>7.1f}"
+              f"{r['calib_gap']:>7.3f}   {r['cfg']}")
+    got = [r for r in rows if np.isfinite(r["penalty"])]
+    if got:
+        d_ba = np.mean([r["balacc"] - r["own_balacc"] for r in got])
+        d_td = np.mean([r["avg_tdet"] - r["own_tdet"] for r in got])
+        d_td_pct = 100 * np.mean([r["avg_tdet"] / r["own_tdet"] - 1 for r in got])
+        # vs the held-out task's own shipped config: which operating point you ended up on.
+        print(f"\n  COST OF NOT RETUNING: balacc {d_ba:+.3f}   tdet {d_td:+.3f} ({d_td_pct:+.0f}%)")
+        pens = [r["penalty"] for r in got]
+        print(f"  LATENCY PENALTY AT MATCHED BALACC: mean {np.mean(pens):+.1f}%  "
+              f"median {np.median(pens):+.1f}%  worst {max(pens):+.1f}%")
 
 
 def print_best_matrix(rows, label):
@@ -219,86 +377,95 @@ def pareto(rows, ykey="balacc", xkey="avg_tdet"):
     return front
 
 
-def transfer(src, tgt_corpus, verbose=False):
-    """Run every config on src's frontier against tgt, and return one dict per config."""
-    src_front = load_front(src)
-    native_front = load_front(tgt_corpus.tag)
+def transferred_rows(rows, mode):
+    """The rows that were actually transferred: mode 1 drops the diagonal, and every mode drops the
+    tasks where no config was feasible."""
+    return [r for r in rows
+            if (mode != 1 or r["source"] != r["target"]) and np.isfinite(r["penalty"])]
 
-    def native_at(b):
-        """Detection time of the fastest native config that is at least as accurate as `b`."""
-        ok = [r["avg_tdet"] for r in native_front if r["balacc"] >= b - 1e-9]
-        return min(ok) if ok else float("nan")
 
-    rows = []
-    for r in src_front:
-        c = as_cfg(r)
-        m = tgt_corpus.evaluate(c)
-        rows.append(dict(
-            src_balacc=r["balacc"], src_tdet=r["avg_tdet"], cfg=c,
-            **m, penalty=100 * (m["avg_tdet"] / native_at(m["balacc"]) - 1)))
-    if verbose:
-        print(f"  {'lw':>6} | {'balacc':>7}{'FPR':>6}{'tdet':>7}{'pen%':>6}   config")
-        for r in rows:
-            print(f"  {str(r['cfg'].get('lw')):>6} | {r['balacc']:>7.3f}{r['fpr']:>6.3f}"
-                  f"{r['avg_tdet']:>7.3f}{r['penalty']:>6.0f}   {cfg_str(r['cfg'])}")
-    return rows
+def sweep_deltas(corpora, deltas, mode, extra=None):
+    """Run one mode at several deltas. Prints one line per delta and returns the rows of each.
+
+    pen% is the latency penalty at matched balanced accuracy. dBA and dtdet are the cost of not
+    retuning: the transferred config minus the target's own config, before transfer.
+    """
+    per_delta = {}
+    name = f"mode {mode}" if mode != 3 else f"transfer onto {extra}"
+    print(f"\n=== {name} delta sweep ===")
+    print(f"  {'delta':>7}{'mean%':>9}{'median%':>9}{'worst%':>9}{'n':>5}{'dBA':>9}{'dtdet':>9}")
+    for d in deltas:
+        if mode == 1:
+            rows = best_config_matrix(corpora, slack=d)
+        elif mode == 2:
+            rows = holdout_matrix(corpora, slack=d)
+        else:
+            rows = external_matrix(corpora, extra, slack=d)
+        per_delta[d] = rows
+        got = transferred_rows(rows, mode)
+        if not got:
+            print(f"  {d:>7.3f}{'-':>9}{'-':>9}{'-':>9}{0:>5}{'-':>9}{'-':>9}   no feasible config")
+            continue
+        pens = [r["penalty"] for r in got]
+        d_ba = np.mean([r["balacc"] - r["own_balacc"] for r in got])
+        d_td = np.mean([r["avg_tdet"] - r["own_tdet"] for r in got])
+        print(f"  {d:>7.3f}{np.mean(pens):>9.1f}{np.median(pens):>9.1f}"
+              f"{max(pens):>9.1f}{len(pens):>5}{d_ba:>+9.3f}{d_td:>+9.3f}")
+    return per_delta
+
+
+def mean_penalty(rows, mode):
+    got = transferred_rows(rows, mode)
+    return float(np.mean([r["penalty"] for r in got])) if got else float("inf")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pair", nargs=2, default=None)
-    ap.add_argument("--best", action="store_true",
-                    help="transfer matrix for one config per task (TPR/TNR/medfire)")
-    ap.add_argument("--save", default=None, help="write the --best rows to this JSON")
-    ap.add_argument("--slack", type=float, default=0.0,
-                    help="how much balanced accuracy to give up when picking each task's config. "
-                         "Only used with --best.")
+    ap.add_argument("--mode", default="both", choices=["1", "2", "both"],
+                    help="1 = tune on one task, test on the other three. "
+                         "2 = tune on three tasks jointly, test on the fourth.")
+    ap.add_argument("--deltas", nargs="*", type=float, default=DELTAS,
+                    help="balanced accuracy budgets to try when picking a config")
+    ap.add_argument("--extra", default=None,
+                    help="also test on this task, which is not in TASKS. It took no part in "
+                         "tuning and no part in picking delta, so it checks the whole recipe.")
+    ap.add_argument("--fix-delta", type=float, default=None,
+                    help="print the detail table at this delta instead of the lowest-penalty one")
+    ap.add_argument("--save", default=None, help="write the winning delta's rows to this JSON")
     args = ap.parse_args()
 
-    corpora = {t: Corpus(t) for t in TASKS}
-
-    # Mode 1: one config per task, chosen by `best_config` under `--slack`
-    if args.best:
-        rows = best_config_matrix(corpora, slack=args.slack)
-        print_best_matrix(rows, f"slack {args.slack:g}")
-        if args.save:
-            os.makedirs(os.path.dirname(args.save) or ".", exist_ok=True)
-            json.dump(rows, open(args.save, "w"), indent=1)
-            print(f"\n-> {args.save}")
-        return
-
-    # Mode 2: the whole frontier, about 50 configs per source.
+    tags = TASKS + ([args.extra] if args.extra else [])
+    corpora = {t: Corpus(t) for t in tags}
     print("Task horizons (L_succ = mean successful-episode length)")
-    for t in TASKS:
+    for t in tags:
         print(f"  {t}: {corpora[t].l_succ:6.1f}   "
               f"({int(corpora[t].succ.sum())}S/{int((~corpora[t].succ).sum())}F)")
-    print()
 
-    if args.pair:
-        s, t = args.pair
-        print(f"=== {s} -> {t}")
-        transfer(s, corpora[t], verbose=True)
-        return
+    modes = [1, 2] if args.mode == "both" else [int(args.mode)]
+    if args.extra:
+        modes.append(3)
+    out = {}
+    for mode in modes:
+        per_delta = sweep_deltas(corpora, args.deltas, mode, extra=args.extra)
+        best_d = (args.fix_delta if args.fix_delta is not None
+                  else min(per_delta, key=lambda d: mean_penalty(per_delta[d], mode)))
+        rows = per_delta.get(best_d)
+        if rows is None:  # --fix-delta asked for a delta that was not swept
+            rows = per_delta[min(per_delta, key=lambda d: abs(d - best_d))]
+        label = (f"delta {best_d:g}" if args.fix_delta is not None
+                 else f"delta {best_d:g} (lowest mean penalty)")
+        if mode == 1:
+            print_best_matrix(rows, label)
+        elif mode == 2:
+            print_holdout_matrix(rows, label)
+        else:
+            print_external_matrix(rows, args.extra, label)
+        out[f"mode{mode}"] = dict(delta=best_d, rows=rows)
 
-    M = np.full((len(TASKS), len(TASKS)), np.nan)
-    for i, s in enumerate(TASKS):
-        for j, t in enumerate(TASKS):
-            if s != t:
-                M[i, j] = np.nanmedian([r["penalty"] for r in transfer(s, corpora[t])])
-
-    print("=== median matched-bal-acc latency penalty % ===")
-    hdr = "src\\tgt"
-    print(f"  {hdr:<9}" + "".join(f"{t:>8}" for t in TASKS) + f"{'row med':>10}")
-    for i, s in enumerate(TASKS):
-        cells = "".join("       -" if np.isnan(M[i, j]) else f"{M[i, j]:>8.0f}"
-                        for j in range(len(TASKS)))
-        print(f"  {s:<9}{cells}{np.nanmedian(M[i]):>10.0f}")
-    print(f"  {'col med':<9}" + "".join(f"{np.nanmedian(M[:, j]):>8.0f}" for j in range(len(TASKS)))
-          + f"{np.nanmedian(M):>10.0f}")
-
-    off = ~np.eye(len(TASKS), dtype=bool)
-    print(f"\nOVERALL: median {np.nanmedian(M[off]):+.0f}%  "
-          f"mean {np.nanmean(M[off]):+.0f}%  worst {np.nanmax(M[off]):+.0f}%")
+    if args.save:
+        os.makedirs(os.path.dirname(args.save) or ".", exist_ok=True)
+        json.dump(out, open(args.save, "w"), indent=1)
+        print(f"\n-> {args.save}")
 
 
 if __name__ == "__main__":
