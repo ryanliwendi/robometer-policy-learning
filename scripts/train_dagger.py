@@ -268,6 +268,10 @@ def main(cfg: DictConfig):
     dd_scorer = None  # DiffDAgger's scorer, calculates diffusion loss
     # Note: Thrifty DAgger recalibrates every episode but retrains every iteration
     refresh_gate = None # DiffDAgger and ThriftyDAgger; recalibrate the gate's threshold/retrain detectors
+    # ThriftyDAgger's novelty ensemble and twin Q, kept so they can be saved next to each
+    # checkpoint. They are retrained every iteration, so the last one is a much stronger detector
+    # than the demo-only fit, and without saving them that version cannot be scored afterwards.
+    thrifty_ac = None
     q_online_buffer = None   # ThriftyDAgger's Q replay buffer stores student transtions as well
     if gate_type == "diffdagger":
         from robometer_policy_learning.utils.diffdagger_gate import DiffDaggerScorer, QuantileGate
@@ -338,6 +342,7 @@ def main(cfg: DictConfig):
         scorer = ThriftyScorer(algo, ac, remove_obs_keys=remove_keys, lowdim_stats=lowdim_stats,
                                action_min=action_min, action_max=action_max, device=device)
         gate = ThriftyGate()
+        thrifty_ac = ac
 
         _thrifty_iter = {"n": 0}
 
@@ -538,6 +543,9 @@ def main(cfg: DictConfig):
             wandb_logger.log(eval_worker.run(algo.actor), step=algo.step_counter, prefix="eval")
             if (it + 1) % save_interval == 0:
                 save_checkpoint(algo, save_dir, it + 1)
+                if thrifty_ac is not None:
+                    torch.save(thrifty_ac.state_dict(),
+                               os.path.join(save_dir, str(it + 1), "thrifty_ac.pt"))
                 logger.info(f"Saved checkpoint to {os.path.join(save_dir, str(it + 1))}")
 
     except KeyboardInterrupt:
