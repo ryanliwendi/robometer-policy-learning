@@ -234,6 +234,51 @@ def holdout_matrix(corpora, slack=0.0):
     return rows
 
 
+def all4_matrix(corpora, slack=0.0):
+    """The config tuned jointly on all four tasks, run on each of those four tasks.
+
+    These are in-sample numbers: the config was fitted on these tasks. A penalty above zero means
+    the one shared config is off a task's own frontier because it has to suit all four at once.
+    """
+    cfg_row = joint_best_config(TASKS, slack=slack)
+    if cfg_row is None:
+        return []
+    cfg = as_cfg(cfg_row)
+    rows = []
+    for t in TASKS:
+        m = corpora[t].evaluate(cfg)
+        nat = native_at(load_front(t), m["balacc"])
+        own = best_config(t, slack=slack)
+        rows.append(dict(
+            target=t, cfg=cfg_str(cfg), lw=cfg.get("lw"),
+            tpr=m["recall"], tnr=1.0 - m["fpr"], balacc=m["balacc"],
+            avg_tdet=m["avg_tdet"], medfire=m["medfire"],
+            penalty=100 * (m["avg_tdet"] / nat - 1), native_at_balacc=nat,
+            own_balacc=own["balacc"], own_tdet=own["avg_tdet"],
+        ))
+    return rows
+
+
+def print_all4_matrix(rows, label):
+    """Prints the one shared config's numbers on each of the four tasks it was tuned on."""
+    if not rows:
+        print("\n  no config stays within slack on all four tasks")
+        return
+    print(f"\n=== config tuned on all 4 tasks, run on each of them (in-sample), {label} ===")
+    print(f"  config: {rows[0]['cfg']}")
+    hdr = (f"  {'task':<8}{'TPR':>7}{'TNR':>7}{'balacc':>8}{'tdet':>7}{'medfire':>9}"
+           f"{'native':>8}{'pen%':>7}   retuned on itself")
+    print(hdr); print("  " + "-" * (len(hdr) - 2))
+    for r in rows:
+        mf = f"{r['medfire']:.0f}" if np.isfinite(r["medfire"]) else "-"
+        print(f"  {r['target']:<8}{r['tpr']:>7.3f}{r['tnr']:>7.3f}{r['balacc']:>8.3f}"
+              f"{r['avg_tdet']:>7.3f}{mf:>9}{r['native_at_balacc']:>8.3f}{r['penalty']:>7.1f}"
+              f"   ba {r['own_balacc']:.3f}  tdet {r['own_tdet']:.3f}")
+    pens = [r["penalty"] for r in rows]
+    print(f"\n  LATENCY PENALTY AT MATCHED BALACC: mean {np.mean(pens):+.1f}%  "
+          f"median {np.median(pens):+.1f}%  worst {max(pens):+.1f}%")
+
+
 def external_matrix(corpora, tag, slack=0.0):
     """Test on a task that took no part in tuning, and no part in choosing delta.
 
@@ -460,6 +505,9 @@ def main():
             print_holdout_matrix(rows, label)
         else:
             print_external_matrix(rows, args.extra, label)
+            in_sample = all4_matrix(corpora, slack=best_d)
+            print_all4_matrix(in_sample, label)
+            out["all4_in_sample"] = dict(delta=best_d, rows=in_sample)
         out[f"mode{mode}"] = dict(delta=best_d, rows=rows)
 
     if args.save:
