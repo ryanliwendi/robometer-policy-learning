@@ -131,7 +131,14 @@ def best_config(tag, family="gate", slack=0.0):
 
 
 def best_config_matrix(corpora, slack=0.0):
-    """Build the 4x4 table: each task's chosen best config (under slack) run on all four tasks."""
+    """Build the 4x4 table: each task's chosen best config (under slack) run on all four tasks.
+
+    Each row carries two comparisons:
+      * against the target's OWN shipped config -- what you lose by not retuning
+      * `penalty`, against the fastest native config that is at least as accurate as what the
+        transferred config actually reached.
+    """
+    fronts = {t: load_front(t) for t in TASKS}
     rows = []
     for s in TASKS:
         cfg_row = best_config(s, slack=slack)
@@ -140,10 +147,13 @@ def best_config_matrix(corpora, slack=0.0):
             tgt = corpora[t]
             m = tgt.evaluate(cfg)
             own = best_config(t, slack=slack)
+            ok = [r["avg_tdet"] for r in fronts[t] if r["balacc"] >= m["balacc"] - 1e-9]
+            nat = min(ok) if ok else float("nan")
             rows.append(dict(
                 source=s, target=t, cfg=cfg_str(cfg), lw=cfg.get("lw"),
                 tpr=m["recall"], tnr=1.0 - m["fpr"], balacc=m["balacc"],
                 avg_tdet=m["avg_tdet"], medfire=m["medfire"],
+                penalty=100 * (m["avg_tdet"] / nat - 1), native_at_balacc=nat,
                 own_tpr=own["recall"], own_tnr=1.0 - own["fpr"], own_balacc=own["balacc"],
                 own_tdet=own["avg_tdet"], own_medfire=own.get("medfire", float("nan")),
             ))
@@ -153,14 +163,16 @@ def best_config_matrix(corpora, slack=0.0):
 def print_best_matrix(rows, label):
     """Prints the 4*4 best task transfer matrix."""
     print(f"\n=== best config transfer, {label} ===")
-    hdr = f"  {'src->tgt':<12}{'TPR':>7}{'TNR':>7}{'balacc':>8}{'tdet':>7}{'medfire':>9}   config"
+    hdr = (f"  {'src->tgt':<12}{'TPR':>7}{'TNR':>7}{'balacc':>8}{'tdet':>7}{'medfire':>9}"
+           f"{'pen%':>7}   config")
     print(hdr); print("  " + "-" * (len(hdr) - 2))
     for t in TASKS:
         for r in [x for x in rows if x["target"] == t]:
             mark = " *" if r["source"] == r["target"] else "  "
             mf = f"{r['medfire']:.0f}" if np.isfinite(r["medfire"]) else "-"
             print(f"  {r['source']+'->'+r['target']:<12}{r['tpr']:>7.3f}{r['tnr']:>7.3f}"
-                  f"{r['balacc']:>8.3f}{r['avg_tdet']:>7.3f}{mf:>9}{mark} {r['cfg']}")
+                  f"{r['balacc']:>8.3f}{r['avg_tdet']:>7.3f}{mf:>9}{r['penalty']:>7.1f}"
+                  f"{mark} {r['cfg']}")
         print()
     off = [r for r in rows if r["source"] != r["target"]]
     print(f"  transferred (off-diagonal, n={len(off)}): "
@@ -172,8 +184,13 @@ def print_best_matrix(rows, label):
     d_balacc = np.mean([r["balacc"] - r["own_balacc"] for r in off])
     d_tdet = np.mean([r["avg_tdet"] - r["own_tdet"] for r in off])
     d_tdet_pct = 100 * np.mean([r["avg_tdet"] / r["own_tdet"] - 1 for r in off])
+    pens = [r["penalty"] for r in off]
+    # vs the target's own shipped config: which operating point you ended up on.
     print(f"  COST OF NOT RETUNING: balacc {d_balacc:+.3f}   "
           f"tdet {d_tdet:+.3f} ({d_tdet_pct:+.0f}%)")
+    # vs the target's frontier at the accuracy you actually reached: how far off it you are.
+    print(f"  LATENCY PENALTY AT MATCHED BALACC: mean {np.mean(pens):+.1f}%  "
+          f"median {np.median(pens):+.1f}%  worst {max(pens):+.1f}%")
 
 
 def as_cfg(r):
