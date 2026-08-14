@@ -173,6 +173,9 @@ def plot_grid(corpora, results, out_path):
                 # and shading would compete with them.
                 _draw(ax, thin(r["native_pts"]), NATIVE, "-", "o")
                 _draw(ax, thin(r["trans_pts"]), TRANSFER, "--", "s", lw=1.8)
+                ax.text(0.97, 0.06, f"{r['ratio']:.2f}", transform=ax.transAxes,
+                        ha="right", va="bottom", fontsize=11, fontweight="medium",
+                        color=INK if r["ratio"] >= 0.85 else TRANSFER)
 
             ax.set_xlim(0.0, xmax)
             ax.set_ylim(0.48, 1.04)
@@ -194,7 +197,8 @@ def plot_grid(corpora, results, out_path):
              fontsize=10, color=INK2, ha="center")
     fig.text(0.012, 0.5, "Balanced accuracy", fontsize=10, color=INK2, va="center", rotation=90)
     fig.text(0.5, 0.945, "columns: task the gate is evaluated on      "
-                         "rows: task the gate was tuned on",
+                         "rows: task the gate was tuned on      "
+                         "number in each panel: area ratio",
              fontsize=9.5, color=INK3, ha="center")
 
     handles = [
