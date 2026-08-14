@@ -27,6 +27,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.45")
 
 import copy
+import json
 
 import numpy as np
 import torch
@@ -73,6 +74,13 @@ def plot_episode_trace(gate, stats: dict, save_path: str, title: str):
         logger.warning(f"trace plot failed for {save_path}: {e}")
 
 
+def _trace_row(p):
+    """One step of the score trace."""
+    if isinstance(p, (tuple, list, np.ndarray)):
+        return [float(x) for x in np.asarray(p).reshape(-1)]
+    return float(p)
+
+
 def dump_episode_stats(episodes, save_path: str, meta: dict | None = None):
     """Write per-episode score traces + success labels to JSON.
     ```meta["gate_type"]``` stores the gate type."""
@@ -85,7 +93,7 @@ def dump_episode_stats(episodes, save_path: str, meta: dict | None = None):
                 episode=i,
                 success=bool(s["success"]),
                 steps=int(s["steps"]),
-                progress_trace=[float(p) for p in s["score_trace"]],
+                progress_trace=[_trace_row(p) for p in s["score_trace"]],
                 gate_fires=[int(f) for f in s["gate_fires"]],
                 gate_reasons=list(s["gate_reasons"]),
                 expert_steps=int(s["expert_steps"]),
@@ -99,6 +107,32 @@ def dump_episode_stats(episodes, save_path: str, meta: dict | None = None):
         json.dump(payload, f)
     n_succ = sum(e["success"] for e in payload["episodes"])
     logger.info(f"wrote {len(payload['episodes'])} episodes ({n_succ} success) -> {save_path}")
+
+
+def dump_episode_arrays(save_path: str, obs_rows, actions, rewards, terminated, truncated,
+                        is_expert, success, meta: dict | None = None):
+    """Write one episode's observations and actions to a .npz so signals can be rescored later.
+
+    The observations are what the policy actually received: the env's DinoEmbeddingWrapper has
+    already turned the camera images into `dino_embedding`, and the raw image keys have been
+    dropped. Diff-DAgger's diffusion loss and ThriftyDAgger's ensemble and twin Q all read exactly
+    these arrays, so they can be recomputed offline without the simulator.
+    """
+    payload = {f"obs/{k}": np.asarray([r[k] for r in obs_rows])
+               for k in obs_rows[0]
+               if isinstance(obs_rows[0][k], (np.ndarray, list, int, float, np.number))}
+    payload.update(
+        action=np.asarray(actions, dtype=np.float32),
+        reward=np.asarray(rewards, dtype=np.float32),
+        terminated=np.asarray(terminated, dtype=np.float32),
+        truncated=np.asarray(truncated, dtype=np.float32),
+        is_expert=np.asarray(is_expert, dtype=bool),
+        success=np.asarray(bool(success)),
+    )
+    if meta:
+        payload["meta"] = np.asarray(json.dumps(meta))
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    np.savez_compressed(save_path, **payload)
 
 
 class Pi0Actor:
@@ -181,6 +215,7 @@ class GatedRolloutWorker:
         video_dir: str | None = None,
         video_fps: int = 20,
         video_scale: int = 2,
+        dump_dir: str | None = None,
     ):
         self.env = env
         self.student = student
@@ -201,9 +236,12 @@ class GatedRolloutWorker:
         self.video_dir = video_dir
         self.video_fps = int(video_fps)
         self.video_scale = int(video_scale)  # upscale so the time step index is readable
+        self.dump_dir = dump_dir  # Where to write the per-episode .npz of observations and actions
 
         if self.video_dir:
             os.makedirs(self.video_dir, exist_ok=True)
+        if self.dump_dir:
+            os.makedirs(self.dump_dir, exist_ok=True)
 
     def _actor_obs(self, actor, obs):
         """Get each actor the observations it was trained on."""
@@ -285,6 +323,8 @@ class GatedRolloutWorker:
         pending, pending_q = [], []
         score_trace, gate_fires, gate_reasons = [], [], []
         video_frames, video_labels = [], []
+        # Kept only when --dump-obs is on; per-step arrays for the .npz dump, 
+        dump_obs, dump_act, dump_rew, dump_term, dump_trunc, dump_exp = [], [], [], [], [], []
         last_score = 0.0
 
         while not done:
@@ -369,6 +409,14 @@ class GatedRolloutWorker:
                 video_frames.append(next_obs[self.frame_key])
                 video_labels.append(label)
 
+            if self.dump_dir:
+                dump_obs.append(cur)
+                dump_act.append(np.asarray(action, dtype=np.float32))
+                dump_rew.append(float(_scalar(rew)))
+                dump_term.append(float(terminated))
+                dump_trunc.append(float(truncated))
+                dump_exp.append(label == INTERVENTION_LABEL)
+
             obs = next_obs
             steps += 1
 
@@ -388,6 +436,15 @@ class GatedRolloutWorker:
                 t["info"]["episode_num_interventions"] = num_interventions
                 self.q_buffer.add(**t)
             q_stored = len(pending_q)
+
+        if self.dump_dir and dump_obs:
+            # One extra row so the last action has a next_obs: obs = arr[:-1], next_obs = arr[1:].
+            dump_obs.append(self._prep_obs(obs))
+            dump_episode_arrays(
+                os.path.join(self.dump_dir, f"{episode_id}.npz"),
+                dump_obs, dump_act, dump_rew, dump_term, dump_trunc, dump_exp, success,
+                meta=dict(episode_id=str(episode_id), steps=steps,
+                          num_interventions=num_interventions, gate_fires=[int(f) for f in gate_fires]))
 
         if self.video_dir:
             self._write_video(video_frames, video_labels, episode_id)
@@ -504,6 +561,9 @@ def main():
     parser.add_argument("--thrifty-lr", type=float, default=1e-3)
     parser.add_argument("--thrifty-gamma", type=float, default=0.9999)
     parser.add_argument("--video-dir", default="gated_videos")
+    parser.add_argument("--dump-obs", default=None,
+                        help="directory to write one .npz per episode with the observations and "
+                             "actions the policy saw.")
     parser.add_argument("--stats-json-dir", default="gated_videos/episode_stats.json",
                         help="per-episode progress traces + success labels (input to the offline gate sweep)")
     parser.add_argument("--seed", type=int, default=0)
@@ -718,6 +778,7 @@ def main():
         expert_n_action_steps=args.expert_n_action_steps,
         score_every=args.score_every,
         video_dir=args.video_dir,
+        dump_dir=args.dump_obs,
     )
 
     if args.gate_type == "hgdagger" and args.hg_backend == "replay":
@@ -744,6 +805,9 @@ def main():
             args.stats_json_dir,
             meta=dict(
                 gate_type=args.gate_type,
+                # What each step of progress_trace holds. One name = a list of floats; two names =
+                # a list of pairs, in this order.
+                score_names=(["novelty", "risk"] if args.gate_type == "thrifty" else ["progress"]),
                 ungated=args.ungated,  # True = the gate was recorded but never allowed to fire
                 thrifty=(base_gate.describe() if args.gate_type == "thrifty" else None),  # thrifty's fitted thresholds
                 dd_threshold=(base_gate.threshold if args.gate_type == "diffdagger" else None),
