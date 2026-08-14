@@ -111,10 +111,7 @@ def run(source, target, corpora, verbose=True):
                 native_pts=nondominated(native_pts), trans_pts=nondominated(trans_pts))
 
 
-# ---------------------------------------------------------------------------------------------
-# The figure: one panel per (source, target) pair.
-# ---------------------------------------------------------------------------------------------
-
+# --- plotting ---
 NATIVE, TRANSFER = "#2a78d6", "#eb6834"
 RULE = "#8f8bb5"
 DIAG = "#a3a19c"
@@ -226,7 +223,6 @@ def main():
     ap.add_argument("--out", default=None, help="where to write the figure")
     args = ap.parse_args()
 
-    # Only load the episodes we need; --all and --plot need every task.
     all_pairs = args.all or args.plot
     tasks = TASKS if all_pairs else sorted({args.source, args.target})
     corpora = {t: Corpus(t) for t in tasks}
@@ -255,7 +251,6 @@ def main():
     else:
         results.append(run(args.source, args.target, corpora))
 
-    # Drop the raw config dicts and keep a readable string for each, so the file stays small.
     os.makedirs(os.path.dirname(args.save), exist_ok=True)
     json.dump([{k: v for k, v in r.items()
                 if k not in ("rows", "native_front", "native_pts", "trans_pts")} | dict(
