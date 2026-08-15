@@ -13,3 +13,6 @@
 [submodule "baselines/thriftydagger"]
 	path = baselines/thriftydagger
 	url = https://github.com/ryanhoque/thriftydagger.git
+[submodule "baselines/SAFE"]
+	path = baselines/SAFE
+	url = https://github.com/vla-safe/SAFE.git

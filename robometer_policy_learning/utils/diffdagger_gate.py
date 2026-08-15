@@ -173,8 +173,12 @@ class QuantileGate:
         patience: int = 1,
         patience_window: Optional[int] = None,
         alpha: float = 0.99,
+        name: str = "diffdagger",
         **_ignored: Any,
     ):
+        # LogpZO fires on the same rule (score over the alpha-quantile of the training scores),
+        # so it reuses this class.
+        self.name = str(name)
         self.threshold = float(threshold)
         self.alpha = float(alpha)
         self.cdf: Optional[CDF] = None
@@ -215,7 +219,7 @@ class QuantileGate:
         self.history.clear()
 
     def describe(self) -> Dict[str, Any]:
-        return dict(gate="diffdagger", threshold=self.threshold, alpha=self.alpha,
+        return dict(gate=self.name, threshold=self.threshold, alpha=self.alpha,
                     calibrated=self.cdf is not None,
                     patience=self.patience, patience_window=self.patience_window)
 

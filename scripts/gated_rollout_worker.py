@@ -525,7 +525,7 @@ def main():
     parser.add_argument("--smoothing", type=float, default=0.0, help="EMA weight on history in [0,1); 0 = off")
     parser.add_argument("--score-every", type=int, default=1)  # Gate scores every score_every steps; account for real_world latency
     parser.add_argument("--gate-type",
-                        choices=["robometer", "diffdagger", "thrifty", "hgdagger"],
+                        choices=["robometer", "diffdagger", "thrifty", "logpzo", "hgdagger"],
                         default="robometer")
     parser.add_argument("--ungated", action="store_true",
                         help="build the gate and score every step, but never hand over: the "
@@ -559,6 +559,12 @@ def main():
                              "--thrifty-q-steps-multiplier")
     parser.add_argument("--thrifty-q-steps-multiplier", type=int, default=5)
     parser.add_argument("--thrifty-lr", type=float, default=1e-3)
+    parser.add_argument("--logpzo-alpha", type=float, default=0.99)
+    parser.add_argument("--logpzo-patience", type=int, default=2)
+    parser.add_argument("--logpzo-patience-window", type=int, default=None)
+    parser.add_argument("--logpzo-train-steps", type=int, default=2000)
+    parser.add_argument("--logpzo-lr", type=float, default=1e-4)
+    parser.add_argument("--logpzo-calib-samples", type=int, default=4096)
     parser.add_argument("--thrifty-gamma", type=float, default=0.9999)
     parser.add_argument("--video-dir", default="gated_videos")
     parser.add_argument("--dump-obs", default=None,
@@ -573,6 +579,9 @@ def main():
         parser.error("--expert-dir is required for --expert-type dp")
     if args.gate_type == "diffdagger" and args.student_type != "dp":
         parser.error("--gate-type diffdagger must have a diffusion policy for the student")
+    if args.gate_type == "logpzo" and args.student_type != "dp":
+        parser.error("--gate-type logpzo scores the student's own observation encoding, "
+                     "so it needs a diffusion policy student")
     if args.gate_type == "thrifty" and args.student_type != "dp":
         parser.error("--gate-type diffdagger must have a diffusion policy for the student")
 
@@ -694,6 +703,26 @@ def main():
                     f"n={info['n']} loss mean={info['loss_mean']:.6f} "
                     f"max={info['loss_max']:.6f}")
         logger.info(f"Diff-DAgger gate: {gate.describe()}")
+    elif args.gate_type == "logpzo":
+        from robometer_policy_learning.utils.diffdagger_gate import QuantileGate
+        from robometer_policy_learning.utils.logpzo_gate import (
+            LogpZOModel, LogpZOScorer, collect_logpzo_scores, train_logpzo)
+
+        algo, _ = build_offline_algo()
+        model = LogpZOModel(int(student.global_cond_dim)).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=args.logpzo_lr)
+        losses = train_logpzo(algo, model, opt, grad_steps=args.logpzo_train_steps, device=device)
+        scorer = LogpZOScorer(algo, model, remove_obs_keys=remove_obs_keys, device=device)
+        gate = QuantileGate(patience=args.logpzo_patience,
+                            patience_window=args.logpzo_patience_window, alpha=args.logpzo_alpha,
+                            name="logpzo")
+        scores = collect_logpzo_scores(algo, model, device=device,
+                                       max_rows=args.logpzo_calib_samples)
+        info = gate.recalibrate(scores)
+        logger.info(f"LogpZO fit on {pre_cfg.env.h5_dataset_path}: "
+                    f"train_loss={losses['train_loss']:.5f} val_loss={losses['val_loss']:.5f} "
+                    f"n_trans={losses['n_transitions']}")
+        logger.info(f"LogpZO gate: {gate.describe()}")
     elif args.gate_type == "thrifty":
         from robometer_policy_learning.utils.thrifty_gate import (
             ThriftyGate, ThriftyScorer, build_ensemble, collect_thrifty_scores,
@@ -811,6 +840,8 @@ def main():
                 ungated=args.ungated,  # True = the gate was recorded but never allowed to fire
                 thrifty=(base_gate.describe() if args.gate_type == "thrifty" else None),  # thrifty's fitted thresholds
                 dd_threshold=(base_gate.threshold if args.gate_type == "diffdagger" else None),
+                logpzo_threshold=(base_gate.threshold if args.gate_type == "logpzo" else None),
+                logpzo_alpha=(args.logpzo_alpha if args.gate_type == "logpzo" else None),
                 dd_alpha=(args.dd_alpha if args.gate_type == "diffdagger" else None),
                 dd_patience=args.dd_patience, dd_patience_window=args.dd_patience_window,
                 dd_batch_multiplier=args.dd_batch_multiplier,

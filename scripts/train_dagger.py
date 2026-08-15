@@ -142,6 +142,14 @@ def main(cfg: DictConfig):
     # The reference gives Q_risk 5x the BC ensemble's gradient steps (grad_steps * 5 per epoch).
     thrifty_q_steps_multiplier = int(OmegaConf.select(
         cfg, "rdagger.thrifty_q_steps_multiplier", default=5))
+    # LogpZO: same quantile firing rule as Diff-DAgger, so alpha means the same thing.
+    logpzo_alpha = float(OmegaConf.select(cfg, "rdagger.logpzo_alpha", default=0.99))
+    logpzo_patience = int(OmegaConf.select(cfg, "rdagger.logpzo_patience", default=2))
+    logpzo_patience_window = OmegaConf.select(cfg, "rdagger.logpzo_patience_window", default=None)
+    logpzo_train_steps = int(OmegaConf.select(cfg, "rdagger.logpzo_train_steps", default=2000))
+    logpzo_lr = float(OmegaConf.select(cfg, "rdagger.logpzo_lr", default=1e-4))
+    logpzo_batch_size = int(OmegaConf.select(cfg, "rdagger.logpzo_batch_size", default=256))
+    logpzo_calib_samples = int(OmegaConf.select(cfg, "rdagger.logpzo_calib_samples", default=4096))
     # HG-DAgger: 'live' needs a display; 'replay' asks the operator after each solo rollout.
     hg_backend = str(OmegaConf.select(cfg, "rdagger.hg_backend", default="live"))
     gate_kwargs = dict(
@@ -272,6 +280,7 @@ def main(cfg: DictConfig):
     # checkpoint. They are retrained every iteration, so the last one is a much stronger detector
     # than the demo-only fit, and without saving them that version cannot be scored afterwards.
     thrifty_ac = None
+    logpzo_model = None      # LogpZO's flow model, saved next to each checkpoint for the same reason
     q_online_buffer = None   # ThriftyDAgger's Q replay buffer stores student transtions as well
     if gate_type == "diffdagger":
         from robometer_policy_learning.utils.diffdagger_gate import DiffDaggerScorer, QuantileGate
@@ -310,6 +319,49 @@ def main(cfg: DictConfig):
             return info
 
         refresh_gate = _refresh_diff
+
+    elif gate_type == "logpzo":
+        from robometer_policy_learning.utils.diffdagger_gate import QuantileGate
+        from robometer_policy_learning.utils.logpzo_gate import (
+            LogpZOModel, LogpZOScorer, collect_logpzo_scores, train_logpzo)
+
+        remove_keys = list(getattr(algo.actor, "remove_obs_keys", None)
+                           or OmegaConf.select(cfg, "env.extra_keys_to_drop", default=[]) or [])
+        feat_dim = int(algo.actor.global_cond_dim)
+        logpzo_model = LogpZOModel(feat_dim).to(device)
+        logpzo_opt = torch.optim.Adam(logpzo_model.parameters(), lr=logpzo_lr)
+        scorer = LogpZOScorer(algo, logpzo_model, remove_obs_keys=remove_keys, device=device)
+        gate = QuantileGate(patience=logpzo_patience, patience_window=logpzo_patience_window,
+                            alpha=logpzo_alpha, name="logpzo")
+        _logpzo_iter = {"n": 0}
+
+        def _refresh_logpzo(tag: str):
+            """Refit the flow on everything collected so far, then reset the firing threshold."""
+            it_n = _logpzo_iter["n"]
+            buf = getattr(algo, "buffer", None)
+            restore = getattr(buf, "sample_ratio", None) if hasattr(buf, "set_sample_ratio") else None
+            if hasattr(buf, "set_sample_ratio"):
+                buf.set_sample_ratio(None)  # calibrate on offline + online, not the training mix
+            try:
+                losses = train_logpzo(algo, logpzo_model, logpzo_opt, grad_steps=logpzo_train_steps,
+                                      batch_size=logpzo_batch_size, device=device,
+                                      seed=collect_seed + 1000 * it_n)
+                scores = collect_logpzo_scores(algo, logpzo_model, device=device,
+                                               max_rows=logpzo_calib_samples)
+            finally:
+                if hasattr(buf, "set_sample_ratio"):
+                    buf.set_sample_ratio(restore)
+            _logpzo_iter["n"] = it_n + 1
+            if len(scores) == 0:
+                logger.warning(f"[logpzo:{tag}] no calibration samples; threshold unchanged")
+                return None
+            info = gate.recalibrate(scores)
+            logger.info(f"[logpzo:{tag}] threshold={info['threshold']:.4f} (alpha={logpzo_alpha}, "
+                        f"n={info['n']}) | train_loss={losses['train_loss']:.5f} "
+                        f"val_loss={losses['val_loss']:.5f} n_trans={losses['n_transitions']}")
+            return dict(info, **{f"train_{k}": v for k, v in losses.items()})
+
+        refresh_gate = _refresh_logpzo
 
     elif gate_type == "thrifty":
         import copy as _copy
@@ -546,6 +598,9 @@ def main(cfg: DictConfig):
                 if thrifty_ac is not None:
                     torch.save(thrifty_ac.state_dict(),
                                os.path.join(save_dir, str(it + 1), "thrifty_ac.pt"))
+                if logpzo_model is not None:
+                    torch.save(logpzo_model.state_dict(),
+                               os.path.join(save_dir, str(it + 1), "logpzo.pt"))
                 logger.info(f"Saved checkpoint to {os.path.join(save_dir, str(it + 1))}")
 
     except KeyboardInterrupt:

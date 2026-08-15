@@ -1,0 +1,82 @@
+defaults:
+  - algorithm@offline_algorithm: dp  # must match the student actor type
+  - reward_model: null
+  - policy@policy: transformer
+
+debug: false
+
+# LogpZO BASELINE arm for task 1. Everything except the gate is held identical to
+# libero_rdagger_task1_config.yaml (same student checkpoint, same pi0 expert, same takeover exit,
+# same expert-only training recipe), so any difference in the resulting policy is attributable to
+# the gating rule alone.
+#
+# The gate here is LogpZO (from the SAFE repo): a flow-matching density model fit to the
+# features of states in the training data, scoring a state by how far it sits from them. Only
+# the success flow is fit, so no rollout labels are needed. Thresholded at the alpha-quantile
+# of the training scores, refit and recalibrated every iteration. No Robometer is loaded.
+
+load_dir: /scr/liryan/robometer_policy_learning/outputs/task1_dp_50k/20-06-31
+checkpoint: 50000  # same 64%-success student the Robometer arm starts from
+
+rdagger:
+  gate_type: logpzo
+
+  expert_type: pi0
+  pi0_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero
+  expert_dir: null
+  expert_checkpoint: null
+
+  reward_model: null  # unused: LogpZO gates on the student's features, not on Robometer
+
+  # LogpZO gate. alpha is the quantile of the training-score distribution; patience is the same
+  # M-of-N rule Diff-DAgger uses, so the two baselines fire on the same kind of evidence.
+  logpzo_alpha: 0.99
+  logpzo_patience: 2
+  logpzo_patience_window: 2
+  # Refit each iteration on the growing buffer. The flow is far larger than the data it sees, so
+  # the held-out loss is logged every refit as an overfitting check.
+  logpzo_train_steps: 2000
+  logpzo_lr: 1e-4
+  logpzo_batch_size: 256
+  logpzo_calib_samples: 4096
+
+  # Expert completes the episode, per Diff-DAgger's protocol (and our winning recipe).
+  expert_n_action_steps: 5
+
+  # Identical to the Robometer arm.
+  num_iterations: 10
+  expert_transitions_per_iter: 1500
+  train_steps_per_iter: 2000
+  use_offline: true
+  offline_sample_ratio: 0.25
+
+  store_only_expert: true
+  reweighting: null
+  iwr_target_intv: 0.8
+
+  require_success: true
+  require_intervention: true
+
+  save_interval: 1
+  online_buffer_capacity: 200000
+  seed: 0
+
+offline_algorithm:
+  use_weighted_bc: false
+
+alg:
+  offline_alg_name: dp
+  online_alg_name: null
+
+eval:
+  eval_num_episodes: 50
+  eval_record_video: true
+  eval_on_first_step: true
+
+logging:
+  wandb_project: libero_rdagger
+  wandb_entity: liryan-usc
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "logpzo_dp_task1_baseline"
+  log_level: "INFO"
