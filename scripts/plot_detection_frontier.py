@@ -8,14 +8,14 @@ right, an episode running that long is already anomalous and a stopwatch starts 
 the part of a curve LEFT of the rule is detection rather than waiting. Under `--truncate min` the
 rule collapses onto the horizon by construction and is omitted.
 
-Two data sources, selected by `--data-dir`:
+`--data-dir` picks which recorded results to draw:
 
-  outputs/gate_frontier_n200   `gate_frontier.py` over the n=200 DP corpora. RewardGate only --
-                               those corpora carry no baseline signals. The default.
-  outputs/thrifty_frontier     `thrifty_alpha_frontier.py` over the `sigq_*` traces, which hold
-                               RewardGate's progress AND ThriftyDAgger's novelty / Q-risk on the
-                               SAME rollouts. Smaller (n~50) but it is the only source where the
-                               Thrifty curve can honestly be drawn in the same axes.
+  outputs/gate_frontier_n200   what sweep_gate_configs.py produced from the 200-episode runs. Our gate
+                               only -- those runs never recorded the baselines' scores. The default.
+  outputs/thrifty_frontier     what thrifty_alpha_frontier.py produced from the sigq_* runs, which
+                               recorded our progress score AND ThriftyDAgger's two scores on the
+                               same episodes. That is the only place the Thrifty curve can be drawn
+                               next to ours without comparing different episodes.
 
 Usage:
     uv run python scripts/plot_detection_frontier.py
@@ -35,8 +35,8 @@ import numpy as np  # noqa: E402
 DEFAULT_PANELS = ["t1_dp:Task 1", "t0_dp:Task 0", "t5_dp:Task 5", "t8_dp:Task 8"]
 NPTS = 12
 
-# categorical slots 1-3 (all-pairs validated) for the three gate variants; a warm 4th for the
-# ThriftyDAgger arm; neutrals for the trivial baselines, which should read as background.
+# Colours: three distinct ones for our gate and its two ablations, purple for ThriftyDAgger, and
+# greys for the dumb baselines so they sit in the background instead of competing for attention.
 STYLE = {
     "gate":         dict(label="Ours: drop + plateau", color="#2a78d6", lw=2.6, ls="-",
                          marker="o", ms=6.5, z=6, alpha=1.0),
@@ -50,29 +50,41 @@ STYLE = {
                          ls="--", marker="X", ms=5.5, z=5, alpha=0.95),
     "thrifty_risk": dict(label="Thrifty Q-risk only (ablation)", color="#d6b3ee", lw=1.5,
                          ls=":", marker="*", ms=6.5, z=4, alpha=0.95),
+    "diffdagger":   dict(label="Diff-DAgger (diffusion loss)", color="#d64550", lw=2.2,
+                         ls="-", marker="v", ms=6.0, z=6, alpha=1.0),
+    "logpzo":       dict(label="LogpZO (density)", color="#0f8f8f", lw=2.2,
+                         ls="-", marker="D", ms=5.5, z=6, alpha=1.0),
     "absolute":     dict(label="Absolute threshold", color="#8a8985", lw=1.5, ls="-",
                          marker="D", ms=4.0, z=3, alpha=0.9),
     "timeout":      dict(label="Timeout / periodic", color="#52514e", lw=1.5, ls=":",
                          marker="v", ms=4.5, z=3, alpha=0.9),
 }
-ORDER = ["gate", "drop_only", "plateau_only", "thrifty", "thrifty_nov", "thrifty_risk",
-         "absolute", "timeout"]
+# ThriftyDAgger's novelty-only and risk-only ablations are left off: with two more baselines on
+# the panel it was too crowded to read, and the union curve is the rule the robot actually runs.
+# Put "thrifty_nov" / "thrifty_risk" back in this list to draw them again.
+ORDER = ["gate", "drop_only", "plateau_only", "thrifty",
+         "diffdagger", "logpzo", "absolute", "timeout"]
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e3e2df"
 
-# `thrifty_alpha_frontier.py` rows carry (method, family, variant); map them onto plot families.
-# The variant is the DEPLOYED ensemble budget (`thrifty_train_steps: 200` in the arm configs) --
-# not the best of the three, which would be a per-task choice made on the eval data.
+# The Thrifty results are stored per ensemble size and per rule, so we have to say which ones to
+# draw. We draw the ensemble size the training runs actually use (thrifty_train_steps: 200), not
+# whichever of the three happened to score best -- picking that per task would flatter the baseline.
 THRIFTY_FAMILY = {"union": "thrifty", "novelty": "thrifty_nov", "risk": "thrifty_risk"}
 
 
-def select(rows, fam, protocol, variant):
-    """Rows belonging to one plot family, under one evaluation protocol."""
+def select(rows, fam, protocol, variant, quant_variants=None):
+    """Pull out just the rows for one curve on the plot."""
+    quant_variants = quant_variants or {}
     out = []
     for r in rows:
         if r.get("protocol", "insample") != protocol:
             continue
         if r.get("method") == "thrifty":
             if THRIFTY_FAMILY.get(r["family"]) == fam and r.get("variant") == variant:
+                out.append(r)
+        elif r.get("method") in quant_variants:
+            # One curve per method, at the hyperparameter setting the caller asked for.
+            if r["family"] == fam and r.get("variant") == quant_variants[r["method"]]:
                 out.append(r)
         elif r["family"] == fam:
             out.append(r)
@@ -109,10 +121,15 @@ def main():
     ap.add_argument("--protocol", choices=["insample", "cv"], default="insample",
                     help="insample matches the RewardGate-only figure; cv reads the "
                          "cross-validated rows `thrifty_alpha_frontier.py` also writes")
+    ap.add_argument("--dd-variant", default="nb500",
+                    help="which Diff-DAgger N_b setting to draw")
+    ap.add_argument("--logpzo-variant", default="s2000",
+                    help="which LogpZO training-length setting to draw")
     ap.add_argument("--thrifty-variant", default="s200",
                     help="ensemble training budget to plot; s200 is what the arm configs deploy")
     ap.add_argument("--out", default="detection_frontier.png")
     args = ap.parse_args()
+    QV = {"diffdagger": args.dd_variant, "logpzo": args.logpzo_variant}
 
     panels = [(p.split(":", 1)[0], p.split(":", 1)[1]) for p in args.panels]
     ncol = 2 if len(panels) > 1 else 1
@@ -125,7 +142,8 @@ def main():
         rows, H = blob["rows"], blob["horizon"]
         nS, nF = blob["n_success"], blob["n_failure"]
 
-        # Only meaningful when episode length still carries class information.
+        # Only worth drawing when episodes still have different lengths. If they were all trimmed
+        # to the same length, this line would sit on top of the right-hand edge and mean nothing.
         x_succ = blob["l_succ"] / H
         if x_succ < 0.98:
             drawn.add("_lsucc")
@@ -134,9 +152,11 @@ def main():
                         xytext=(5, 0), ha="left", va="bottom", fontsize=7.8, color="#4a3aa7")
 
         for fam in ORDER:
-            sub = select(rows, fam, args.protocol, args.thrifty_variant)
+            sub = select(rows, fam, args.protocol, args.thrifty_variant, QV)
             if not sub and fam in ("absolute", "timeout"):
-                sub = select(rows, fam, "insample", args.thrifty_variant)   # never cross-validated
+                # The dumb baselines have nothing to tune, so there are no cross-validated rows for
+                # them. Fall back to the plain ones rather than dropping the curve.
+                sub = select(rows, fam, "insample", args.thrifty_variant, QV)
             pts = thin(front(sub))
             if not pts:
                 continue
