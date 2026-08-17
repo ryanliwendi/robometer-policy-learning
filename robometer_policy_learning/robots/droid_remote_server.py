@@ -224,6 +224,62 @@ def extract_observation(
     return formatted_obs
 
 
+def get_teleop_controller():
+    """Build the DROID teleop controller used for human takeover.
+
+    ⚠️ VERIFY ON-RIG. The exact import/constructor depends on your DROID install and
+    teleop hardware. The default below is the Oculus Quest ``VRPolicy`` used by DROID's
+    own data-collection loop; swap in the SpaceMouse policy if that's your device.
+    """
+    from droid.controllers.oculus_controller import VRPolicy
+
+    return VRPolicy()
+
+
+def run_teleop_until_done(env, episode_state, args):
+    """Human drives THIS robot to finish the episode; returns the final success bool.
+
+    Invoked from the HANDOFF branch after the client's reward gate fires. The NUC owns the
+    arm+gripper the whole time -- autonomous (STEP) and teleop both go through this one
+    ``env``, so no hardware is re-plugged at handoff. The operator ends the segment with the
+    existing 's'/'f' keys, which the keyboard thread turns into ``episode_state.success``.
+
+    ⚠️ ACTION-SPACE CAVEAT (verify on-rig): the server runs the arm in
+    ``action_space='joint_velocity'`` for pi0, but ``VRPolicy`` emits 6-DoF Cartesian-
+    velocity + gripper. We temporarily switch the env to ``args.teleop_action_space`` for the
+    human segment and restore it afterwards. Confirm your ``RobotEnv`` supports a mid-session
+    action-space switch; if not, stand up a dedicated teleop RobotEnv instead.
+    """
+    controller = get_teleop_controller()
+    prev_space = getattr(env, "action_space", None)
+    switched = False
+    if args.teleop_action_space and prev_space != args.teleop_action_space:
+        try:
+            env.action_space = args.teleop_action_space
+            switched = True
+            print(f"[handoff] switched env action_space -> {args.teleop_action_space}")
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ [handoff] could not switch action_space for teleop: {e}")
+    try:
+        while episode_state.success is None:
+            start = time.time()
+            obs = env.get_observation()
+            action = controller.forward(obs)
+            env.step(np.asarray(action, dtype=np.float32))
+            episode_state.increment_step()
+            elapsed = time.time() - start
+            if elapsed < 1 / DROID_CONTROL_FREQUENCY:
+                time.sleep(1 / DROID_CONTROL_FREQUENCY - elapsed)
+    finally:
+        if switched:
+            try:
+                env.action_space = prev_space
+            except Exception:  # noqa: BLE001
+                pass
+    _, _, success, _ = episode_state.get_status()
+    return bool(success)
+
+
 def handle_client(conn, addr, env, camera_config, args, episode_state):
     """Handle a single client connection with keyboard input support."""
     print(f"Handling client from {addr}")
@@ -555,6 +611,27 @@ def handle_client(conn, addr, env, camera_config, args, episode_state):
                             },
                         )
 
+            elif cmd["type"] == "HANDOFF":
+                # The client's reward gate fired -> a human finishes the episode by
+                # teleoperating this robot. Blocks here until the operator presses 's'/'f'.
+                print("\n" + "=" * 60)
+                print("🙋 HUMAN TAKEOVER requested by the reward gate.")
+                print("   Teleoperate to finish the task, then press 's' (SUCCESS) or 'f' (FAILURE).")
+                print("=" * 60)
+                try:
+                    success = run_teleop_until_done(env, episode_state, args)
+                except Exception as e:  # noqa: BLE001
+                    print(f"Error during human takeover: {e}")
+                    import traceback
+
+                    traceback.print_exc()
+                    success = False
+                # 's'/'f' also queued a deferred env reset (defer_env_reset=True); the client
+                # drives resets, so clear it to avoid a surprise reset before the next RESET.
+                episode_state.consume_env_reset_request()
+                print(f"[handoff] returning control to client (success={success})")
+                send_msg(conn, {"done": True, "success": bool(success)})
+
             elif cmd["type"] == "CLOSE":
                 print("Closing connection...")
                 break
@@ -654,6 +731,13 @@ def main():
         type=int,
         default=600,
         help="Maximum steps per episode before timeout (default: 600, same as official example)",
+    )
+    parser.add_argument(
+        "--teleop-action-space",
+        type=str,
+        default="cartesian_velocity",
+        help="Action space to switch the robot into during human takeover (HANDOFF). VRPolicy "
+        "emits Cartesian velocity; the autonomous rollout runs joint_velocity for pi0.",
     )
 
     args = parser.parse_args()

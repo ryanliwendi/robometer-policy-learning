@@ -359,7 +359,34 @@ class RemoteEnv(gym.Env):
             return done, formatted_obs, info, blocked
 
         return done, None, {"new_reward": SUCCESS_REWARD}, blocked
-            
+
+    def send_handoff(self):
+        """Ask the server to hand control to a human teleoperator who finishes the episode.
+
+        Used by the reward-gated real-world rollout: when the gate fires, the client calls
+        this and BLOCKS until the operator ends the intervention (presses 's'/'f' on the
+        robot server). The robot stays owned by the server (the NUC) the entire time --
+        autonomous and teleop actions both go through the server's one RobotEnv, so no
+        hardware is re-plugged at handoff. Returns the final success bool.
+        """
+        self._ensure_connected()
+        # A human takeover can take arbitrarily long; drop the socket timeout while waiting
+        # (mirrors reset(), which also blocks on operator input).
+        prev_timeout = self.sock.gettimeout()
+        self.sock.settimeout(None)
+        try:
+            send_msg(self.sock, {"type": "HANDOFF"})
+            response = recv_msg(self.sock)
+        finally:
+            try:
+                self.sock.settimeout(prev_timeout)
+            except Exception:
+                pass
+        if response is None:
+            print("[RemoteEnv] Server disconnected during handoff.")
+            return False
+        return bool(response.get("success", False))
+
     def get_reward(self, success: bool) -> float:
         if success:
             reward = SUCCESS_REWARD

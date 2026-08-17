@@ -12,7 +12,7 @@ rule collapses onto the horizon by construction and is omitted.
 
   outputs/gate_frontier_n200   what sweep_gate_configs.py produced from the 200-episode runs. Our gate
                                only -- those runs never recorded the baselines' scores. The default.
-  outputs/thrifty_frontier     what thrifty_alpha_frontier.py produced from the sigq_* runs, which
+  outputs/thrifty_frontier     what score_detection_frontier.py produced from the sigq_* runs, which
                                recorded our progress score AND ThriftyDAgger's two scores on the
                                same episodes. That is the only place the Thrifty curve can be drawn
                                next to ours without comparing different episodes.
@@ -120,13 +120,17 @@ def main():
                     help='"tag:Title" per panel, in reading order')
     ap.add_argument("--protocol", choices=["insample", "cv"], default="insample",
                     help="insample matches the RewardGate-only figure; cv reads the "
-                         "cross-validated rows `thrifty_alpha_frontier.py` also writes")
+                         "cross-validated rows `score_detection_frontier.py` also writes")
     ap.add_argument("--dd-variant", default="nb500",
                     help="which Diff-DAgger N_b setting to draw")
     ap.add_argument("--logpzo-variant", default="s2000",
                     help="which LogpZO training-length setting to draw")
     ap.add_argument("--thrifty-variant", default="s200",
                     help="ensemble training budget to plot; s200 is what the arm configs deploy")
+    ap.add_argument("--xmax", type=float, default=1.0,
+                    help="right edge of the x axis. Without truncation the curves all finish well "
+                         "before 1.0, so cutting the axis at about 0.6 fills the panel instead of "
+                         "leaving half of it empty. Points past the cut are clipped, not dropped.")
     ap.add_argument("--out", default="detection_frontier.png")
     args = ap.parse_args()
     QV = {"diffdagger": args.dd_variant, "logpzo": args.logpzo_variant}
@@ -168,7 +172,7 @@ def main():
 
         ax.set_title(f"{title}   ({nS} success / {nF} failure)", fontsize=11.5, color=INK,
                      loc="left", pad=8)
-        ax.set_xlim(0.0, 1.0)
+        ax.set_xlim(0.0, args.xmax)
         ax.set_ylim(0.48, 1.03)
         ax.grid(True, color=GRID, lw=0.8)
         ax.set_axisbelow(True)

@@ -52,10 +52,9 @@ rdagger:
 
   # Identical to the Robometer arm.
   num_iterations: 10
-  rollouts_per_iter: 10
+  expert_transitions_per_iter: 1500
   # Budget the iteration by expert transitions instead of episodes -- the axis that makes
   # two gates comparable at equal human effort. Set to an int to override rollouts_per_iter.
-  expert_transitions_per_iter: null
   train_steps_per_iter: 2000
   use_offline: true
   offline_sample_ratio: 0.25
@@ -79,8 +78,7 @@ alg:
   online_alg_name: null
 
 eval:
-  eval_freq: 10000
-  eval_num_episodes: 25
+  eval_num_episodes: 50
   eval_record_video: true
   eval_on_first_step: true
 

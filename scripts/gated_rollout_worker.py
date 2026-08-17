@@ -559,12 +559,15 @@ def main():
                              "--thrifty-q-steps-multiplier")
     parser.add_argument("--thrifty-q-steps-multiplier", type=int, default=5)
     parser.add_argument("--thrifty-lr", type=float, default=1e-3)
-    parser.add_argument("--logpzo-alpha", type=float, default=0.99)
+    # alpha is the conformal band's false-alarm budget (fraction of successful episodes it may
+    # fire on), not a quantile like --dd-alpha.
+    parser.add_argument("--logpzo-alpha", type=float, default=0.15)
+    parser.add_argument("--logpzo-rollouts", type=int, default=50,
+                        help="solo rollouts of this student spent fitting the flow and the band")
     parser.add_argument("--logpzo-patience", type=int, default=2)
     parser.add_argument("--logpzo-patience-window", type=int, default=None)
     parser.add_argument("--logpzo-train-steps", type=int, default=2000)
     parser.add_argument("--logpzo-lr", type=float, default=1e-4)
-    parser.add_argument("--logpzo-calib-samples", type=int, default=4096)
     parser.add_argument("--thrifty-gamma", type=float, default=0.9999)
     parser.add_argument("--video-dir", default="gated_videos")
     parser.add_argument("--dump-obs", default=None,
@@ -704,25 +707,16 @@ def main():
                     f"max={info['loss_max']:.6f}")
         logger.info(f"Diff-DAgger gate: {gate.describe()}")
     elif args.gate_type == "logpzo":
-        from robometer_policy_learning.utils.diffdagger_gate import QuantileGate
-        from robometer_policy_learning.utils.logpzo_gate import (
-            LogpZOModel, LogpZOScorer, collect_logpzo_scores, train_logpzo)
+        from robometer_policy_learning.utils.logpzo_gate import BandGate, LogpZOModel, LogpZOScorer
 
         algo, _ = build_offline_algo()
+        # Both the flow and the band come from solo rollouts of this student, which cannot be
+        # collected until the worker exists, so the fit happens further down.
         model = LogpZOModel(int(student.global_cond_dim)).to(device)
-        opt = torch.optim.Adam(model.parameters(), lr=args.logpzo_lr)
-        losses = train_logpzo(algo, model, opt, grad_steps=args.logpzo_train_steps, device=device)
         scorer = LogpZOScorer(algo, model, remove_obs_keys=remove_obs_keys, device=device)
-        gate = QuantileGate(patience=args.logpzo_patience,
-                            patience_window=args.logpzo_patience_window, alpha=args.logpzo_alpha,
-                            name="logpzo")
-        scores = collect_logpzo_scores(algo, model, device=device,
-                                       max_rows=args.logpzo_calib_samples)
-        info = gate.recalibrate(scores)
-        logger.info(f"LogpZO fit on {pre_cfg.env.h5_dataset_path}: "
-                    f"train_loss={losses['train_loss']:.5f} val_loss={losses['val_loss']:.5f} "
-                    f"n_trans={losses['n_transitions']}")
-        logger.info(f"LogpZO gate: {gate.describe()}")
+        gate = BandGate(alpha=args.logpzo_alpha, patience=args.logpzo_patience,
+                        patience_window=args.logpzo_patience_window, score_every=args.score_every,
+                        name="logpzo")
     elif args.gate_type == "thrifty":
         from robometer_policy_learning.utils.thrifty_gate import (
             ThriftyGate, ThriftyScorer, build_ensemble, collect_thrifty_scores,
@@ -810,6 +804,33 @@ def main():
         dump_dir=args.dump_obs,
     )
 
+    if args.gate_type == "logpzo":
+        from robometer_policy_learning.utils.logpzo_gate import refit_from_rollouts
+
+        logger.info(f"LogpZO: collecting {args.logpzo_rollouts} solo rollouts of this student to "
+                    "fit the flow and the band...")
+        out = refit_from_rollouts(
+            worker, scorer, int(student.global_cond_dim),
+            horizon=int(pre_cfg.env.max_episode_steps), n_rollouts=args.logpzo_rollouts,
+            alpha=args.logpzo_alpha, grad_steps=args.logpzo_train_steps, lr=args.logpzo_lr,
+            device=device, tag="logpzo_fit", seed=args.seed)
+        if out is None:
+            raise SystemExit(f"LogpZO: fewer than 4 of {args.logpzo_rollouts} solo rollouts "
+                             "succeeded, so there is nothing to fit the flow and the band on.")
+        model, band, fit_info = out
+        scorer.model = model
+        band_info = base_gate.set_band(band)
+        logger.info(f"LogpZO fit on {fit_info['n_success']}/{fit_info['n_rollouts']} successful "
+                    f"solo rollouts ({fit_info['solo_steps']} steps): flow on "
+                    f"{fit_info['n_flow_episodes']} episodes, band from "
+                    f"{fit_info['n_band_episodes']} | train_loss={fit_info['train_loss']:.5f} "
+                    f"val_loss={fit_info['val_loss']:.5f} | band mean={band_info['band_mean']:.4f}")
+        logger.info(f"LogpZO gate: {base_gate.describe()}")
+        # The fitting rollouts consumed resets, and LIBERO draws each episode's initial state from
+        # a stream seeded once at construction. Re-seed so the watched episodes are the same set
+        # every other gate sees, otherwise this gate is scored on a different set of episodes.
+        env.reset(seed=args.seed)
+
     if args.gate_type == "hgdagger" and args.hg_backend == "replay":
         return run_interactive(args, worker, scorer)
 
@@ -840,8 +861,9 @@ def main():
                 ungated=args.ungated,  # True = the gate was recorded but never allowed to fire
                 thrifty=(base_gate.describe() if args.gate_type == "thrifty" else None),  # thrifty's fitted thresholds
                 dd_threshold=(base_gate.threshold if args.gate_type == "diffdagger" else None),
-                logpzo_threshold=(base_gate.threshold if args.gate_type == "logpzo" else None),
-                logpzo_alpha=(args.logpzo_alpha if args.gate_type == "logpzo" else None),
+                logpzo=(dict(base_gate.describe(), band=base_gate.band.tolist(),
+                             rollouts=args.logpzo_rollouts)
+                        if args.gate_type == "logpzo" else None),
                 dd_alpha=(args.dd_alpha if args.gate_type == "diffdagger" else None),
                 dd_patience=args.dd_patience, dd_patience_window=args.dd_patience_window,
                 dd_batch_multiplier=args.dd_batch_multiplier,

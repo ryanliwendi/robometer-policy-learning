@@ -10,10 +10,16 @@ debug: false
 # same expert-only training recipe), so any difference in the resulting policy is attributable to
 # the gating rule alone.
 #
-# The gate here is LogpZO (from the SAFE repo): a flow-matching density model fit to the
-# features of states in the training data, scoring a state by how far it sits from them. Only
-# the success flow is fit, so no rollout labels are needed. Thresholded at the alpha-quantile
-# of the training scores, refit and recalibrated every iteration. No Robometer is loaded.
+# The gate here is LogpZO (from the SAFE repo): a flow-matching density model fit to the features
+# of states from *successful solo rollouts of this student*, scoring a state by how far it sits from
+# them, and thresholded by a time-varying conformal band built from further held-out successful
+# rollouts. No Robometer is loaded.
+#
+# That is the reference's recipe, and it is why this arm is expensive: the flow has to be fit to
+# rollouts of the policy it watches, the student changes every iteration, so every iteration spends
+# logpzo_rollouts ungated episodes rebuilding the detector before it can gate anything. Those
+# episodes teach the student nothing -- there is no expert in them. The running total is logged as
+# logpzo/cum_solo_episodes for the cost table.
 
 load_dir: /scr/liryan/robometer_policy_learning/outputs/task1_dp_50k/20-06-31
 checkpoint: 50000  # same 64%-success student the Robometer arm starts from
@@ -28,17 +34,22 @@ rdagger:
 
   reward_model: null  # unused: LogpZO gates on the student's features, not on Robometer
 
-  # LogpZO gate. alpha is the quantile of the training-score distribution; patience is the same
+  # alpha is the band's false-alarm budget: the fraction of successful episodes it is allowed to
+  # fire on. NOT a quantile -- 0.99 here would fire on nearly every episode. 0.15 sits at the top
+  # of this task's offline frontier (balanced accuracy 0.908 at alpha 0.17, flat from ~0.07 up),
+  # so the baseline gets its best operating point rather than an arbitrary one.
+  logpzo_alpha: 0.15
+  # Solo rollouts collected per iteration to refit the flow and rebuild the band. At ~64% success
+  # that is ~32 successful episodes, half for the flow and half for the band. Patience is the same
   # M-of-N rule Diff-DAgger uses, so the two baselines fire on the same kind of evidence.
-  logpzo_alpha: 0.99
+  logpzo_rollouts: 50
   logpzo_patience: 2
   logpzo_patience_window: 2
-  # Refit each iteration on the growing buffer. The flow is far larger than the data it sees, so
-  # the held-out loss is logged every refit as an overfitting check.
+  # The flow is far larger than the data it sees, so the held-out loss is logged every refit as an
+  # overfitting check.
   logpzo_train_steps: 2000
   logpzo_lr: 1e-4
   logpzo_batch_size: 256
-  logpzo_calib_samples: 4096
 
   # Expert completes the episode, per Diff-DAgger's protocol (and our winning recipe).
   expert_n_action_steps: 5

@@ -12,6 +12,7 @@ checkpoint: 50000  # ~56% success (wide headroom under pi0's 88%)
 # clean (single job, no collision).
 
 rdagger:
+  gate_type: robometer
   expert_type: pi0
   pi0_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero
   expert_dir: null
@@ -19,22 +20,23 @@ rdagger:
 
   reward_model: jesbu1/robometer-4b-fft-libero
 
-  # Gate: long_window = 0.9 x L_succ. Task-0 successful trajectories (demos) mean 290 steps
-  # (median 282) -> lw=261. Largest window of any task so far (longest horizon).
+  # Gate: the single config tuned jointly on all four tasks (transfer study, delta 0.02). On a
+  # fifth task it never tuned on it costs 1.9% latency against that task's own frontier, so this is
+  # the config the paper ships. Not task-0's own tuned config, on purpose.
   method: spearman
-  short_window: 50
+  short_window: 75
   drop_threshold: -0.9
-  long_window: 261
-  plateau_threshold: 0.1
-  min_drop_magnitude: 0.1
+  long_window: 225
+  plateau_threshold: 0.0
+  min_drop_magnitude: 0.0
   smoothing: 0.0
   score_every: 1
 
-  expert_n_action_steps: 10
+  expert_n_action_steps: 5
 
   # DAgger -- winning expert-only recipe (offline demos + expert intervention segments only):
   num_iterations: 10
-  rollouts_per_iter: 10
+  expert_transitions_per_iter: 1500
   train_steps_per_iter: 2000
   use_offline: true
   offline_sample_ratio: 0.25
@@ -58,8 +60,7 @@ alg:
   online_alg_name: null
 
 eval:
-  eval_freq: 10000
-  eval_num_episodes: 25
+  eval_num_episodes: 50
   eval_record_video: true
   eval_on_first_step: true
 

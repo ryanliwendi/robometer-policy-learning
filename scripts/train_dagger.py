@@ -7,6 +7,8 @@
     thrifty     ThriftyDAgger: ensemble novelty and Q-risk (thrifty_gate.py)
     hgdagger    a human decides, live or via a replay loop (human_gate.py)
     diffdagger  Diff-DAgger: the student's own diffusion loss (diffdagger_gate.py)
+    logpzo      SAFE's LogpZO: a flow fit to solo rollouts of the student, read against a
+                time-varying conformal band (logpzo_gate.py)
 
 Starting from a pretrained student and a frozen expert, each iteration:
   1. collects gated rollouts with GatedRolloutWorker until target episodes/transitions are kept;
@@ -14,7 +16,7 @@ Starting from a pretrained student and a frozen expert, each iteration:
   2. trains behavior cloning for rdagger.train_steps_per_iter steps on the online buffer,
      optionally mixed with the offline demos with a fixed ratio (MixedReplayBuffer);
   3. refreshes the gate if it needs it -- DiffDAgger and ThriftyDAgger recalibrate thresholds or
-     retrains detectors;
+     retrain detectors, and LogpZO spends a batch of solo rollouts rebuilding itself from scratch;
   4. evaluates the autonomous policy performance and checkpoints;
 
 Example usage:
@@ -142,14 +144,17 @@ def main(cfg: DictConfig):
     # The reference gives Q_risk 5x the BC ensemble's gradient steps (grad_steps * 5 per epoch).
     thrifty_q_steps_multiplier = int(OmegaConf.select(
         cfg, "rdagger.thrifty_q_steps_multiplier", default=5))
-    # LogpZO: same quantile firing rule as Diff-DAgger, so alpha means the same thing.
-    logpzo_alpha = float(OmegaConf.select(cfg, "rdagger.logpzo_alpha", default=0.99))
+    # LogpZO: alpha is the conformal band's false-alarm budget -- the fraction of successful
+    # episodes it is allowed to fire on -- NOT a quantile like Diff-DAgger's. Small means a high
+    # band. logpzo_rollouts solo rollouts of the current student are collected every iteration to
+    # rebuild the flow and the band; that is the baseline's running cost.
+    logpzo_alpha = float(OmegaConf.select(cfg, "rdagger.logpzo_alpha", default=0.15))
+    logpzo_rollouts = int(OmegaConf.select(cfg, "rdagger.logpzo_rollouts", default=50))
     logpzo_patience = int(OmegaConf.select(cfg, "rdagger.logpzo_patience", default=2))
     logpzo_patience_window = OmegaConf.select(cfg, "rdagger.logpzo_patience_window", default=None)
     logpzo_train_steps = int(OmegaConf.select(cfg, "rdagger.logpzo_train_steps", default=2000))
     logpzo_lr = float(OmegaConf.select(cfg, "rdagger.logpzo_lr", default=1e-4))
     logpzo_batch_size = int(OmegaConf.select(cfg, "rdagger.logpzo_batch_size", default=256))
-    logpzo_calib_samples = int(OmegaConf.select(cfg, "rdagger.logpzo_calib_samples", default=4096))
     # HG-DAgger: 'live' needs a display; 'replay' asks the operator after each solo rollout.
     hg_backend = str(OmegaConf.select(cfg, "rdagger.hg_backend", default="live"))
     gate_kwargs = dict(
@@ -321,45 +326,74 @@ def main(cfg: DictConfig):
         refresh_gate = _refresh_diff
 
     elif gate_type == "logpzo":
-        from robometer_policy_learning.utils.diffdagger_gate import QuantileGate
         from robometer_policy_learning.utils.logpzo_gate import (
-            LogpZOModel, LogpZOScorer, collect_logpzo_scores, train_logpzo)
+            BandGate, LogpZOModel, LogpZOScorer, refit_from_rollouts)
 
         remove_keys = list(getattr(algo.actor, "remove_obs_keys", None)
                            or OmegaConf.select(cfg, "env.extra_keys_to_drop", default=[]) or [])
         feat_dim = int(algo.actor.global_cond_dim)
+        # Placeholder until the first refit replaces it. The gate has no band until then, so it
+        # cannot fire, and the model is only here so the scorer and the checkpoint saver have
+        # something to point at.
         logpzo_model = LogpZOModel(feat_dim).to(device)
-        logpzo_opt = torch.optim.Adam(logpzo_model.parameters(), lr=logpzo_lr)
         scorer = LogpZOScorer(algo, logpzo_model, remove_obs_keys=remove_keys, device=device)
-        gate = QuantileGate(patience=logpzo_patience, patience_window=logpzo_patience_window,
-                            alpha=logpzo_alpha, name="logpzo")
-        _logpzo_iter = {"n": 0}
+        gate = BandGate(alpha=logpzo_alpha, patience=logpzo_patience,
+                        patience_window=logpzo_patience_window, score_every=score_every,
+                        name="logpzo")
+        _logpzo_iter = {"n": 0, "solo_episodes": 0, "solo_steps": 0}
 
         def _refresh_logpzo(tag: str):
-            """Refit the flow on everything collected so far, then reset the firing threshold."""
+            """Rebuild LogpZO from scratch for the current student.
+
+            The flow has to be fit to rollouts of the policy it will watch, and the student changes
+            every iteration, so every iteration pays for a fresh set of solo rollouts. The running
+            total of that cost is logged, because it is the whole reason this baseline is expensive.
+            """
+            nonlocal logpzo_model
             it_n = _logpzo_iter["n"]
-            buf = getattr(algo, "buffer", None)
-            restore = getattr(buf, "sample_ratio", None) if hasattr(buf, "set_sample_ratio") else None
-            if hasattr(buf, "set_sample_ratio"):
-                buf.set_sample_ratio(None)  # calibrate on offline + online, not the training mix
-            try:
-                losses = train_logpzo(algo, logpzo_model, logpzo_opt, grad_steps=logpzo_train_steps,
-                                      batch_size=logpzo_batch_size, device=device,
-                                      seed=collect_seed + 1000 * it_n)
-                scores = collect_logpzo_scores(algo, logpzo_model, device=device,
-                                               max_rows=logpzo_calib_samples)
-            finally:
-                if hasattr(buf, "set_sample_ratio"):
-                    buf.set_sample_ratio(restore)
             _logpzo_iter["n"] = it_n + 1
-            if len(scores) == 0:
-                logger.warning(f"[logpzo:{tag}] no calibration samples; threshold unchanged")
+            logger.info(f"[logpzo:{tag}] collecting {logpzo_rollouts} ungated rollouts of the "
+                        f"current student to refit the flow and the band...")
+            out = refit_from_rollouts(
+                worker, scorer, feat_dim, horizon=int(cfg.env.max_episode_steps),
+                n_rollouts=logpzo_rollouts, alpha=logpzo_alpha, grad_steps=logpzo_train_steps,
+                lr=logpzo_lr, device=device, tag=f"logpzo_{tag}",
+                seed=collect_seed + 1000 * it_n, batch_size=logpzo_batch_size)
+            if out is None:
+                # Without a band the gate cannot fire, the expert never takes over, and the
+                # collection loop below spins forever chasing a transition budget it can never
+                # reach. If an earlier round left a band behind, keep gating on that; if this is
+                # the first round, there is nothing to fall back on and the run cannot proceed.
+                if gate.band is None:
+                    raise SystemExit(
+                        f"[logpzo:{tag}] fewer than 4 of {logpzo_rollouts} solo rollouts "
+                        "succeeded, so LogpZO has nothing to fit the flow and the band on. Raise "
+                        "rdagger.logpzo_rollouts, or start from a student that succeeds more often.")
+                logger.warning(f"[logpzo:{tag}] fewer than 4 of {logpzo_rollouts} rollouts "
+                               "succeeded; keeping the previous round's band, which is now stale "
+                               f"({gate.describe()})")
                 return None
-            info = gate.recalibrate(scores)
-            logger.info(f"[logpzo:{tag}] threshold={info['threshold']:.4f} (alpha={logpzo_alpha}, "
-                        f"n={info['n']}) | train_loss={losses['train_loss']:.5f} "
-                        f"val_loss={losses['val_loss']:.5f} n_trans={losses['n_transitions']}")
-            return dict(info, **{f"train_{k}": v for k, v in losses.items()})
+            logpzo_model, band, info = out
+            scorer.model = logpzo_model
+            _logpzo_iter["solo_episodes"] += info["n_rollouts"]
+            _logpzo_iter["solo_steps"] += info["solo_steps"]
+            band_info = gate.set_band(band)
+            if info["n_shape_episodes"] < 3:
+                logger.warning(f"[logpzo:{tag}] only {info['n_shape_episodes']} episode(s) set the "
+                               "band's shape, so it tracks those traces almost exactly and will "
+                               "look jagged; raise rdagger.logpzo_rollouts for a smoother band")
+            logger.info(f"[logpzo:{tag}] {info['n_success']}/{info['n_rollouts']} rollouts "
+                        f"succeeded -> flow on {info['n_flow_episodes']} episodes "
+                        f"({info['n_transitions']} steps), band from {info['n_band_episodes']} "
+                        f"({info['n_shape_episodes']} shape / {info['n_width_episodes']} width) "
+                        f"| train_loss={info['train_loss']:.5f} val_loss={info['val_loss']:.5f} "
+                        f"| band alpha={gate.alpha:g} mean={band_info['band_mean']:.4f} "
+                        f"first={band_info['band_first']:.4f} last={band_info['band_last']:.4f} "
+                        f"| solo rollouts so far: {_logpzo_iter['solo_episodes']} episodes / "
+                        f"{_logpzo_iter['solo_steps']} steps")
+            return dict(info, **band_info,
+                        cum_solo_episodes=_logpzo_iter["solo_episodes"],
+                        cum_solo_steps=_logpzo_iter["solo_steps"])
 
         refresh_gate = _refresh_logpzo
 
@@ -601,6 +635,10 @@ def main(cfg: DictConfig):
                 if logpzo_model is not None:
                     torch.save(logpzo_model.state_dict(),
                                os.path.join(save_dir, str(it + 1), "logpzo.pt"))
+                    # The flow alone does not define the gate: the band it was read against was
+                    # built from rollouts that are not kept anywhere else, so save it too.
+                    if gate.band is not None:
+                        np.save(os.path.join(save_dir, str(it + 1), "logpzo_band.npy"), gate.band)
                 logger.info(f"Saved checkpoint to {os.path.join(save_dir, str(it + 1))}")
 
     except KeyboardInterrupt:
