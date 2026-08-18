@@ -332,9 +332,7 @@ def main(cfg: DictConfig):
         remove_keys = list(getattr(algo.actor, "remove_obs_keys", None)
                            or OmegaConf.select(cfg, "env.extra_keys_to_drop", default=[]) or [])
         feat_dim = int(algo.actor.global_cond_dim)
-        # Placeholder until the first refit replaces it. The gate has no band until then, so it
-        # cannot fire, and the model is only here so the scorer and the checkpoint saver have
-        # something to point at.
+        # Placeholder until the first refit replaces it
         logpzo_model = LogpZOModel(feat_dim).to(device)
         scorer = LogpZOScorer(algo, logpzo_model, remove_obs_keys=remove_keys, device=device)
         gate = BandGate(alpha=logpzo_alpha, patience=logpzo_patience,
@@ -345,9 +343,8 @@ def main(cfg: DictConfig):
         def _refresh_logpzo(tag: str):
             """Rebuild LogpZO from scratch for the current student.
 
-            The flow has to be fit to rollouts of the policy it will watch, and the student changes
-            every iteration, so every iteration pays for a fresh set of solo rollouts. The running
-            total of that cost is logged, because it is the whole reason this baseline is expensive.
+            The flow has to be fit to rollouts of the current policy, and the student changes
+            every iteration, so every iteration needs a set of current policy's rollouts to train on.
             """
             nonlocal logpzo_model
             it_n = _logpzo_iter["n"]
@@ -360,17 +357,12 @@ def main(cfg: DictConfig):
                 lr=logpzo_lr, device=device, tag=f"logpzo_{tag}",
                 seed=collect_seed + 1000 * it_n, batch_size=logpzo_batch_size)
             if out is None:
-                # Without a band the gate cannot fire, the expert never takes over, and the
-                # collection loop below spins forever chasing a transition budget it can never
-                # reach. If an earlier round left a band behind, keep gating on that; if this is
-                # the first round, there is nothing to fall back on and the run cannot proceed.
                 if gate.band is None:
                     raise SystemExit(
                         f"[logpzo:{tag}] fewer than 4 of {logpzo_rollouts} solo rollouts "
-                        "succeeded, so LogpZO has nothing to fit the flow and the band on. Raise "
-                        "rdagger.logpzo_rollouts, or start from a student that succeeds more often.")
+                        "succeeded, so LogpZO has nothing to fit the flow and the thresholds on.")
                 logger.warning(f"[logpzo:{tag}] fewer than 4 of {logpzo_rollouts} rollouts "
-                               "succeeded; keeping the previous round's band, which is now stale "
+                               "succeeded; keeping the previous round's thresholds, which is now stale "
                                f"({gate.describe()})")
                 return None
             logpzo_model, band, info = out
