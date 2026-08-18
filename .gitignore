@@ -38,8 +38,11 @@ replay_buffers/*
 
 # Job submission files
 *.slurm
+*.out
+*.sbatch
 
 # Others
 .vscode/
+.claude/
 pyrightconfig.json
 gated_videos/
