@@ -1,21 +1,9 @@
-"""The LogpZO intervention gate (SAFE's density baseline, https://github.com/vla-safe/SAFE).
-
-The recipe, matching the reference: fit a flow to the features of *successful rollouts of the
-policy being watched*, then threshold with a time-varying conformal band built from a further
-held-out set of successful rollouts. Both halves cost rollouts, and inside DAgger the policy
-changes every round, so the whole thing has to be rebuilt every round -- see
-``refit_from_rollouts``, which is one round's worth of that work.
+"""The LogpZO intervention gate.
 
 Differences from the original implementation:
-    * Only the success flow is fit, so no failure labels are needed. The reference also offers a
-      second flow fit on failures, which turns the score into a log-odds between the two; that
-      variant needs labelled failures and belongs in the offline detector comparison, not here.
-    * The features are the student's own observation encoding (``encode_obs``), the same vector
-      ThriftyDAgger's novelty ensemble reads, rather than a VLA's hidden states. That keeps the two
-      baselines a fair comparison: same input, different density model.
-    * The flow is refit from scratch each round rather than fine-tuned, so the band always says
-      "this is what LogpZO gets from N rollouts of the current student" and never quietly benefits
-      from rollouts of earlier ones.
+    * The features are the student's own observation encoding (``encode_obs``).
+    * Adapts the original method with DAgger; The flow and thresholds is refit from scratch each round 
+      from rollouts of the current policy.
 """
 
 from typing import Any, Dict, List, Optional
@@ -28,7 +16,7 @@ import torch.nn as nn
 
 from robometer_policy_learning.modules.diffusion.unet import ConditionalUnet1D
 
-# The reference's UNet width. Kept as-is so the model has the capacity the paper reports.
+# The reference's UNet width
 DOWN_DIMS = (256, 512, 1024)
 # Channel count the feature vector is folded into. 32 divides our 768-d encoding exactly.
 IN_DIM = 32
@@ -88,8 +76,7 @@ def fit_flow(model: LogpZOModel, opt: torch.optim.Optimizer, get_features, total
              val_fraction: float = 0.1) -> Dict[str, float]:
     """Fit the flow on `total` rows, where `get_features(idx)` returns the rows at those indices.
 
-    A slice of rows is held out and never trained on. This model is much larger than the feature
-    set it is fit to, so the held-out loss is the only warning that it has started memorising.
+    A slice of rows is held out and never trained on.
     """
     if total == 0:
         return dict(train_loss=float("nan"), val_loss=float("nan"), n_transitions=0)
@@ -305,19 +292,13 @@ def refit_from_rollouts(worker, scorer: LogpZOScorer, feat_dim: int, horizon: in
 
 
 class BandGate:
-    """Fire when the score leaves LogpZO's conformal band.
-
-    Unlike ``QuantileGate`` the threshold moves with time -- one value per step -- so the gate has
-    to know how far into the episode it is. Same M-of-N patience as the other gates. With no band
-    installed it never fires, so a round whose rollouts nearly all failed degrades to no gating
-    rather than to nonsense.
-    """
+    """Fire when the score exceeds LogpZO's conformal threshold."""
 
     def __init__(self, band=None, alpha: float = 0.1, patience: int = 1,
                  patience_window: Optional[int] = None, score_every: int = 1,
                  name: str = "logpzo", **_ignored: Any):
         if not 0.0 < float(alpha) < 1.0:
-            raise ValueError(f"alpha is a false-alarm budget here, not a quantile; got {alpha}")
+            raise ValueError(f"alpha is a false-alarm budget; got {alpha}")
         if float(alpha) > 0.5:
             raise ValueError(f"alpha={alpha} would fire on most successful episodes; did you mean "
                              f"{1.0 - float(alpha):g}?")
@@ -353,7 +334,7 @@ class BandGate:
     def update(self, value: float) -> bool:
         value = float(value)
         self.history.append(value)
-        # The worker only scores every score_every-th step, so this counts env steps, not calls.
+        # The worker only scores every score_every-th step, so this counts env steps
         step = self.n_updates * self.score_every
         self.n_updates += 1
         self.last_threshold = self.threshold_at(step)
