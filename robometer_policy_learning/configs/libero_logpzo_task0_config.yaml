@@ -1,0 +1,95 @@
+defaults:
+  - algorithm@offline_algorithm: dp  # must match the student actor type
+  - reward_model: null
+  - policy@policy: transformer
+
+debug: false
+
+# LogpZO BASELINE arm for task 0. Everything except the gate is held identical to
+# libero_rdagger_task0_config.yaml (same student checkpoint, same pi0 expert, same takeover exit,
+# same expert-only training recipe), so any difference in the resulting policy is attributable to
+# the gating rule alone.
+#
+# The gate here is LogpZO (from the SAFE repo): a flow-matching density model fit to the features
+# of states from *successful solo rollouts of this student*, scoring a state by how far it sits from
+# them, and thresholded by a time-varying conformal band built from further held-out successful
+# rollouts. No Robometer is loaded.
+#
+# That is the reference's recipe, and it is why this arm is expensive: the flow has to be fit to
+# rollouts of the policy it watches, the student changes every iteration, so every iteration spends
+# logpzo_rollouts ungated episodes rebuilding the detector before it can gate anything. Those
+# episodes teach the student nothing -- there is no expert in them. The running total is logged as
+# logpzo/cum_solo_episodes for the cost table.
+
+load_dir: /scr/liryan/robometer_policy_learning/outputs/task0_dp_50k/22-08-45
+checkpoint: 50000  # the same student the Robometer arm starts from (72% in the task-0 runs)
+
+rdagger:
+  gate_type: logpzo
+
+  expert_type: pi0
+  pi0_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero
+  expert_dir: null
+  expert_checkpoint: null
+
+  reward_model: null  # unused: LogpZO gates on the student's features, not on Robometer
+
+  # alpha is the band's false-alarm budget: the fraction of successful episodes it is allowed to
+  # fire on. NOT a quantile -- 0.99 here would fire on nearly every episode. 0.26 is the peak of
+  # this task's offline frontier (balanced accuracy 0.826 at alpha 0.264, measured on the 150
+  # episodes of gated_videos/sigq_t0_b50), so the baseline gets its best operating point rather
+  # than an arbitrary one. Task 1's peak is elsewhere (0.17), so the two arms do not share a value.
+  # Note the peak here is sharp, not flat: no other alpha comes within 0.01 of it.
+  logpzo_alpha: 0.264
+  # Solo rollouts collected per iteration to refit the flow and rebuild the band. About two thirds
+  # succeed, so roughly 33 usable episodes, half for the flow and half for the band. Patience is the
+  # same M-of-N rule Diff-DAgger uses, so the two baselines fire on the same kind of evidence.
+  logpzo_rollouts: 50
+  logpzo_patience: 2
+  logpzo_patience_window: 2
+  # The flow is far larger than the data it sees, so the held-out loss is logged every refit as an
+  # overfitting check.
+  logpzo_train_steps: 2000
+  logpzo_lr: 1e-4
+  logpzo_batch_size: 256
+
+  # Expert completes the episode, per Diff-DAgger's protocol (and our winning recipe).
+  expert_n_action_steps: 5
+
+  # Identical to the Robometer arm.
+  num_iterations: 10
+  expert_transitions_per_iter: 1500
+  train_steps_per_iter: 2000
+  use_offline: true
+  offline_sample_ratio: 0.25
+
+  store_only_expert: true
+  reweighting: null
+  iwr_target_intv: 0.8
+
+  require_success: true
+  require_intervention: true
+
+  save_interval: 1
+  online_buffer_capacity: 200000
+  seed: 0
+
+offline_algorithm:
+  use_weighted_bc: false
+
+alg:
+  offline_alg_name: dp
+  online_alg_name: null
+
+eval:
+  eval_num_episodes: 50
+  eval_record_video: true
+  eval_on_first_step: true
+
+logging:
+  wandb_project: libero_rdagger
+  wandb_entity: liryan-usc
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "logpzo_dp_task0_baseline"
+  log_level: "INFO"
