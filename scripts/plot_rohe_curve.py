@@ -226,7 +226,8 @@ def draw(ax, panels, key, lo_key, hi_key, ylabel, title):
     ax.set_axisbelow(True)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
-    ax.set_xticks(sorted(ticks))
+    # A baseline can sit between rounds, so only whole rounds get a tick.
+    ax.set_xticks(sorted(t for t in ticks if float(t).is_integer()))
 
 
 def main():
@@ -245,6 +246,19 @@ def main():
     ap.add_argument("--metric", choices=["rohe", "success", "both"], default="rohe",
                     help="rohe: per-round and cumulative ROHE. success: the eval success rate "
                          "after each round, with a binomial band. both: all three panels.")
+    ap.add_argument("--baseline", action="append", default=[],
+                    help='"Label=path" for a run with no gate, e.g. the student trained on demos '
+                         "only. It appears on the success panel and not on the ROHE panels, "
+                         "because an arm that never calls the expert has H=0 and its ROHE is 1 by "
+                         "definition. Repeat once per baseline.")
+    ap.add_argument("--baseline-steps", type=int, nargs="+",
+                    default=[0, 2000, 6000, 10000, 12000],
+                    help="training step of each baseline eval, counted from where the run resumed. "
+                         "An offline run evaluates on its own schedule, so its evals are placed by "
+                         "the training they have had rather than by their position in the list.")
+    ap.add_argument("--steps-per-round", type=int, default=4000,
+                    help="train steps in one DAgger round, used to put the baseline on the same "
+                         "x axis. A baseline eval at 12000 steps lands on round 3.")
     args = ap.parse_args()
 
     series = []
@@ -267,20 +281,39 @@ def main():
                            "ROHE, cumulative (all rounds so far)",
                            [(lab, r) for lab, r, _o, _e in series]))
     if want_success:
+        curves = [(lab, e) for lab, _r, _o, e in series]
+        for spec in args.baseline:
+            label, _, path = spec.partition("=")
+            rows = eval_rows(parse_log(find_log(path))[1])
+            steps = args.baseline_steps
+            if len(steps) != len(rows):
+                raise SystemExit(f"{label}: {len(rows)} evals in the log but {len(steps)} step "
+                                 f"positions given in --baseline-steps")
+            # Placed by how much training each eval has had, so the last one lands on the round the
+            # arms finish at rather than on a slot in the list.
+            for r, s in zip(rows, steps):
+                r["round"] = s / args.steps_per_round
+            print(f"\n=== {label} (baseline) ===")
+            print("  " + "  ".join(f"{s}steps/r{r['round']:.2f}={100 * r['rate']:.0f}%"
+                                   for r, s in zip(rows, steps)))
+            curves.append((label, rows))
         panels.append(("rate", "lo", "hi", "Eval success rate",
-                       "Autonomous success after each round",
-                       [(lab, e) for lab, _r, _o, e in series]))
+                       "Autonomous success after each round", curves))
 
     fig, axes = plt.subplots(1, len(panels), figsize=(6.6 * len(panels), 4.6), squeeze=False)
     for ax, (key, lo, hi, ylab, title, data) in zip(axes[0], panels):
         draw(ax, data, key, lo, hi, ylab, title)
 
-    handles, _ = axes[0][0].get_legend_handles_labels()
-    if args.metric == "success":
-        names = [f"{lab}  (final: {100 * e[-1]['rate']:.0f}%)" for lab, _r, _o, e in series]
-    else:
-        names = [f"{lab}  (all rounds: {ov['rohe']:.3f})" for lab, _r, ov, _e in series]
-    fig.legend(handles, names, loc="lower center", ncol=len(series), frameon=False,
+    # The legend is read off the last panel, which is the success one whenever it is drawn, so any
+    # baseline curve is included. The summary in each label matches whichever metric is on show.
+    legend_ax = axes[0][-1]
+    handles, labels = legend_ax.get_legend_handles_labels()
+    summary = {}
+    for lab, _rows, ov, evals in series:
+        summary[lab] = (f"{lab}  (final: {100 * evals[-1]['rate']:.0f}%)" if want_success
+                        else f"{lab}  (all rounds: {ov['rohe']:.3f})")
+    names = [summary.get(l, l) for l in labels]
+    fig.legend(handles, names, loc="lower center", ncol=len(names), frameon=False,
                fontsize=10, bbox_to_anchor=(0.5, -0.02))
     fig.suptitle(args.title, fontsize=13, color=INK)
     fig.tight_layout(rect=(0, 0.06, 1, 0.95))
