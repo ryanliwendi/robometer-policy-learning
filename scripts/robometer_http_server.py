@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
-"""Robometer scoring HTTP server -- runs on the LAB SERVER (where the GPU + weights live).
+"""Robometer scoring HTTP server.
 
-The real-world reward-DAgger control loop runs on the WORKSTATION next to the robot and calls
-THIS over the network for progress scores -- exactly like it already calls the pi0 policy server
-on port 8000. Keeping Robometer here means it never competes with pi0 for the workstation GPU.
-
-Protocol (stateless): POST / with a pickled dict
+Protocol:
     {"frames": (N, H, W, 3) uint8, "prompt": str}
 -> pickled reply {"progress": float, "success_prob": float}.
-The client subsamples its causal prefix to <= max_frames BEFORE sending, so payloads stay small
-and scoring matches the offline scripts/label_real_world.py pipeline (same RobometerLabeler).
+The client subsamples its causal prefix to <= max_frames BEFORE sending.
 
-Run (lab server):
+Usage:
     srun --gres=shard:8 --mem=32G uv run python scripts/robometer_http_server.py \
         --model robometer/Robometer-4B --port 8900
-Then make it reachable from the workstation (same pattern as the DROID Pinggy tunnels), e.g.
-from the workstation:  ssh -N -L 8900:localhost:8900 <lab-server>   (loop uses --reward-host localhost).
-Sanity check:  curl http://localhost:8900/   -> "ok".
+If the server is not run on the workstation: 
+    ssh -N -L 8900:localhost:8900 <server> 
 """
 
 import argparse
