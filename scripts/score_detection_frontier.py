@@ -3,9 +3,11 @@
 from. This is the compute half of the pair; `plot_detection_frontier.py` reads what it writes.
 
 Every gate has one knob that trades firing early against firing on episodes that were going to
-succeed anyway. ThriftyDAgger and Diff-DAgger call it alpha, roughly "what fraction of steps should
-the gate fire on": neither sets a threshold directly, they look at the scores from earlier episodes
-and pick the cutoff that only the top alpha fraction beat. LogpZO's alpha is the width of a
+succeed anyway. ThriftyDAgger, Diff-DAgger and UCF call it alpha, roughly "what fraction of steps
+should the gate fire on": none of them sets a threshold directly, they look at the scores from
+earlier episodes and pick the cutoff that only the top alpha fraction beat. Careful with UCF: its
+own config states the same knob the other way round, as the QUANTILE it keeps (0.95), so its
+`ucf_alpha: 0.95` is alpha = 0.05 here. LogpZO's alpha is the width of a
 per-timestep band instead of a single cutoff. Sweeping alpha gives a curve -- low alpha fires
 rarely and late, high alpha fires often and early -- and this script measures every point on it,
 for every family, so the curves can be put on one pair of axes.
@@ -652,6 +654,11 @@ def main():
                          "training demos is far below its loss on any rollout. 'rollouts' lets "
                          "the threshold be any value the rollout scores span, which shows what "
                          "the signal could do with a threshold it cannot actually obtain.")
+    ap.add_argument("--ucf-calib", choices=["demos", "rollouts"], default="demos",
+                    help="where UCF's threshold comes from. Same question as --dd-calib, asked of "
+                         "the vector-field uncertainty: 'demos' is the published method, "
+                         "'rollouts' is the upper bound it could reach with a threshold it cannot "
+                         "actually obtain at deploy time.")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--repeats", type=int, default=5, help="repeated stratified K-fold")
     ap.add_argument("--seed", type=int, default=0)
@@ -685,6 +692,11 @@ def main():
         if quantile_variants(corpus, "dd_loss"):
             rows += quantile_rows(corpus, "diffdagger", "dd_loss", alphas, args.folds,
                                   args.repeats, args.seed, args.dd_calib)
+        # UCF fires on the same rule as Diff-DAgger -- one score over one cutoff, the cutoff a
+        # quantile of the demo scores -- so it goes through the same code.
+        if quantile_variants(corpus, "ucf"):
+            rows += quantile_rows(corpus, "ucf", "ucf", alphas, args.folds,
+                                  args.repeats, args.seed, args.ucf_calib)
         rows += band_rows(corpus, alphas, args.repeats, args.seed)
         for variant in corpus.thrifty_variants:
             print_alpha_table(rows, variant, "cv", show)

@@ -54,6 +54,8 @@ STYLE = {
                          ls="-", marker="v", ms=6.0, z=6, alpha=1.0),
     "logpzo":       dict(label="LogpZO (density)", color="#0f8f8f", lw=2.2,
                          ls="-", marker="D", ms=5.5, z=6, alpha=1.0),
+    "ucf":          dict(label="UCF (denoising vector field)", color="#c98b12", lw=2.2,
+                         ls="-", marker="h", ms=6.0, z=6, alpha=1.0),
     "absolute":     dict(label="Absolute threshold", color="#8a8985", lw=1.5, ls="-",
                          marker="D", ms=4.0, z=3, alpha=0.9),
     "timeout":      dict(label="Timeout / periodic", color="#52514e", lw=1.5, ls=":",
@@ -63,8 +65,9 @@ STYLE = {
 # the panel it was too crowded to read, and the union curve is the rule the robot actually runs.
 # Put "thrifty_nov" / "thrifty_risk" back in this list to draw them again.
 ORDER = ["gate", "drop_only", "plateau_only", "thrifty",
-         "diffdagger", "logpzo", "absolute", "timeout"]
+         "diffdagger", "logpzo", "ucf", "absolute", "timeout"]
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e3e2df"
+HL = "#d1194f"   # the --highlight marker
 
 # The Thrifty results are stored per ensemble size and per rule, so we have to say which ones to
 # draw. We draw the ensemble size the training runs actually use (thrifty_train_steps: 200), not
@@ -118,22 +121,41 @@ def main():
                                                          "outputs/gate_frontier_n200"))
     ap.add_argument("--panels", nargs="+", default=DEFAULT_PANELS,
                     help='"tag:Title" per panel, in reading order')
-    ap.add_argument("--protocol", choices=["insample", "cv"], default="insample",
-                    help="insample matches the RewardGate-only figure; cv reads the "
-                         "cross-validated rows `score_detection_frontier.py` also writes")
+    ap.add_argument("--protocol", choices=["insample", "cv"], default="cv",
+                    help="cv is the default and the one to quote: every threshold is fit on the "
+                         "other folds' episodes, which is what happens on the robot. insample "
+                         "picks the cutoff using all the episodes and then reads it on those same "
+                         "episodes -- an upper bound, not an operating point. The gap between them "
+                         "scales with how much each method fits: a scalar quantile barely moves "
+                         "(<0.01 hypervolume), while LogpZO's per-timestep band drops ~60% on "
+                         "task 0 because insample builds it from episodes it is then judged on.")
     ap.add_argument("--dd-variant", default="nb500",
                     help="which Diff-DAgger N_b setting to draw")
     ap.add_argument("--logpzo-variant", default="s2000",
                     help="which LogpZO training-length setting to draw")
+    ap.add_argument("--ucf-variant", default="r1",
+                    help="which UCF sampling radius to draw")
     ap.add_argument("--thrifty-variant", default="s200",
                     help="ensemble training budget to plot; s200 is what the arm configs deploy")
-    ap.add_argument("--xmax", type=float, default=1.0,
-                    help="right edge of the x axis. Without truncation the curves all finish well "
-                         "before 1.0, so cutting the axis at about 0.6 fills the panel instead of "
-                         "leaving half of it empty. Points past the cut are clipped, not dropped.")
+    ap.add_argument("--xmax", type=float, default=0.6,
+                    help="right edge of the x axis. Without truncation every curve finishes well "
+                         "before 1.0, so 0.6 fills the panel instead of leaving half of it empty. "
+                         "Points past the cut are clipped, not dropped -- the ranking is unchanged, "
+                         "only the empty right-hand third is removed. Raise it to see the tails.")
     ap.add_argument("--out", default="detection_frontier.png")
+    ap.add_argument("--highlight", default=None,
+                    help='mark one specific gate config on every panel, as "sw=75,dthr=-0.9,'
+                         'mag=0.0,lw=225,pthr=0.0,smoothing=0.0". Use it to show where a config '
+                         'chosen elsewhere lands on this corpus\'s frontier.')
+    ap.add_argument("--highlight-label", default="Highlighted config")
+    ap.add_argument("--title", default="Failure detection: earlier is better at equal accuracy")
     args = ap.parse_args()
-    QV = {"diffdagger": args.dd_variant, "logpzo": args.logpzo_variant}
+
+    hl = None
+    if args.highlight:
+        hl = {k: float(v) for k, v in (kv.split("=") for kv in args.highlight.split(","))}
+    QV = {"diffdagger": args.dd_variant, "logpzo": args.logpzo_variant,
+          "ucf": args.ucf_variant}
 
     panels = [(p.split(":", 1)[0], p.split(":", 1)[1]) for p in args.panels]
     ncol = 2 if len(panels) > 1 else 1
@@ -170,6 +192,28 @@ def main():
                     ls=s["ls"], marker=s["marker"], ms=s["ms"], alpha=s["alpha"],
                     zorder=s["z"], mec="white", mew=0.9, clip_on=True)
 
+        if hl is not None:
+            match = [r for r in rows
+                     if r["family"] == "gate" and r.get("protocol", "insample") == "insample"
+                     and all(r.get(k) is not None and abs(r[k] - v) < 1e-9 for k, v in hl.items())]
+            if len(match) != 1:
+                raise SystemExit(f"--highlight matched {len(match)} configs on {tag}, expected 1")
+            m = match[0]
+            drawn.add("_hl")
+            # The gap to the frontier is the point of the figure, so draw it: a horizontal rule to
+            # the frontier config that is at least as accurate but fires sooner.
+            fpts = front(select(rows, "gate", args.protocol, args.thrifty_variant, QV))
+            same = [t for b, t in fpts if b >= m["balacc"] - 1e-9]
+            if same:
+                ax.annotate("", xy=(min(same), m["balacc"]), xytext=(m["avg_tdet"], m["balacc"]),
+                            arrowprops=dict(arrowstyle="-|>", color=HL, lw=1.4,
+                                            ls=(0, (3, 2)), shrinkA=7, shrinkB=2), zorder=8)
+            ax.plot([m["avg_tdet"]], [m["balacc"]], marker="*", ms=17, color=HL,
+                    mec="white", mew=1.3, ls="none", zorder=9, clip_on=False)
+            ax.annotate(f"balacc {m['balacc']:.2f}\nTPR {m['recall']:.2f} / TNR {1 - m['fpr']:.2f}",
+                        (m["avg_tdet"], m["balacc"]), textcoords="offset points", xytext=(0, -13),
+                        ha="center", va="top", fontsize=7.8, color=HL, zorder=9)
+
         ax.set_title(f"{title}   ({nS} success / {nF} failure)", fontsize=11.5, color=INK,
                      loc="left", pad=8)
         ax.set_xlim(0.0, args.xmax)
@@ -192,14 +236,16 @@ def main():
     handles = [plt.Line2D([], [], color=STYLE[f]["color"], lw=STYLE[f]["lw"], ls=STYLE[f]["ls"],
                           marker=STYLE[f]["marker"], ms=STYLE[f]["ms"], mec="white", mew=0.9,
                           label=STYLE[f]["label"]) for f in ORDER if f in drawn]
+    if "_hl" in drawn:
+        handles.append(plt.Line2D([], [], color=HL, marker="*", ms=13, ls="none", mec="white",
+                                  mew=1.2, label=args.highlight_label))
     if "_lsucc" in drawn:
         handles.append(plt.Line2D([], [], color="#4a3aa7", lw=1.5, ls=(0, (5, 4)),
                                   label="Mean successful-episode length"))
     fig.legend(handles=handles, loc="lower center", ncol=3, frameon=False, fontsize=9.5,
                bbox_to_anchor=(0.5, -0.005), labelcolor=INK2, handlelength=2.6,
                columnspacing=2.0)
-    fig.suptitle("Failure detection: earlier is better at equal accuracy",
-                 fontsize=13.5, color=INK, x=0.008, ha="left", y=0.995)
+    fig.suptitle(args.title, fontsize=13.5, color=INK, x=0.008, ha="left", y=0.995)
     fig.tight_layout(rect=(0, 0.02 + 0.032 * len(handles) / ncol, 1, 0.96))
     out = args.out if os.path.isabs(args.out) else os.path.join(args.data_dir, args.out)
     fig.savefig(out, dpi=200, facecolor="white", bbox_inches="tight")
