@@ -14,6 +14,9 @@ Example usages:
 
     # Diff-DAgger gate, and a DP expert instead of pi0
     ... --gate-type diffdagger --expert-type dp --expert-dir outputs/<dp_run>
+
+    # "Uncertainty Comes for Free": the student's own denoising vector field
+    ... --gate-type ucf
 """
 
 import os
@@ -525,7 +528,8 @@ def main():
     parser.add_argument("--smoothing", type=float, default=0.0, help="EMA weight on history in [0,1); 0 = off")
     parser.add_argument("--score-every", type=int, default=1)  # Gate scores every score_every steps; account for real_world latency
     parser.add_argument("--gate-type",
-                        choices=["robometer", "diffdagger", "thrifty", "logpzo", "hgdagger"],
+                        choices=["robometer", "diffdagger", "thrifty", "logpzo", "ucf",
+                                 "hgdagger"],
                         default="robometer")
     parser.add_argument("--ungated", action="store_true",
                         help="build the gate and score every step, but never hand over: the "
@@ -569,6 +573,35 @@ def main():
     parser.add_argument("--logpzo-train-steps", type=int, default=2000)
     parser.add_argument("--logpzo-lr", type=float, default=1e-4)
     parser.add_argument("--thrifty-gamma", type=float, default=0.9999)
+    # UCF: alpha is a quantile of the training uncertainties, like --dd-alpha.
+    parser.add_argument("--ucf-alpha", type=float, default=0.95,
+                        help="quantile of the training uncertainties used as the threshold")
+    parser.add_argument("--ucf-calib", choices=["rollouts", "buffer"], default="rollouts",
+                        help="where the quantile is taken. 'rollouts' is the reference: run the "
+                             "student solo and pool its per-step uncertainties. 'buffer' takes it "
+                             "over the training data instead -- free, and Diff-DAgger's recipe, "
+                             "but that data is what the student was trained ON.")
+    parser.add_argument("--ucf-rollouts", type=int, default=50,
+                        help="'rollouts' only: solo episodes spent setting the threshold")
+    parser.add_argument("--ucf-successes-only", action="store_true",
+                        help="'rollouts' only: pool only successful episodes (SAFE's convention). "
+                             "The reference pools every episode, which is what this defaults to.")
+    parser.add_argument("--ucf-calib-samples", type=int, default=1024,
+                        help="'buffer' only: states scored to build that quantile")
+    parser.add_argument("--ucf-patience", type=int, default=1,
+                        help="fire once this many of the last --ucf-patience-window steps exceed "
+                             "the threshold (the reference has no patience, i.e. 1)")
+    parser.add_argument("--ucf-patience-window", type=int, default=None,
+                        help="defaults to --ucf-patience")
+    parser.add_argument("--ucf-samples", type=int, default=100,
+                        help="candidate actions per scored state (the reference's 100)")
+    parser.add_argument("--ucf-radius", type=float, default=1.0,
+                        help="sampling radius in normalized action units; 1.0 is the reference's "
+                             "5 cm ball, since robosuite caps one delta step at 5 cm")
+    parser.add_argument("--ucf-gmm-alpha", type=float, default=0.1,
+                        help="weight on the intra-mode variance term of D(V) + alpha * Var_g(V)")
+    parser.add_argument("--ucf-gmm-n-init", type=int, default=1,
+                        help="GMM restarts per mode count; the reference uses 10 for ~15x the cost")
     parser.add_argument("--video-dir", default="gated_videos")
     parser.add_argument("--dump-obs", default=None,
                         help="directory to write one .npz per episode with the observations and "
@@ -587,6 +620,9 @@ def main():
                      "so it needs a diffusion policy student")
     if args.gate_type == "thrifty" and args.student_type != "dp":
         parser.error("--gate-type diffdagger must have a diffusion policy for the student")
+    if args.gate_type == "ucf" and args.student_type != "dp":
+        parser.error("--gate-type ucf reads the student's own noise-prediction network, "
+                     "so it needs a diffusion policy student")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -717,6 +753,19 @@ def main():
         gate = BandGate(alpha=args.logpzo_alpha, patience=args.logpzo_patience,
                         patience_window=args.logpzo_patience_window, score_every=args.score_every,
                         name="logpzo")
+    elif args.gate_type == "ucf":
+        from robometer_policy_learning.utils.ucf_gate import UCFScorer, build_gate
+
+        algo, _ = build_offline_algo()
+        scorer = UCFScorer(
+            student, remove_obs_keys=remove_obs_keys,
+            lowdim_stats=algo.buffer.lowdim_obs_stats, device=device,
+            n_samples=args.ucf_samples, radius=args.ucf_radius, alpha=args.ucf_gmm_alpha,
+            gmm_n_init=args.ucf_gmm_n_init,
+        )
+        gate = build_gate(alpha=args.ucf_alpha, patience=args.ucf_patience,
+                          patience_window=args.ucf_patience_window)
+        # Calibration needs the worker when it runs the student solo, so it happens further down.
     elif args.gate_type == "thrifty":
         from robometer_policy_learning.utils.thrifty_gate import (
             ThriftyGate, ThriftyScorer, build_ensemble, collect_thrifty_scores,
@@ -804,6 +853,35 @@ def main():
         dump_dir=args.dump_obs,
     )
 
+    if args.gate_type == "ucf":
+        from robometer_policy_learning.utils.ucf_gate import (
+            set_threshold_from_buffer, set_threshold_from_rollouts)
+
+        if args.ucf_calib == "rollouts":
+            logger.info(f"UCF: running {args.ucf_rollouts} solo rollouts of this student to set "
+                        "the threshold...")
+            info = set_threshold_from_rollouts(
+                base_gate, scorer, worker, n_rollouts=args.ucf_rollouts, tag="ucf_calib",
+                successes_only=args.ucf_successes_only)
+            if info is None:
+                raise SystemExit(f"UCF: none of {args.ucf_rollouts} solo rollouts produced a "
+                                 "usable trace, so there is nothing to set the threshold from.")
+            logger.info(f"UCF calibration on {info['n_calib_episodes']}/{info['n_rollouts']} solo "
+                        f"episodes ({info['n_success']} successful, {info['n']} steps): "
+                        f"uncertainty mean={info['loss_mean']:.6f} max={info['loss_max']:.6f}")
+            # The calibration rollouts consumed resets, and LIBERO draws each episode's initial
+            # state from a stream seeded once at construction. Re-seed so the watched episodes are
+            # the set every other gate sees.
+            env.reset(seed=args.seed)
+        else:
+            info = set_threshold_from_buffer(base_gate, scorer, algo,
+                                           num_samples=args.ucf_calib_samples)
+            if info is None:
+                raise RuntimeError("UCF calibration drew no samples from the demo buffer.")
+            logger.info(f"UCF calibration on {pre_cfg.env.h5_dataset_path}: n={info['n']} "
+                        f"uncertainty mean={info['loss_mean']:.6f} max={info['loss_max']:.6f}")
+        logger.info(f"UCF gate: {base_gate.describe()}")
+
     if args.gate_type == "logpzo":
         from robometer_policy_learning.utils.logpzo_gate import refit_from_rollouts
 
@@ -865,6 +943,10 @@ def main():
                              rollouts=args.logpzo_rollouts)
                         if args.gate_type == "logpzo" else None),
                 dd_alpha=(args.dd_alpha if args.gate_type == "diffdagger" else None),
+                ucf=(dict(base_gate.describe(), n_samples=args.ucf_samples,
+                          radius=args.ucf_radius, gmm_alpha=args.ucf_gmm_alpha,
+                          calib=args.ucf_calib, rollouts=args.ucf_rollouts)
+                     if args.gate_type == "ucf" else None),
                 dd_patience=args.dd_patience, dd_patience_window=args.dd_patience_window,
                 dd_batch_multiplier=args.dd_batch_multiplier,
                 reward_model=(args.reward_model if args.gate_type == "robometer" else None),
