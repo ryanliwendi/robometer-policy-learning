@@ -16,3 +16,6 @@
 [submodule "baselines/SAFE"]
 	path = baselines/SAFE
 	url = https://github.com/vla-safe/SAFE.git
+[submodule "baselines/hitl_DiffusionPolicy"]
+	path = baselines/hitl_DiffusionPolicy
+	url = https://github.com/Yifeng-Cao/hitl_DiffusionPolicy.git

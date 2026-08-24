@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Robometer scoring HTTP server.
 
-Protocol:
+Protocol (stateless):
     {"frames": (N, H, W, 3) uint8, "prompt": str}
--> pickled reply {"progress": float, "success_prob": float}.
+-> pickled {"progress": float, "success_prob": float}.
 The client subsamples its causal prefix to <= max_frames BEFORE sending.
 
 Usage:
@@ -30,7 +30,7 @@ from label_real_world import RobometerLabeler  # noqa: E402  (same scorer as the
 
 def make_handler(labeler: RobometerLabeler, lock: threading.Lock):
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):  # silence per-request logging
+        def log_message(self, *args):
             pass
 
         def do_GET(self):  # health check
