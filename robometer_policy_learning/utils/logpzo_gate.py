@@ -15,15 +15,15 @@ import torch
 import torch.nn as nn
 
 from robometer_policy_learning.modules.diffusion.unet import ConditionalUnet1D
+from robometer_policy_learning.utils.reward_gate import collect_solo_rollouts
 
 # The reference's UNet width
 DOWN_DIMS = (256, 512, 1024)
-# Channel count the feature vector is folded into. 32 divides our 768-d encoding exactly.
 IN_DIM = 32
 
 
 def adjust_xshape(x: torch.Tensor, in_dim: int) -> torch.Tensor:
-    """Fold a flat feature vector (N, D) into (N, D/in_dim, in_dim) so the 1D UNet can read it."""
+    """Reshape a feature vector from (N, D) into (N, D/in_dim, in_dim) to feed to 1D UNet."""
     remain = x.shape[1] % in_dim
     if remain:
         x = torch.cat([x, torch.zeros(x.shape[0], in_dim - remain, device=x.device, dtype=x.dtype)],
@@ -37,7 +37,7 @@ def _build_unet(in_dim: int) -> ConditionalUnet1D:
 
 
 class LogpZOModel(nn.Module):
-    """Flow matching from the training-feature distribution to noise, used as a density score."""
+    """Flow matching from the training distribution to noise."""
 
     def __init__(self, feat_dim: int, in_dim: int = IN_DIM):
         super().__init__()
@@ -49,10 +49,6 @@ class LogpZOModel(nn.Module):
         return torch.zeros(n, 0, device=ref.device, dtype=ref.dtype)
 
     def flow_loss(self, feat: torch.Tensor) -> torch.Tensor:
-        """Train the net to carry a real feature to noise in a straight line.
-
-        x0 is the real feature, x1 is noise, and the true velocity is the difference. 
-        """
         x0 = adjust_xshape(feat, self.in_dim)
         x1 = torch.randn_like(x0)
         v_true = x1 - x0
@@ -135,7 +131,7 @@ def score_features(model: LogpZOModel, feat: np.ndarray, device, batch_size: int
 
 def pad_to(trace, T: int) -> np.ndarray:
     """Cut or stretch one trace to T steps. Short episodes are stretched by repeating their last
-    value, which is what SAFE does before building a band out of episodes of different lengths."""
+    value."""
     t = np.asarray(trace, dtype=np.float64)
     return t[:T] if len(t) >= T else np.pad(t, (0, T - len(t)), mode="edge")
 
@@ -169,13 +165,6 @@ def conformal_band(train_traces: np.ndarray, calib_traces: np.ndarray,
 
 
 class LogpZOScorer:
-    """Per-step score for the rollout worker. Same interface as ``DiffDaggerScorer``.
-
-    It can also just record the features it encodes and skip the flow entirely, which is what the
-    rollouts that LogpZO is rebuilt from need: at that point the flow for this round does not exist
-    yet, so there is no score to compute, only features to keep.
-    """
-
     def __init__(self, algo, model: LogpZOModel, remove_obs_keys=None, device=None):
         self.algo = algo
         self.model = model
@@ -219,29 +208,6 @@ class LogpZOScorer:
         return float(self.model.score(feat).reshape(-1)[0]), 0.0
 
 
-def collect_solo_rollouts(worker, scorer: LogpZOScorer, n_rollouts: int, tag: str) -> List[dict]:
-    """Run `n_rollouts` ungated episodes of the current student, keeping each one's features.
-
-    This is LogpZO's running cost. Nothing is stored in the training buffer -- the student is alone,
-    so there is no expert action to learn from; the episodes buy the density model and nothing else.
-    """
-    from robometer_policy_learning.utils.reward_gate import NeverGate
-
-    saved = (worker.gate, worker.video_dir, worker.dump_dir)
-    worker.gate, worker.video_dir, worker.dump_dir = NeverGate(), None, None
-    episodes = []
-    try:
-        for i in range(int(n_rollouts)):
-            scorer.start_recording()
-            stats = worker.rollout_episode(f"{tag}_solo{i}", store=False)
-            episodes.append(dict(feat=scorer.take_recording(), success=bool(stats["success"]),
-                                 steps=int(stats["steps"])))
-    finally:
-        scorer._record = None
-        worker.gate, worker.video_dir, worker.dump_dir = saved
-    return episodes
-
-
 def refit_from_rollouts(worker, scorer: LogpZOScorer, feat_dim: int, horizon: int, *,
                         n_rollouts: int, alpha: float, grad_steps: int, lr: float, device,
                         tag: str = "", seed: int = 0, batch_size: int = 256):
@@ -253,7 +219,7 @@ def refit_from_rollouts(worker, scorer: LogpZOScorer, feat_dim: int, horizon: in
     gate alone.
     """
     episodes = collect_solo_rollouts(worker, scorer, n_rollouts, tag or "logpzo")
-    succ = [e["feat"] for e in episodes if e["success"] and len(e["feat"])]
+    succ = [e["trace"] for e in episodes if e["success"] and len(e["trace"])]
     n_succ = len(succ)
     if n_succ < 4:
         return None

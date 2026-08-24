@@ -50,6 +50,29 @@ class NeverGate:
             self.inner.plot_trace(stats, save_path, title=title)
 
 
+def collect_solo_rollouts(worker, scorer, n_rollouts: int, tag: str) -> List[dict]:
+    """Run `n_rollouts` ungated episodes of the current student, keeping what the scorer records.
+
+    Some gates need to calibrate on rollouts from the updated, current policy instead of on the 
+    training buffer directly, such as LogpZO's flow and conformal thresholds, and UCF's uncertainty quantile.
+
+    The scorer must implement ``start_recording()`` and ``take_recording()``.
+    """
+    saved = (worker.gate, worker.video_dir, worker.dump_dir)
+    worker.gate, worker.video_dir, worker.dump_dir = NeverGate(), None, None
+    episodes = []
+    try:
+        for i in range(int(n_rollouts)):
+            scorer.start_recording()
+            stats = worker.rollout_episode(f"{tag}_solo{i}", store=False)
+            episodes.append(dict(trace=scorer.take_recording(), success=bool(stats["success"]),
+                                 steps=int(stats["steps"])))
+    finally:
+        scorer._record = None
+        worker.gate, worker.video_dir, worker.dump_dir = saved
+    return episodes
+
+
 class RewardGate:
     """Takes a scalar progress and decides when the expert should take over,"""
 
