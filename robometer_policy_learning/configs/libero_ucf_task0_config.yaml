@@ -1,0 +1,107 @@
+defaults:
+  - algorithm@offline_algorithm: dp  # must match the student actor type
+  - reward_model: null
+  - policy@policy: transformer
+
+debug: false
+
+# "Uncertainty Comes for Free" (UCF) BASELINE arm for task 0. Everything except the gate is held
+# identical to libero_rdagger_task0_config.yaml (same student checkpoint, same pi0 expert, same
+# takeover exit, same expert-only training recipe), so any difference in the resulting policy is
+# attributable to the gating rule alone.
+#
+# The gate is the student's own noise-prediction network, read as a score field: sample 100
+# candidate actions around the current end-effector pose, ask the network what noise it would
+# remove from each at timestep 0, fit a GMM to the resulting vectors, and score the state by how
+# far apart the modes sit plus how loose they are. No second model is trained, which is the
+# paper's point -- this arm is by far the cheapest baseline to run.
+#
+# The threshold is recalibrated every iteration from fresh solo rollouts of the current student,
+# which is what the reference's calibrate_threshold.py does. That makes this arm cost the same kind
+# of ungated episodes LogpZO's refit does, logged as ucf/cum_solo_episodes for the cost table.
+# See ucf_gate.py for the remaining deviations from the reference.
+
+load_dir: /scr/liryan/robometer_policy_learning/outputs/task0_dp_50k/22-08-45  # task-0 student
+checkpoint: 50000  # ~62% ungated success
+
+rdagger:
+  gate_type: ucf
+
+  expert_type: pi0
+  pi0_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero
+  expert_dir: null
+  expert_checkpoint: null
+
+  reward_model: null  # unused: UCF gates on the student's own network, not on Robometer
+
+  # Quantile of the calibration uncertainties used as the threshold. The paper's value.
+  ucf_alpha: 0.95
+  # Where that quantile is taken. "rollouts" is the reference: the student runs ucf_rollouts
+  # ungated episodes each round and the quantile is pooled over every step of them. "buffer" is
+  # the free variant -- the quantile over the training data, Diff-DAgger's recipe -- but that data
+  # is what the student was trained ON rather than anything held out.
+  ucf_calib: rollouts
+  # Nothing is fitted from these episodes (the student's own network IS the detector), so all of
+  # them feed the quantile instead of half going to train a model. That is why this needs fewer
+  # episodes than logpzo_rollouts does for the same job; 50 is the reference's number.
+  ucf_rollouts: 50
+  # The reference pools every calibration episode, successes and failures alike. Harmless for its
+  # own policy, which solves the task essentially every time; at our student's 40-60% the failures
+  # help set the bar for "normal" and push the threshold up exactly where the gate should fire.
+  # Set true to give the baseline SAFE's successful-rollouts-only convention instead.
+  ucf_successes_only: false
+  # The reference fires the first step over the threshold (patience 1). At a 0.95 quantile that
+  # trips by chance roughly every 20 steps, so this arm uses the same 2-of-2 rule as the
+  # Diff-DAgger arm: both baselines then fire on the same kind of evidence.
+  ucf_patience: 2
+  ucf_patience_window: 2
+  ucf_calib_samples: 1024
+  # The reference's vector-field settings. radius is in normalized action units; 1.0 is the
+  # reference's 5 cm ball, since robosuite caps one OSC delta step at 5 cm.
+  ucf_samples: 100
+  ucf_radius: 1.0
+  ucf_gmm_alpha: 0.1
+  # GMM restarts per candidate mode count. The reference uses 10; that costs ~330 ms per scored
+  # state against ~22 ms for 1, and the two pick the same number of modes 99% of the time.
+  ucf_gmm_n_init: 1
+
+  # Expert completes the episode, per Diff-DAgger's protocol (and our winning recipe).
+  expert_n_action_steps: 5
+
+  # Identical to the Robometer arm.
+  num_iterations: 10
+  expert_transitions_per_iter: 1500
+  train_steps_per_iter: 2000
+  use_offline: true
+  offline_sample_ratio: 0.25
+
+  store_only_expert: true
+  reweighting: null
+  iwr_target_intv: 0.8
+
+  require_success: true
+  require_intervention: true
+
+  save_interval: 1
+  online_buffer_capacity: 200000
+  seed: 0
+
+offline_algorithm:
+  use_weighted_bc: false
+
+alg:
+  offline_alg_name: dp
+  online_alg_name: null
+
+eval:
+  eval_num_episodes: 50
+  eval_record_video: true
+  eval_on_first_step: true
+
+logging:
+  wandb_project: libero_rdagger
+  wandb_entity: liryan-usc
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "ucf_dp_task0_baseline"
+  log_level: "INFO"

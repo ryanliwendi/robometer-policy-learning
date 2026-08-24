@@ -1,0 +1,95 @@
+defaults:
+  - algorithm@offline_algorithm: dp  # must match the student actor type
+  - reward_model: null
+  - policy@policy: transformer
+
+debug: false
+
+# ThriftyDAgger BASELINE arm for task 5. Everything except the gate is held identical to
+# libero_rdagger_task5_config.yaml (same student checkpoint, same pi0 expert, same takeover exit,
+# same expert-only training recipe), so any difference in the resulting policy is attributable to
+# the gating rule alone.
+#
+# The gate here is ThriftyDAgger's novelty-OR-risk rule: an ensemble of 5 MLP heads over the
+# student's frozen encoder supplies novelty (disagreement), and a sigmoid Q-head supplies risk
+# (1 - P(reach goal)). Both are retrained and both thresholds re-derived every iteration.
+# No Robometer is loaded.
+
+load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-07/19-17-11  # task-5 DP student
+checkpoint: 10000  # ~54% ungated success
+
+# NOTE: task 5's failures are TERMINAL -- the book flops flat and no policy can
+# recover it. This arm is the CONTROL that proves the scope condition, not a task
+# any gate is expected to win on. Expect flat or negative deltas here.
+
+rdagger:
+  gate_type: thrifty
+
+  expert_type: pi0
+  pi0_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero
+  expert_dir: null
+  expert_checkpoint: null
+
+  reward_model: null  # unused: Diff-DAgger gates on the student, not on Robometer
+
+  # ThriftyDAgger gate. alpha_h is the target intervention RATE: thresholds are set to the
+  # (1 - alpha_h)-quantiles of novelty and risk over buffer states, recomputed each iteration.
+  # The paper uses 0.01 for peg insertion.
+  # Target intervention rate. NOTE: this is a per-STEP hazard, and the authors assume the human
+  # hands control back after a few steps so the budget is spent per-step. Under our one-way
+  # takeover a single fire costs the rest of the episode, so the episode-level gating rate is
+  # 1-(1-alpha_h)^episode_len. At the authors' 0.01 over ~250-step episodes that is ~92% of
+  # episodes gated (measured: 89-90%), firing at median step 46-77 -- before the student's own
+  # failures appear, so the expert data is near-initial-state demos rather than corrections.
+  # 0.001 puts the EPISODE-level rate near 25%, matching the rdagger arm's 24-26%.
+  thrifty_alpha_h: 0.001
+  thrifty_num_nets: 5
+  thrifty_train_steps: 200
+  thrifty_lr: 1e-3
+  # Q_risk gets 5x the BC ensemble's gradient steps, as in the reference
+  # (`for _ in range(bc_epochs): for i in range(grad_steps * 5)`). Set to 1 to spend the
+  # same budget on both.
+  thrifty_q_steps_multiplier: 5
+
+  # Expert completes the episode, per Diff-DAgger's protocol (and our winning recipe).
+  expert_n_action_steps: 5
+
+  # Identical to the Robometer arm.
+  num_iterations: 10
+  expert_transitions_per_iter: 1500
+  # Budget the iteration by expert transitions instead of episodes -- the axis that makes
+  # two gates comparable at equal human effort. Set to an int to override rollouts_per_iter.
+  train_steps_per_iter: 2000
+  use_offline: true
+  offline_sample_ratio: 0.25
+
+  store_only_expert: true
+  reweighting: null
+  iwr_target_intv: 0.8
+
+  require_success: true
+  require_intervention: true
+
+  save_interval: 1
+  online_buffer_capacity: 200000
+  seed: 0
+
+offline_algorithm:
+  use_weighted_bc: false
+
+alg:
+  offline_alg_name: dp
+  online_alg_name: null
+
+eval:
+  eval_num_episodes: 50
+  eval_record_video: true
+  eval_on_first_step: true
+
+logging:
+  wandb_project: libero_rdagger
+  wandb_entity: liryan-usc
+  wandb_offline: false
+  wandb_log_dir_base: logs/wandb
+  wandb_name: "thriftydagger_dp_task5_baseline"
+  log_level: "INFO"

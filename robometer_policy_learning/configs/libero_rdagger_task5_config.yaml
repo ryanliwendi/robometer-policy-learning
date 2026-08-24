@@ -5,12 +5,13 @@ defaults:
 
 debug: true  # record collection episodes + per-intervention Robometer progress plots
 
-load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-14/21-35-36  # task-8 DP student
-checkpoint: 5000  # ~46% ungated success
+load_dir: /scr/liryan/robometer_policy_learning/outputs/2026-07-07/19-17-11  # task-5 DP student
+checkpoint: 10000  # ~54% ungated success
 
-# env/training/model/policy adopted from <load_dir>/.hydra (task_id=8, n_act=10).
-# Task 8 (both moka pots -> stove) is two-object and rigid, so partial progress is
-# real and a dropped pot stays graspable -- a recoverable-failure task like 0 and 1.
+# env/training/model/policy adopted from <load_dir>/.hydra (task_id=5, n_act=2).
+# NOTE: task 5's failures are TERMINAL -- the book flops flat and no policy can
+# recover it. This arm is the CONTROL that proves the scope condition, not a task
+# any gate is expected to win on. Expect flat or negative deltas here.
 
 rdagger:
   gate_type: robometer
@@ -23,7 +24,7 @@ rdagger:
 
   # Gate: the single config tuned jointly on all four tasks (transfer study, delta 0.02). On a
   # fifth task it never tuned on it costs 1.9% latency against that task's own frontier, so this is
-  # the config the paper ships. Not task 8's own tuned config, on purpose.
+  # the config the paper ships. Not task 5's own tuned config, on purpose.
   method: spearman
   short_window: 75
   drop_threshold: -0.9
@@ -70,5 +71,5 @@ logging:
   wandb_entity: liryan-usc
   wandb_offline: false
   wandb_log_dir_base: logs/wandb
-  wandb_name: "rdagger_dp_task8_expert_only"
+  wandb_name: "rdagger_dp_task5_expert_only"
   log_level: "INFO"
