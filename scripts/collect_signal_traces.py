@@ -2,9 +2,10 @@
 """Q1 in simulation: record every gate's signal on the SAME rollouts.
 
 The real-world Q1 (`analyze_real_world_labels.py`) asks whether the Robometer progress signal
-separates successful teleop episodes from failed ones. This is its sim twin, extended to the two
-baseline signals -- Diff-DAgger's diffusion loss and ThriftyDAgger's novelty / Q-risk -- so the
-three can be compared as *failure detectors* before any gating rule is applied.
+separates successful teleop episodes from failed ones. This is its sim twin, extended to the
+baseline signals -- Diff-DAgger's diffusion loss, ThriftyDAgger's novelty / Q-risk, and UCF's
+denoising vector field -- so they can be compared as *failure detectors* before any gating rule is
+applied.
 
 Everything is recorded in ONE ungated pass per task. That matters: each signal is computed from
 the student's own network, and scoring draws from the torch RNG, so three separate runs would
@@ -58,6 +59,7 @@ from robometer_policy_learning.utils.gpu_utils import convert_to_tensor, move_to
 from robometer_policy_learning.utils.reward_gate import NeverGate  # noqa: E402
 from robometer_policy_learning.utils.thrifty_gate import (  # noqa: E402
     build_ensemble, collect_thrifty_scores, train_thrifty_models)
+from robometer_policy_learning.utils.ucf_gate import VectorFieldScorer  # noqa: E402
 
 LABEL_OFFLINE = 2
 
@@ -73,19 +75,21 @@ class MultiSignalScorer:
     reverse-diffusion passes per scored step.
     """
 
-    def __init__(self, actor, robometer_scorer, dd_scorers, thrifty_acs, remove_obs_keys=None,
-                 device=None):
+    def __init__(self, actor, robometer_scorer, dd_scorers, thrifty_acs, ucf_scorers=(),
+                 remove_obs_keys=None, device=None):
         self.actor = actor
         self.robometer = robometer_scorer
         self.dd_scorers = list(dd_scorers)          # [(name, DiffusionLossScorer)]
         self.thrifty_acs = list(thrifty_acs)        # [(name, Ensemble)]
+        self.ucf_scorers = list(ucf_scorers)        # [(name, VectorFieldScorer)]
         self.remove_obs_keys = list(remove_obs_keys or [])
         self.device = device or next(actor.parameters()).device
         self._last_obs = None
 
         self.names = (["robometer_progress", "robometer_success_prob"]
                       + [f"dd_loss_{n}" for n, _ in self.dd_scorers]
-                      + [f"{p}_{n}" for n, _ in self.thrifty_acs for p in ("novelty", "safety")])
+                      + [f"{p}_{n}" for n, _ in self.thrifty_acs for p in ("novelty", "safety")]
+                      + [f"ucf_{n}" for n, _ in self.ucf_scorers])
 
     def reset(self, task: str = ""):
         self.robometer.reset(task=task)
@@ -115,6 +119,12 @@ class MultiSignalScorer:
         for _, ac in self.thrifty_acs:
             values.append(float(ac.variance(feat)))
             values.append(float(ac.safety(feat, act0)))
+
+        # UCF only needs the action for the gripper dim of its candidate cloud. Here that is the
+        # student's freshly sampled action; `score_signals_offline.py` uses the executed one,
+        # the same split the two collectors already have for Diff-DAgger.
+        for _, sc in self.ucf_scorers:
+            values.append(float(sc.score_features(global_cond, act0)[0]))
 
         return tuple(values), 0.0
 
@@ -163,6 +173,16 @@ def main():
     ap.add_argument("--dd-batch-multipliers", type=int, nargs="+", default=[5, 20])
     ap.add_argument("--dd-calib-samples", type=int, default=1024)
     ap.add_argument("--dd-alpha", type=float, default=0.99)
+    # UCF: radius is the one setting our delta-action mapping had to choose (see ucf_gate.py),
+    # so that is the knob carried as variants; the rest are the reference's fixed values.
+    ap.add_argument("--ucf-radii", type=float, nargs="+", default=[1.0])
+    ap.add_argument("--ucf-samples", type=int, default=100)
+    ap.add_argument("--ucf-gmm-alpha", type=float, default=0.1)
+    ap.add_argument("--ucf-gmm-n-init", type=int, default=1)
+    ap.add_argument("--ucf-calib-samples", type=int, default=1024)
+    ap.add_argument("--ucf-alpha", type=float, default=0.95)
+    ap.add_argument("--no-ucf", action="store_true",
+                    help="skip UCF; it is the slowest signal here, one GMM fit per step")
     # ThriftyDAgger: the reference fits its ensemble to convergence on D_exp; the rdagger loop's
     # default is 200 steps, which may simply be undertrained. Carry both and let the data say.
     ap.add_argument("--thrifty-train-steps", type=int, nargs="+", default=[200, 2000])
@@ -248,11 +268,15 @@ def main():
     algo = algo_cfg.create()
 
     # ---- Signals ----
+    # The demo scores each quantile method calibrates on. The frontier needs the whole
+    # distribution, not just the deployed threshold, to sweep alpha the way the method would.
+    calib_scores = {}
     dd_scorers, dd_meta = [], {}
     for bm in args.dd_batch_multipliers:
         s = DiffusionLossScorer(student, batch_multiplier=bm, num_per_batch=1, device=device)
         name = f"nb{s.num_train_timesteps * bm}"
         losses = s.calibrate_from_buffer(offline_buffer, num_samples=args.dd_calib_samples)
+        calib_scores[f"dd_loss_{name}"] = [float(x) for x in losses]
         thr = quantile_threshold(losses, args.dd_alpha)
         dd_meta[name] = dict(batch_multiplier=bm, n_b=s.num_train_timesteps * bm,
                              alpha=args.dd_alpha, threshold=float(thr),
@@ -262,6 +286,27 @@ def main():
                     f"offline loss mean={losses.mean():.6f} max={losses.max():.6f} "
                     f"alpha={args.dd_alpha} threshold={thr:.6f}")
         dd_scorers.append((name, s))
+
+    # UCF needs no training: the student's own network is the detector, and all that happens here
+    # is reading the quantile of its uncertainty over the demos.
+    ucf_scorers, ucf_meta = [], {}
+    for radius in ([] if args.no_ucf else args.ucf_radii):
+        sc = VectorFieldScorer(student, n_samples=args.ucf_samples, radius=radius,
+                               alpha=args.ucf_gmm_alpha, gmm_n_init=args.ucf_gmm_n_init,
+                               device=device)
+        name = f"r{radius:g}"
+        vals = sc.calibrate_from_buffer(offline_buffer, num_samples=args.ucf_calib_samples)
+        calib_scores[f"ucf_{name}"] = [float(x) for x in vals]
+        ucf_meta[name] = dict(radius=float(radius), n_samples=args.ucf_samples,
+                              gmm_alpha=args.ucf_gmm_alpha, gmm_n_init=args.ucf_gmm_n_init,
+                              alpha=args.ucf_alpha,
+                              threshold=float(quantile_threshold(vals, args.ucf_alpha)),
+                              calib_n=int(len(vals)), calib_mean=float(vals.mean()),
+                              calib_max=float(vals.max()))
+        logger.info(f"[ucf:{name}] offline uncertainty mean={vals.mean():.6f} "
+                    f"max={vals.max():.6f} alpha={args.ucf_alpha} "
+                    f"threshold={ucf_meta[name]['threshold']:.6f}")
+        ucf_scorers.append((name, sc))
 
     thrifty_acs, thrifty_meta = [], {}
     feat_dim = int(student.global_cond_dim)
@@ -284,7 +329,7 @@ def main():
 
         robometer = RobometerScorer(model_path=args.reward_model, device=device)
 
-    scorer = MultiSignalScorer(student, robometer, dd_scorers, thrifty_acs,
+    scorer = MultiSignalScorer(student, robometer, dd_scorers, thrifty_acs, ucf_scorers,
                                remove_obs_keys=remove_obs_keys, device=device)
     logger.info(f"signals: {scorer.names}")
 
@@ -313,7 +358,8 @@ def main():
         n_action_steps=n_exec, seed=args.seed, score_every=args.score_every,
         signals=scorer.names,
         reward_model=(None if args.no_robometer else args.reward_model),
-        diffdagger=dd_meta, thrifty=thrifty_meta,
+        diffdagger=dd_meta, ucf=ucf_meta, thrifty=thrifty_meta,
+        calib_scores=calib_scores,
     )
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
 

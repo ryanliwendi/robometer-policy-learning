@@ -9,14 +9,17 @@
     diffdagger  Diff-DAgger: the student's own diffusion loss (diffdagger_gate.py)
     logpzo      SAFE's LogpZO: a flow fit to solo rollouts of the student, read against a
                 time-varying conformal band (logpzo_gate.py)
+    ucf         "Uncertainty Comes for Free": a GMM over the student's own denoising vector
+                field, against a quantile of the training distribution (ucf_gate.py)
 
 Starting from a pretrained student and a frozen expert, each iteration:
   1. collects gated rollouts with GatedRolloutWorker until target episodes/transitions are kept;
      within episodes, expert takes over once gate fires without transferring control back';     
   2. trains behavior cloning for rdagger.train_steps_per_iter steps on the online buffer,
      optionally mixed with the offline demos with a fixed ratio (MixedReplayBuffer);
-  3. refreshes the gate if it needs it -- DiffDAgger and ThriftyDAgger recalibrate thresholds or
-     retrain detectors, and LogpZO spends a batch of solo rollouts rebuilding itself from scratch;
+  3. refreshes the gate if it needs it -- DiffDAgger, UCF and ThriftyDAgger recalibrate thresholds
+     or retrain detectors, and LogpZO spends a batch of solo rollouts rebuilding itself from
+     scratch;
   4. evaluates the autonomous policy performance and checkpoints;
 
 Example usage:
@@ -155,6 +158,23 @@ def main(cfg: DictConfig):
     logpzo_train_steps = int(OmegaConf.select(cfg, "rdagger.logpzo_train_steps", default=2000))
     logpzo_lr = float(OmegaConf.select(cfg, "rdagger.logpzo_lr", default=1e-4))
     logpzo_batch_size = int(OmegaConf.select(cfg, "rdagger.logpzo_batch_size", default=256))
+    # UCF: alpha is a quantile of the training uncertainties, like dd_alpha. n_samples/radius/
+    # gmm_alpha describe the denoising vector field the uncertainty is read off; see ucf_gate.py.
+    ucf_alpha = float(OmegaConf.select(cfg, "rdagger.ucf_alpha", default=0.95))
+    ucf_patience = int(OmegaConf.select(cfg, "rdagger.ucf_patience", default=1))
+    ucf_patience_window = OmegaConf.select(cfg, "rdagger.ucf_patience_window", default=None)
+    ucf_calib_samples = int(OmegaConf.select(cfg, "rdagger.ucf_calib_samples", default=1024))
+    ucf_samples = int(OmegaConf.select(cfg, "rdagger.ucf_samples", default=100))
+    ucf_radius = float(OmegaConf.select(cfg, "rdagger.ucf_radius", default=1.0))
+    ucf_gmm_alpha = float(OmegaConf.select(cfg, "rdagger.ucf_gmm_alpha", default=0.1))
+    ucf_gmm_n_init = int(OmegaConf.select(cfg, "rdagger.ucf_gmm_n_init", default=1))
+    # Where the quantile is taken. "rollouts" is the reference: run the student solo every round
+    # and pool the per-step uncertainties, which costs ucf_rollouts episodes that teach it nothing.
+    # "buffer" takes it over the training data instead -- free, and Diff-DAgger's recipe, but that
+    # data is what the student was trained ON, not anything held out.
+    ucf_calib = str(OmegaConf.select(cfg, "rdagger.ucf_calib", default="rollouts"))
+    ucf_rollouts = int(OmegaConf.select(cfg, "rdagger.ucf_rollouts", default=50))
+    ucf_successes_only = bool(OmegaConf.select(cfg, "rdagger.ucf_successes_only", default=False))
     # HG-DAgger: 'live' needs a display; 'replay' asks the operator after each solo rollout.
     hg_backend = str(OmegaConf.select(cfg, "rdagger.hg_backend", default="live"))
     gate_kwargs = dict(
@@ -388,6 +408,76 @@ def main(cfg: DictConfig):
                         cum_solo_steps=_logpzo_iter["solo_steps"])
 
         refresh_gate = _refresh_logpzo
+
+    elif gate_type == "ucf":
+        from robometer_policy_learning.utils.ucf_gate import (
+            UCFScorer, build_gate, set_threshold_from_buffer, set_threshold_from_rollouts)
+
+        if ucf_calib not in ("rollouts", "buffer"):
+            raise ValueError(f"rdagger.ucf_calib must be 'rollouts' or 'buffer'; got {ucf_calib}")
+
+        remove_keys = list(getattr(algo.actor, "remove_obs_keys", None)
+                           or OmegaConf.select(cfg, "env.extra_keys_to_drop", default=[]) or [])
+        scorer = UCFScorer(algo.actor, remove_obs_keys=remove_keys, lowdim_stats=lowdim_stats,
+                           device=device, n_samples=ucf_samples, radius=ucf_radius,
+                           alpha=ucf_gmm_alpha, gmm_n_init=ucf_gmm_n_init)
+        gate = build_gate(alpha=ucf_alpha, patience=ucf_patience,
+                          patience_window=ucf_patience_window)
+
+        _ucf_iter = {"n": 0, "solo_episodes": 0, "solo_steps": 0}
+
+        def _refresh_ucf(tag: str):
+            """Move the threshold to the alpha-quantile of the current student's uncertainty.
+
+            The reference takes that quantile over fresh solo rollouts of the policy being
+            watched, so it is recomputed from scratch every round; the student changes, and a
+            threshold set for an earlier student would be a strawman.
+            """
+            if ucf_calib == "rollouts":
+                it_n = _ucf_iter["n"]
+                _ucf_iter["n"] = it_n + 1
+                logger.info(f"[ucf:{tag}] running {ucf_rollouts} ungated rollouts of the current "
+                            "student to recalibrate the threshold...")
+                info = set_threshold_from_rollouts(
+                    gate, scorer, worker, n_rollouts=ucf_rollouts, tag=f"ucf_{tag}",
+                    successes_only=ucf_successes_only)
+                if info is None:
+                    logger.warning(f"[ucf:{tag}] no usable calibration rollouts; "
+                                   "threshold unchanged")
+                    return None
+                _ucf_iter["solo_episodes"] += info["n_rollouts"]
+                _ucf_iter["solo_steps"] += info["solo_steps"]
+                logger.info(f"[ucf:{tag}] threshold={info['threshold']:.6f} (alpha={ucf_alpha}, "
+                            f"n={info['n']} steps over {info['n_calib_episodes']}/"
+                            f"{info['n_rollouts']} episodes, {info['n_success']} successful, "
+                            f"uncertainty mean={info['loss_mean']:.6f} "
+                            f"max={info['loss_max']:.6f}) | solo rollouts so far: "
+                            f"{_ucf_iter['solo_episodes']} episodes / "
+                            f"{_ucf_iter['solo_steps']} steps")
+                return dict(info, cum_solo_episodes=_ucf_iter["solo_episodes"],
+                            cum_solo_steps=_ucf_iter["solo_steps"])
+
+            buf = getattr(algo, "buffer", None)
+            restore = getattr(buf, "sample_ratio", None) if hasattr(buf, "set_sample_ratio") else None
+            if hasattr(buf, "set_sample_ratio"):
+                buf.set_sample_ratio(None)  # calibrate uniformly over offline + online
+            try:
+                info = set_threshold_from_buffer(gate, scorer, algo, num_samples=ucf_calib_samples)
+            finally:
+                if hasattr(buf, "set_sample_ratio"):
+                    buf.set_sample_ratio(restore)
+            if info is None:
+                logger.warning(f"[ucf:{tag}] no calibration samples; threshold unchanged")
+                return None
+            mix = ""
+            if hasattr(buf, "buffer_1") and hasattr(buf, "buffer_2"):
+                mix = f", calib mix offline={len(buf.buffer_1)} online={len(buf.buffer_2)}"
+            logger.info(f"[ucf:{tag}] threshold={info['threshold']:.6f} (alpha={ucf_alpha}, "
+                        f"n={info['n']}, uncertainty mean={info['loss_mean']:.6f} "
+                        f"max={info['loss_max']:.6f}{mix})")
+            return info
+
+        refresh_gate = _refresh_ucf
 
     elif gate_type == "thrifty":
         import copy as _copy
