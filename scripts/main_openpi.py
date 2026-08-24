@@ -67,6 +67,13 @@ class Args:
     # True relaunches Polymetis from the workstation and can break an existing session on re-run.
     launch_robot: bool = False
 
+    # Which gate decides when the human takes over:
+    #   "robometer" = progress from the Robometer VLM (needs the scoring server below).
+    #   "thrifty"   = ThriftyDAgger novelty + Q-risk from a --thrifty_checkpoint written by
+    #                 scripts/refresh_thrifty_real.py. Robometer is not started in this mode.
+    gate_type: str = "robometer"
+    thrifty_checkpoint: str | None = None   # required when gate_type=thrifty
+
     # Robometer scoring server (scripts/robometer_http_server.py)
     reward_host: str = "localhost"
     reward_port: int = 8900
@@ -89,13 +96,25 @@ class Args:
     # What happens when the gate fires:
     #   "teleop" = hand to the Quest human; needs quest setup
     #   "stop"   = end the episode at the fire
-    #   "shadow" = log the fire and let pi0 keep driving
+    #   "shadow" = log the fire and let pi05 keep driving
     handoff_mode: str = "teleop"
     teleop_action_space: str = "cartesian_velocity"
+    # Largest Cartesian velocity we will accept as the operator's FIRST command of a takeover.
+    # VRPolicy commands the delta from a reference pose captured when the grip is pressed; if that
+    # reference is stale, the first action is a large jump that both throws the arm and gets
+    # recorded as the expert's opening correction. Anything bigger than this is treated as that
+    # artifact and dropped, not executed.
+    teleop_max_start_vel: float = 0.3
     
     # Save each episode's transitions for DAgger training.
     save_episodes: bool = True
     episode_dir: str = "results/rdagger/round1"
+    # Stop the round once this many expert transitions have been collected (None = run until you
+    # answer "n"). This is the currency a DAgger round is measured in -- the sim side calls it
+    # rdagger.expert_transitions_per_iter -- so rounds are only comparable across arms if every
+    # arm collects the same number. Counts only the human steps that will survive into training:
+    # successful episodes, post no-op trim.
+    expert_budget: int | None = None
 
 
 def _ensure_nuc_robot_ready(robot) -> None:
@@ -341,12 +360,12 @@ class EpisodeRecorder:
     """Collects the (observation, action, actor(policy/human)) triples a DAgger round needs to train on.
 
     The loop already saves video and a progress trace, but neither can be trained on. This stores
-    what pi0 uses -- both camera views at 224x224, joint positions, gripper position -- next to
-    the action that was actually executed, in pi0's own action space (7 joint velocities + gripper
+    what pi05 uses -- both camera views at 224x224, joint positions, gripper position -- next to
+    the action that was actually executed, in pi05's own action space (7 joint velocities + gripper
     position). Teleop actions come out of the Quest as Cartesian velocity, so the caller converts
     them through the NUC's IK first.
 
-    actor: 0 = pi0, 1 = human.
+    actor: 0 = pi05, 1 = human.
     """
 
     def __init__(self):
@@ -364,15 +383,16 @@ class EpisodeRecorder:
     def __len__(self):
         return len(self.actions)
 
-    def save(self, path, control_hz=DROID_CONTROL_FREQUENCY, **meta):
+    def save(self, path, control_hz=DROID_CONTROL_FREQUENCY, **meta) -> int:
+        """Write the episode and return how many human steps it contains (the budget currency)."""
         if not self.actions:
             print("[record] no steps to save")
-            return
+            return 0
         actions = np.stack(self.actions)
         actor = np.asarray(self.actor, dtype=np.int8)
         human = actor == 1
         if human.any():
-            # Fill in the human's arm labels in pi0's action space: the joint velocity that
+            # Fill in the human's arm labels in pi05's action space: the joint velocity that
             # produced the next observed pose
             q = np.stack(self.joints)
             dq = np.zeros_like(q)
@@ -405,7 +425,11 @@ class EpisodeRecorder:
             actor=actor,
             **{k: np.asarray(v) for k, v in meta.items()},
         )
-        print(f"saved episode data  -> {path}  ({len(self)} steps, {int(np.sum(self.actor))} human)")
+        n_human = int(np.sum(self.actor))
+        # len(actions), not len(self): the no-op trim rebinds `actions` locally, so self.actions
+        # still holds the untrimmed count and would over-report the episode length.
+        print(f"saved episode data  -> {path}  ({len(actions)} steps, {n_human} human)")
+        return n_human
 
 
 def human_takeover(env, local_gripper, args, video=None, scorer=None, progress_trace=None, start_step=0,
@@ -425,11 +449,17 @@ def human_takeover(env, local_gripper, args, video=None, scorer=None, progress_t
     tstep = int(start_step)
     _, last_version = scorer.latest if scorer is not None else (0.0, 0)
     _t0 = time.time()   # handoff instant; used to report how long until the operator had control
-    # The first moments after a handoff are dead: the operator is still reaching for the grip, and
-    # the reader may not be streaming poses yet. Commanding the arm with a near-zero action there
-    # does nothing useful, and RECORDING it teaches the policy to freeze exactly when a correction
-    # is needed. So hold until the human genuinely moves, then start.
+    # Arming is two-stage, and both stages exist to protect the FIRST recorded expert frames --
+    # the ones that teach the policy what to do at the exact state where it failed.
+    #   1. Wait for a fresh grip press (movement_enabled False -> True). VRPolicy captures its
+    #      reference pose on that transition; without it the first command is the delta against a
+    #      stale reference (the previous takeover's, since the controller is reused), which is a
+    #      large jump that moves the arm off the failure state before the human does anything.
+    #   2. Then wait for real motion, so the seconds spent reaching for the grip are not recorded
+    #      as "hold still" at the moment a correction is needed.
+    # If movement_enabled is unreadable, stage 1 is skipped and only the magnitude guard applies.
     armed = False
+    grip_released = None   # None = grip state unreadable on this rig, so stage 1 cannot be used
     try:
         while success is None:
             start = time.time()
@@ -457,15 +487,36 @@ def human_takeover(env, local_gripper, args, video=None, scorer=None, progress_t
             tstep += 1
             action = np.asarray(action, dtype=np.float32)
             # Record the step BEFORE sending it. The action stored here is a placeholder: teleop
-            # uses Cartesian velocity but pi0 uses joint velocity, and converting online meant
+            # uses Cartesian velocity but pi05 uses joint velocity, and converting online meant
             # an extra NUC round-trip per step (create_action_dict), which hung the control loop.
             # EpisodeRecorder.save() derives the joint-velocity label offline instead, by finite-
             # differencing the joint positions we already log.
             if not armed:
-                if float(np.abs(np.asarray(action)[:6]).max()) > 1e-3:
+                enabled = (getattr(controller, "_state", None) or {}).get("movement_enabled")
+                if grip_released is None and enabled is not None:
+                    grip_released = not enabled     # first readable sample decides where we start
+                    if not grip_released:
+                        print("[teleop] release the grip, then press it again to take control "
+                              "(this re-anchors the controller so the arm does not jump).")
+                if grip_released is False and time.time() - _t0 > 10.0:
+                    # Never block the operator out of control -- a robot sitting in a failure state
+                    # is worse than a possible jump, and the magnitude guard below still applies.
+                    print("⚠️  [teleop] no grip release seen in 10s; arming anyway.")
+                    grip_released = True
+                mag = float(np.abs(np.asarray(action)[:6]).max())
+                ready = (grip_released is not False) and mag > 1e-3
+                if ready and mag > args.teleop_max_start_vel:
+                    # Stale-reference jump: drop it rather than execute it. Not armed yet, so it is
+                    # neither sent to the arm nor written to the episode.
+                    print(f"[teleop] ignoring a {mag:.2f} start command (> {args.teleop_max_start_vel}) "
+                          "-- looks like a stale controller reference, not a real correction.")
+                    ready = False
+                if ready:
                     armed = True
                     print(f"[teleop] operator has control ({time.time() - _t0:.1f}s after handoff)")
                 else:
+                    if grip_released is False and enabled is False:
+                        grip_released = True        # grip let go; the next press re-anchors
                     elapsed = time.time() - start
                     if elapsed < 1 / DROID_CONTROL_FREQUENCY:
                         time.sleep(1 / DROID_CONTROL_FREQUENCY - elapsed)
@@ -500,7 +551,7 @@ def human_takeover(env, local_gripper, args, video=None, scorer=None, progress_t
                 ans = "n"
         success = ans == "y"
     finally:
-        env.action_space, env.DoF = prev_space, prev_dof  # restore joint_velocity for pi0
+        env.action_space, env.DoF = prev_space, prev_dof  # restore joint_velocity for pi05
     print(f"↩️  takeover ended (success={success})")
     return bool(success)
 
@@ -559,21 +610,42 @@ def main(args: Args):
     # Connect to the policy server
     policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
 
-    # Reward-DAgger: Robometer client (over the network) + gate
-    reward_url = args.reward_url or f"http://{args.reward_host}:{args.reward_port}/"
-    scorer = AsyncRobometerClient(reward_url, timeout=args.reward_timeout)
-    if not scorer.health():
-        print(f"⚠️ Robometer server not reachable at {reward_url} -- the gate won't fire until it is.")
+    # The gate. Both kinds expose update(value) -> bool, so only construction differs; the value
+    # is a Robometer progress scalar in one case and a (novelty, safety) pair in the other.
+    scorer = thrifty = None
+    if args.gate_type == "thrifty":
+        if not args.thrifty_checkpoint:
+            raise SystemExit("--gate_type thrifty needs --thrifty_checkpoint "
+                             "(write one with scripts/refresh_thrifty_real.py)")
+        from robometer_policy_learning.utils.thrifty_real import RealtimeThriftyScorer, load_thrifty
+
+        gate, _ac, _actor = load_thrifty(args.thrifty_checkpoint)
+        thrifty = RealtimeThriftyScorer(_actor, _ac, external_camera=args.external_camera)
+        print("✓ ThriftyDAgger gate ready (Robometer is not used in this mode)")
+    elif args.gate_type == "robometer":
+        reward_url = args.reward_url or f"http://{args.reward_host}:{args.reward_port}/"
+        scorer = AsyncRobometerClient(reward_url, timeout=args.reward_timeout)
+        if not scorer.health():
+            print(f"⚠️ Robometer server not reachable at {reward_url} -- the gate won't fire until it is.")
+        else:
+            print(f"✓ Robometer reachable at {reward_url}")
+        gate = RewardGate(short_window=args.short_window, drop_threshold=args.drop_threshold,
+                          long_window=args.long_window, plateau_threshold=args.plateau_threshold,
+                          method=args.method, smoothing=args.smoothing,
+                          min_drop_magnitude=args.min_drop_magnitude)
     else:
-        print(f"✓ Robometer reachable at {reward_url}")
-    gate = RewardGate(short_window=args.short_window, drop_threshold=args.drop_threshold,
-                      long_window=args.long_window, plateau_threshold=args.plateau_threshold,
-                      method=args.method, smoothing=args.smoothing, min_drop_magnitude=args.min_drop_magnitude)
+        raise SystemExit(f"unknown --gate_type {args.gate_type!r}; expected robometer or thrifty")
 
     if args.handoff_mode == "teleop":
         _get_vr_controller(timeout=10.0)
 
+    if args.expert_budget is not None and not args.save_episodes:
+        raise SystemExit("--expert_budget needs --save_episodes (the count comes from the saved npz)")
+
     results = []  # Collect results as list of dicts, convert to DataFrame at end
+    expert_steps = 0      # counts toward the budget: human steps in SUCCESSFUL episodes
+    wasted_steps = 0      # human steps in failed episodes -- collected, but dropped by
+                          # require_success=1 at training time, so they buy you nothing
 
     while True:
         instruction = args.prompt or input("Enter instruction: ")
@@ -585,9 +657,13 @@ def main(args: Args):
         pred_action_chunk = None
 
         # Reward-DAgger per-episode state
-        scorer.reset(instruction)
+        if scorer is not None:
+            scorer.reset(instruction)
+        if thrifty is not None:
+            thrifty.reset()
         gate.reset()
-        _, last_version = scorer.latest      # skip a score still in flight from the last episode
+        # Robometer only: skip a score still in flight from the last episode.
+        _, last_version = scorer.latest if scorer is not None else (0.0, 0)
         fire_steps = []
         progress_trace = []                  # (env_step, robometer_progress) per completed score
         gate_success = None                  # set by human_takeover in teleop mode
@@ -613,11 +689,13 @@ def main(args: Args):
 
                 video.append(curr_obs[f"{args.external_camera}_image"])
 
-                _ext = curr_obs[f"{args.external_camera}_image"]
-                scorer.append(np.asarray(
-                    Image.fromarray(_ext).resize((args.frame_width, args.frame_height)), dtype=np.uint8))
-                if t_step % args.score_every == 0:
-                    scorer.request()
+                if scorer is not None:
+                    _ext = curr_obs[f"{args.external_camera}_image"]
+                    scorer.append(np.asarray(
+                        Image.fromarray(_ext).resize((args.frame_width, args.frame_height)),
+                        dtype=np.uint8))
+                    if t_step % args.score_every == 0:
+                        scorer.request()
 
                 # Send websocket request to policy server if it's time to predict a new chunk
                 if actions_from_chunk_completed == 0 or actions_from_chunk_completed >= args.open_loop_horizon:
@@ -637,7 +715,12 @@ def main(args: Args):
                     # Ctrl+C will be handled after the server call is complete
                     with prevent_keyboard_interrupt():
                         pred_action_chunk = policy_client.infer(request_data)["actions"]
-                    assert pred_action_chunk.shape == (10, 8) or pred_action_chunk.shape == (15, 8)    ## 10 is for pi0, 15 is for pi05
+                    # pi05 predicts 15 actions per chunk (pi0 predicted 10). Pinned rather than
+                    # permissive: the shape is the one cheap signal that the policy server on :8000
+                    # is serving the model this loop assumes.
+                    assert pred_action_chunk.shape == (15, 8), (
+                        f"expected a pi05 chunk of (15, 8), got {pred_action_chunk.shape} -- is the "
+                        "policy server running a pi05 config?")
 
                 # Select current action to execute from chunk
                 action = pred_action_chunk[actions_from_chunk_completed]
@@ -657,13 +740,26 @@ def main(args: Args):
                     recorder.add(curr_obs, action, actor=0, external_camera=args.external_camera)
                 _step_env(env, action, local_gripper)
 
-                progress, version = scorer.latest
-                if version != last_version:
-                    last_version = version
-                    progress_trace.append((t_step, float(progress)))
-                    if gate.update(progress):
+                # Thrifty scores the state pi05 just acted in, every step and inline; Robometer
+                # publishes asynchronously, so its value is consumed only when a new one lands.
+                if thrifty is not None:
+                    novelty, safety = thrifty.score(curr_obs, action)
+                    gate_value, have_value = (novelty, safety), True
+                    gate_desc = f"novelty={novelty:.4g} safety={safety:.4g}"
+                    # The trace stores novelty so the per-episode graph still plots one series.
+                    progress_trace.append((t_step, float(novelty)))
+                else:
+                    progress, version = scorer.latest
+                    have_value = version != last_version
+                    gate_value = progress
+                    gate_desc = f"progress={progress:.3f}"
+                    if have_value:
+                        last_version = version
+                        progress_trace.append((t_step, float(progress)))
+                if have_value:
+                    if gate.update(gate_value):
                         fire_steps.append(t_step)
-                        print(f"\n[gate] fired at step {t_step} (progress={progress:.3f}, "
+                        print(f"\n[gate] fired at step {t_step} ({gate_desc}, "
                               f"trigger={gate.last_trigger}) [handoff_mode={args.handoff_mode}]")
                         if args.handoff_mode == "teleop":
                             handoff_step = t_step
@@ -676,7 +772,7 @@ def main(args: Args):
                             print("  no-Quest: ending episode here (a human WOULD take over).")
                             intervened = True
                             break
-                        else:  # "shadow": log the fire and let pi0 keep driving
+                        else:  # "shadow": log the fire and let pi05 keep driving
                             gate.reset()
 
                 # Sleep to match DROID data collection frequency
@@ -691,24 +787,36 @@ def main(args: Args):
         save_filename = os.path.join("results", "video_" + timestamp)
         ImageSequenceClip(list(video), fps=10).write_videofile(save_filename + ".mp4", codec="libx264")
 
-        print(scorer.latency_report(args.score_every, DROID_CONTROL_FREQUENCY))
+        if scorer is not None:
+            print(scorer.latency_report(args.score_every, DROID_CONTROL_FREQUENCY))
+        if thrifty is not None:
+            print(thrifty.latency_report(DROID_CONTROL_FREQUENCY))
         if fire_steps:
             print(f"[gate] fired at steps: {fire_steps}")
         # In teleop mode the y/n prompt at the end of the takeover already labeled the episode;
         # otherwise ask here as usual.
         success: str | float | None = float(gate_success) if gate_success is not None else None
         while not isinstance(success, float):
-            success = input(
+            answer = input(
                 "Did the rollout succeed? (enter y for 100%, n for 0%), or a numeric value 0-100 based on the evaluation spec"
-            )
-            if success == "y":
+            ).strip()
+            # Only the numeric answer is a percentage. y/n are already fractions, so scaling them
+            # by 1/100 too would label every success 0.01 and silently fail the `success >= 1.0`
+            # check below, booking every human rescue as wasted.
+            if answer == "y":
                 success = 1.0
-            elif success == "n":
+            elif answer == "n":
                 success = 0.0
-
-            success = float(success) / 100
-            if not (0 <= success <= 1):
-                print(f"Success must be a number in [0, 100] but got: {success * 100}")
+            else:
+                try:
+                    value = float(answer) / 100
+                except ValueError:
+                    print(f"Enter y, n, or a number in [0, 100]; got: {answer!r}")
+                    continue
+                if not (0 <= value <= 1):
+                    print(f"Success must be a number in [0, 100] but got: {value * 100}")
+                    continue
+                success = value
 
         results.append({
             "success": success,
@@ -724,11 +832,24 @@ def main(args: Args):
         )
         if recorder is not None:
             os.makedirs(args.episode_dir, exist_ok=True)
-            recorder.save(
+            n_human = recorder.save(
                 os.path.join(args.episode_dir, f"episode_{timestamp}.npz"),
                 prompt=instruction, success=success, intervened=intervened,
                 handoff_step=-1 if handoff_step is None else handoff_step, gate_fires=fire_steps,
             )
+            # Mirror npz_dataset's require_success=1 filter: a rescue the human botched is still
+            # on disk, but it will not train, so counting it toward the budget would end the round
+            # with less usable data than every other arm.
+            if success >= 1.0:
+                expert_steps += n_human
+            else:
+                wasted_steps += n_human
+            if args.expert_budget is not None:
+                print(f"[budget] {expert_steps}/{args.expert_budget} expert transitions"
+                      + (f" ({wasted_steps} more from failed rescues, not counted)" if wasted_steps else ""))
+                if expert_steps >= args.expert_budget:
+                    print("[budget] round complete.")
+                    break
 
         if input("Do one more eval? (enter y or n) ").lower() != "y":
             break
